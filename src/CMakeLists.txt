@@ -2,10 +2,10 @@
 # Fire 核心库
 # ==============================
 
-set(base_files base/*)
+aux_source_directory(base/ BASE_DIR)
 
 add_library(fire STATIC 
-    ${base_files}
+    ${BASE_DIR}
 )
 
 
@@ -15,7 +15,10 @@ target_include_directories(fire
         ${ARMADILLO_INCLUDE_DIRS}
 )
 
-
+target_link_libraries(fire 
+    PRIVATE 
+        CUDA::cudart)
+        
 target_link_libraries(fire
     PUBLIC
         glog::glog

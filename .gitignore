@@ -1,0 +1,53 @@
+# ==============================
+# Build
+# ==============================
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# Ninja
+build.ninja
+.ninja_deps
+.ninja_log
+
+# ==============================
+# Compiled files
+# ==============================
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+
+# ==============================
+# VSCode
+# ==============================
+.vscode/
+
+# ==============================
+# CLion / JetBrains
+# ==============================
+.idea/
+
+# ==============================
+# OS files
+# ==============================
+.DS_Store
+Thumbs.db
+
+# ==============================
+# Logs / temporary files
+# ==============================
+*.log
+*.tmp
+*.swp
+*~
+*.cache

@@ -1,7 +1,7 @@
 
 
 add_executable(fire_tests
-    test_base/
+    test_base/test_buffer.cpp
 )
 
 target_link_libraries(fire_tests

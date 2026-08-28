@@ -21,6 +21,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(glog REQUIRED)
 find_package(Armadillo REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
 
 # ==============================
@@ -41,8 +42,3 @@ if(BUILD_TESTING)
 endif()
 
 
-# ==============================
-# Tools
-# ==============================
-
-add_subdirectory(tools)
