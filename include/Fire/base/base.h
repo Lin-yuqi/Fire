@@ -28,6 +28,13 @@ protected:
     NoCopyable& operator=(const NoCopyable&) = delete;
 };
 
+enum class DataType{
+    Unknown=0,
+    Fp32,
+    int8,
+    int32
+};
+
 
 
 }
