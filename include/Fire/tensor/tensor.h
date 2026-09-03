@@ -42,10 +42,11 @@ public:
     int32_t get_dim(int32_t idx) const;
 
     const std::vector<int32_t>& dims() const;
-    const std::vector<size_t>& strides() const;
+    const std::vector<int64_t>& strides() const;
 
     base::DataType data_type() const;
     base::DeviceType device_type() const;
+    void set_device_type(base::DeviceType device_type) const;
 
     bool is_empty() const;
 
@@ -60,7 +61,7 @@ public:
 
     void reshape(const std::vector<int32_t>& dims);
 
-    void allocate(std::shared_ptr<base::DeviceAllocator> allocator);
+    bool allocate(std::shared_ptr<base::DeviceAllocator> allocator);
 
     void assign(std::shared_ptr<base::Buffer> buffer,
                 size_t offset = 0);
@@ -70,17 +71,19 @@ public:
     void to_cpu();
     void to_cuda(cudaStream_t stream = nullptr);
 
+    void reset(base::DataType data_type, const std::vector<int32_t>& dims);
+
 private:
     void update_shape_info();
 
 private:
-    base::DataType data_type_ =base::DataType::Unknown;
-    std::vector<int32_t> dims_;
-    std::vector<size_t> strides_;
-    size_t size_ = 0;
+    base::DataType _data_type =base::DataType::Unknown;
+    std::vector<int32_t> _dims;
+    std::vector<int64_t> _strides;
+    size_t _size = 0;
     // 元素 offset，而不是 byte offset
-    size_t offset_ = 0;
-    std::shared_ptr<base::Buffer> buffer_;
+    size_t _offset = 0;
+    std::shared_ptr<base::Buffer> _buffer;
 };
 
 }// -------------------tensor end---------------------

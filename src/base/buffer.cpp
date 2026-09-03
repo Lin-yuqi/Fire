@@ -4,49 +4,35 @@
 // ----------------base begin--------------
 namespace base {
 
-Buffer::Buffer(size_t sz,std::shared_ptr<DeviceAllocator> alloc,void* ptr,bool use_external)
-    :_byte_sz(sz),_ptr(ptr),_use_external(use_external),_allocator(alloc)
+ Buffer::Buffer(size_t capacity_bytes,std::shared_ptr<DeviceAllocator> allocator)
+ :_capacity_bytes(capacity_bytes),_allocator(allocator),_owns_memory(true)
+ {
+    CHECK(_allocator != nullptr);
+    CHECK_GT(_capacity_bytes, 0);
+
+    _device_type = _allocator->device_type();
+
+    _ptr = _allocator->allocate(_capacity_bytes);
+
+    CHECK(_ptr != nullptr)
+        << "Failed to allocate buffer";
+ }
+
+Buffer::Buffer(void* ptr,size_t capacity_bytes,DeviceType device_type)
+:_ptr(ptr),_capacity_bytes(capacity_bytes),_device_type(device_type),_owns_memory(false)
 {
-    if(_use_external&&_ptr){
-        //使用外部的资源,此时ptr有空间,外部不传入alloc;
-    }else{
-        //自己管理资源,此时ptr为空,外部传入alloc;
-        CHECK(_ptr==nullptr);
-        CHECK_NE(_allocator,nullptr);
-        
-        _ptr = _allocator->allocate(_byte_sz);
-        _device_type=_allocator->device_type();
-    }
+    CHECK(_ptr != nullptr);
+    CHECK_GT(_capacity_bytes, 0);
 }
+
 
 Buffer::~Buffer(){
-    if(!_use_external){
-        if(_ptr&&_allocator){
-            _allocator->release(_ptr);
-        }
+    if (_owns_memory && _ptr) {
+        CHECK(_allocator != nullptr);
+        _allocator->release(_ptr);
+        _ptr = nullptr;
     }
 }
-
-
-bool Buffer::alloc(){
-    if(_allocator&&_byte_sz!=0){
-        _use_external=false;
-        _ptr=_allocator->allocate(_byte_sz);
-        if(_ptr)return true;
-        else return false;
-    }else{
-        return false;
-    }
-}
-
-
-// void Buffer::copy_from(const Buffer* buffer)const{
-
-// }
-
-// void Buffer::copy_from(const Buffer& buffer)const{
-
-// }
 
 void* Buffer::ptr(){
     return _ptr;
@@ -67,14 +53,14 @@ std::shared_ptr<DeviceAllocator> Buffer::allocator(){
 std::shared_ptr<Buffer> Buffer::get_shared_from_this(){
     return get_shared_from_this();
 }
-bool Buffer::is_external() const{
-    return _use_external;
+bool Buffer::owns_memory() const{
+    return _owns_memory;
 }
 
 size_t Buffer::size() const{
-    return _byte_sz;
+    return _capacity_bytes;
 }
-void Buffer::set_dtype(DeviceType dtype){
+void Buffer::set_device_type(DeviceType dtype){
     _device_type=dtype;
 }
 
