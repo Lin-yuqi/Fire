@@ -73,6 +73,9 @@ public:
 
     void reset(base::DataType data_type, const std::vector<int32_t>& dims);
 
+    void* raw_ptr();
+    const void* raw_ptr() const;
+
 private:
     void update_shape_info();
 

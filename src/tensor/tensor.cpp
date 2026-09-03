@@ -156,12 +156,51 @@ namespace tensor {
         _offset = offset;
     }
 
-    Tensor Tensor::clone() const{
-        Tensor new_tensor(_data_type, _dims);
-        if(_buffer){
-            auto allocator = (_buffer->device_type() == base::DeviceType::CPU)?
-             base::CPUAllocatorFactory::get_instance() : base::GPUAllocatorFactory::get_instance();
+    Tensor Tensor::clone() const {
+        CHECK_NE(_buffer, nullptr)<< "Cannot clone tensor without buffer";
+
+        CHECK_NE(_buffer->ptr(), nullptr)<< "Cannot clone empty buffer";
+        std::shared_ptr<base::DeviceAllocator> allocator;
+        const auto device = device_type();
+        if (device == base::DeviceType::CPU) {
+            allocator =base::CPUAllocatorFactory::get_instance();
         }
+        else if (device == base::DeviceType::GPU) {
+            allocator =
+                base::GPUAllocatorFactory::get_instance();
+        }
+        else {
+            LOG(FATAL)
+                << "Cannot clone tensor with unknown device";
+        }
+
+        // 创建一个新的独立 Tensor
+        Tensor result(
+            _data_type,
+            _dims,
+            allocator
+        );
+
+        const size_t bytes = byte_size();
+
+        if (device == base::DeviceType::CPU) {
+            allocator->memcpy(
+                raw_ptr(),
+                result.raw_ptr(),
+                bytes,
+                base::MemCpyKind::CPU2CPU
+            );
+        }
+        else {
+            allocator->memcpy(
+                raw_ptr(),
+                result.raw_ptr(),
+                bytes,
+                base::MemCpyKind::GPU2GPU
+            );
+        }
+
+        return result;
     }
 
     void Tensor::to_cpu(){
@@ -207,6 +246,14 @@ namespace tensor {
         this-> _size = reduce_dimension(dims.begin(), dims.end(), 1);
         this-> _buffer = nullptr;
     }
+
+    void* Tensor::raw_ptr(){
+        return _buffer->ptr();
+    }
+    const void* Tensor::raw_ptr() const{
+        return _buffer->ptr();
+    }
+
 
     void Tensor::update_shape_info(){
         if (_dims.empty()) {
