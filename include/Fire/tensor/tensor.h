@@ -25,7 +25,7 @@ public:
     Tensor(base::DataType dtype,
            std::vector<int32_t> dims,
            std::shared_ptr<base::Buffer> buffer,
-           size_t offset = 0);
+           size_t byte_offset = 0);
 
     // 包装外部内存
     static Tensor from_blob(
@@ -51,32 +51,39 @@ public:
     bool is_empty() const;
 
     template <typename T>
-    T* ptr();
+    T* ptr(){
+        if(_buffer == nullptr){
+            return nullptr;
+        }
+        return reinterpret_cast<T*>(raw_ptr());
+    }
 
     template <typename T>
-    const T* ptr() const;
-
-    template <typename T>
-    T* ptr(size_t index);
+    const T* ptr() const{
+        if(_buffer == nullptr){
+            return nullptr;
+        }
+        return reinterpret_cast<T*>(raw_ptr());
+    }
 
     void reshape(const std::vector<int32_t>& dims);
 
     bool allocate(std::shared_ptr<base::DeviceAllocator> allocator);
 
     void assign(std::shared_ptr<base::Buffer> buffer,
-                size_t offset = 0);
+                size_t byte_offset = 0);
 
     Tensor clone() const;
 
     void to_cpu();
+    // 同步迁移：即使传入 stream，返回时数据也已拷贝完成
     void to_cuda(cudaStream_t stream = nullptr);
 
     void reset(base::DataType data_type, const std::vector<int32_t>& dims);
 
+private:
     void* raw_ptr();
     const void* raw_ptr() const;
-
-private:
     void update_shape_info();
 
 private:
@@ -84,8 +91,8 @@ private:
     std::vector<int32_t> _dims;
     std::vector<int64_t> _strides;
     size_t _size = 0;
-    // 元素 offset，而不是 byte offset
-    size_t _offset = 0;
+    // 相对于 Buffer 起始地址的字节偏移
+    size_t _byte_offset = 0;
     std::shared_ptr<base::Buffer> _buffer;
 };
 

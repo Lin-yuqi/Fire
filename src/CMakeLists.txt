@@ -3,9 +3,13 @@
 # ==============================
 
 aux_source_directory(base/ BASE_DIR)
+aux_source_directory(op/ OP_DIR)
+aux_source_directory(tensor/ TENSOR_DIR)
 
 add_library(fire STATIC 
     ${BASE_DIR}
+    ${OP_DIR}
+    ${TENSOR_DIR}
 )
 
 
@@ -15,12 +19,9 @@ target_include_directories(fire
         ${ARMADILLO_INCLUDE_DIRS}
 )
 
-target_link_libraries(fire 
-    PRIVATE 
-        CUDA::cudart)
-        
 target_link_libraries(fire
     PUBLIC
+        CUDA::cudart
         glog::glog
         ${ARMADILLO_LIBRARIES}
 )

@@ -53,11 +53,11 @@ namespace tensor {
     Tensor::Tensor(base::DataType dtype,
            std::vector<int32_t> dims,
            std::shared_ptr<base::Buffer> buffer,
-           size_t offset)
+           size_t byte_offset)
     : _data_type(dtype), _dims(dims)
     {   
         update_shape_info();
-        assign(std::move(buffer), offset);
+        assign(std::move(buffer), byte_offset);
     }
 
     // 包装外部内存
@@ -69,7 +69,7 @@ namespace tensor {
     {
         Tensor tensor(dtype, dims);
         size_t sz = tensor.byte_size();
-        auto buffer= std::make_shared<base::Buffer>(sz,nullptr,ptr,true);
+        auto buffer= std::make_shared<base::Buffer>(ptr,sz,device_type);
         tensor.set_device_type(device_type);
         buffer->set_device_type(device_type);
         tensor.assign(buffer, 0);
@@ -145,15 +145,16 @@ namespace tensor {
         return true;
     }
 
-    void Tensor::assign(std::shared_ptr<base::Buffer> buffer, size_t offset){
+    void Tensor::assign(std::shared_ptr<base::Buffer> buffer, size_t byte_offset){
         CHECK_NE(buffer, nullptr) << "Buffer cannot be null";
         if(_buffer){
-            CHECK_EQ(_buffer->device_type(), buffer->device_type()) << "Buffer device type mismatch";
+            CHECK(_buffer->device_type() == buffer->device_type()) << "Buffer device type mismatch";
         }
-        size_t sz=this->byte_size();    
-        CHECK_LE(sz, buffer->size() - offset)<< "Buffer space is too small for tensor";
+        const size_t bytes = byte_size();
+        CHECK_LE(byte_offset, buffer->size()) << "Tensor byte offset exceeds buffer size";
+        CHECK_LE(bytes, buffer->size() - byte_offset) << "Buffer space is too small for tensor";
         _buffer = std::move(buffer);
-        _offset = offset;
+        _byte_offset = byte_offset;
     }
 
     Tensor Tensor::clone() const {
@@ -213,9 +214,10 @@ namespace tensor {
             auto cpu_allocator = base::CPUAllocatorFactory::get_instance();
 
             auto cpu_buffer = std::make_shared<base::Buffer>(this->byte_size(), cpu_allocator);
-            cpu_allocator->memcpy(_buffer->ptr(), cpu_buffer->ptr(), this->byte_size(),base::MemCpyKind::GPU2CPU);
+            cpu_allocator->memcpy(raw_ptr(), cpu_buffer->ptr(), this->byte_size(),base::MemCpyKind::GPU2CPU);
 
             _buffer = std::move(cpu_buffer);
+            _byte_offset = 0;
             // This is a placeholder for the actual implementation
             LOG(INFO) << "Transferring tensor from CUDA to CPU";
         } else {
@@ -231,8 +233,15 @@ namespace tensor {
             // Implement the logic to transfer data from CPU to CUDA
             auto gpu_allocator = base::GPUAllocatorFactory::get_instance();
             auto gpu_buffer = std::make_shared<base::Buffer>(this->byte_size(), gpu_allocator);
-            gpu_allocator->memcpy(_buffer->ptr(), gpu_buffer->ptr(), this->byte_size(), base::MemCpyKind::CPU2GPU, stream);
+            gpu_allocator->memcpy(raw_ptr(), gpu_buffer->ptr(), this->byte_size(), base::MemCpyKind::CPU2GPU, stream);
+            if (stream != nullptr) {
+                const cudaError_t error = cudaStreamSynchronize(stream);
+                CHECK(error == cudaSuccess)
+                    << "Failed to synchronize tensor transfer stream: "
+                    << cudaGetErrorString(error);
+            }
             _buffer = std::move(gpu_buffer);
+            _byte_offset = 0;
             // This is a placeholder for the actual implementation
             LOG(INFO) << "Transferring tensor from CPU to CUDA";
         } else {
@@ -245,15 +254,17 @@ namespace tensor {
         this->_dims = dims;
         this-> _size = reduce_dimension(dims.begin(), dims.end(), 1);
         this-> _buffer = nullptr;
+        this->_byte_offset = 0;
     }
 
     void* Tensor::raw_ptr(){
-        return _buffer->ptr();
+        CHECK_NE(_buffer, nullptr) << "Buffer is null";
+        return static_cast<void*>(static_cast<char*>(_buffer->ptr()) + _byte_offset);
     }
     const void* Tensor::raw_ptr() const{
-        return _buffer->ptr();
+        CHECK_NE(_buffer, nullptr) << "Buffer is null";
+        return static_cast<const void*>(static_cast<const char*>(_buffer->ptr()) + _byte_offset);
     }
-
 
     void Tensor::update_shape_info(){
         if (_dims.empty()) {

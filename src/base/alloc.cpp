@@ -13,7 +13,7 @@ void DeviceAllocator::memcpy(const void* src, void* dst,size_t sz, MemCpyKind co
     if(stream) _stream=static_cast<cudaStream_t>(stream);
 
     if(copyKind==MemCpyKind::CPU2CPU){
-        memcpy(src, dst,  sz);
+        std::memcpy(dst, src, sz);
     }else if(copyKind==MemCpyKind::CPU2GPU){
         if(stream){
             cudaMemcpyAsync(dst,src,sz,cudaMemcpyKind::cudaMemcpyHostToDevice,_stream);

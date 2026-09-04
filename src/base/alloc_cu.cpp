@@ -1,8 +1,11 @@
+#include "Fire/base/base.h"
 #include <Fire/base/alloc.h>
 #include <cuda_runtime_api.h>
 
 // ---------------base begin----------------
 namespace base {
+
+GPUAllocator::GPUAllocator():DeviceAllocator(DeviceType::GPU) {}
 
 void GPUAllocator::release(void* ptr) const {
     cudaError_t err = cudaFree(ptr);

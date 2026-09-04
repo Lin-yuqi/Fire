@@ -4,20 +4,23 @@
 // ----------------base begin--------------
 namespace base {
 
- Buffer::Buffer(size_t capacity_bytes,std::shared_ptr<DeviceAllocator> allocator)
- :_capacity_bytes(capacity_bytes),_allocator(allocator),_owns_memory(true)
- {
-    CHECK(_allocator != nullptr);
-    CHECK_GT(_capacity_bytes, 0);
 
-    _device_type = _allocator->device_type();
+//自己申请与管理内存
+Buffer::Buffer(size_t capacity_bytes,std::shared_ptr<DeviceAllocator> allocator)
+:_capacity_bytes(capacity_bytes),_allocator(allocator),_owns_memory(true)
+{
+CHECK(_allocator != nullptr);
+CHECK_GT(_capacity_bytes, 0);
 
-    _ptr = _allocator->allocate(_capacity_bytes);
+_device_type = _allocator->device_type();
 
-    CHECK(_ptr != nullptr)
-        << "Failed to allocate buffer";
- }
+_ptr = _allocator->allocate(_capacity_bytes);
 
+CHECK(_ptr != nullptr)
+    << "Failed to allocate buffer";
+}
+
+//包装外部的内存空间
 Buffer::Buffer(void* ptr,size_t capacity_bytes,DeviceType device_type)
 :_ptr(ptr),_capacity_bytes(capacity_bytes),_device_type(device_type),_owns_memory(false)
 {
@@ -50,8 +53,8 @@ std::shared_ptr<DeviceAllocator> Buffer::allocator(){
     return _allocator;
 }
 
-std::shared_ptr<Buffer> Buffer::get_shared_from_this(){
-    return get_shared_from_this();
+std::shared_ptr<Buffer> Buffer::get(){
+    return shared_from_this();
 }
 bool Buffer::owns_memory() const{
     return _owns_memory;

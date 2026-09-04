@@ -28,7 +28,7 @@ public:
 
     std::shared_ptr<DeviceAllocator> allocator();
 
-    std::shared_ptr<Buffer> get_shared_from_this();
+    std::shared_ptr<Buffer> get();
 
     bool owns_memory() const;
 
