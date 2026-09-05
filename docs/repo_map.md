@@ -113,7 +113,7 @@ op::BaseLayer ── 持有 LayerType、DataType、DeviceType 和名称
 - `DeviceAllocator` 是分配后端抽象，统一提供 `allocate`、`release`、`memcpy`、`memset_zero`。
 - `CPUAllocator` 使用 `malloc/free`；`GPUAllocator` 使用 CUDA runtime。
 - 两个 Factory 返回进程级共享分配器实例。
-- `Buffer` 有两种模式：通过 allocator 分配并拥有内存，或包装外部指针且不负责释放。它是不可复制对象，可通过 `shared_ptr` 共享底层存储。
+- `Buffer` 有两种模式：通过 allocator 分配并拥有内存，或包装外部指针且不负责释放。它是不可复制对象，可通过 `shared_ptr` 共享底层存储；`get()` 基于 `enable_shared_from_this` 返回当前 Buffer 的共享引用。
 
 Buffer 已接入库目标和测试目标，也是 Tensor 底层存储的基础。
 
@@ -125,9 +125,11 @@ Buffer 已接入库目标和测试目标，也是 Tensor 底层存储的基础�
 - 仅元数据、allocator 分配、复用 Buffer、包装外部指针等构造路径；
 - reshape、clone、CPU/CUDA 迁移和存储重新绑定；
 - 以字节为单位的 Buffer offset；`raw_ptr()` 返回应用该偏移后的地址；
-- clone 从偏移后的有效数据起点复制，迁移到新 Buffer 后 offset 归零。
+- 对外通过 `ptr<T>()` 提供类型化地址，应用 offset 的 `raw_ptr()` 仅供 Tensor 内部使用；
+- clone 从偏移后的有效数据起点复制，迁移到新 Buffer 后 offset 归零；
+- `to_cuda(stream)` 是同步迁移接口：非空 stream 的异步拷贝会在返回前完成并检查同步结果，之后才释放原 CPU Buffer。
 
-Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测试；迁移契约与更多行为测试仍待完善，详见第 6 节。
+Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测试；设备迁移与更多行为测试仍待完善，详见第 6 节。
 
 ### `op`: Layer 元数据骨架
 
@@ -152,10 +154,9 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 以下是阅读和继续开发时最重要的事实，不等同于本次要修复的任务清单：
 
-1. **异步迁移的生命周期/同步契约未完成**：`to_cuda(stream)` 可发起异步拷贝后立即替换原 Buffer；接口也未清晰表达调用方何时负责同步。
-2. **部分 CUDA 返回值未检查**：部分 memcpy/memset 路径忽略 CUDA API 返回的 `cudaError_t`，失败时可能缺少及时、准确的错误信息；按当前约定可继续使用 `CHECK/LOG(FATAL)` 报错，无需引入额外错误类型。
-3. **测试覆盖仍较窄**：目前覆盖 CPU Buffer 分配、外部内存所有权、GPU allocator 构造与设备类型、Tensor `from_blob`、字节偏移和 CPU clone；GPU 内存操作、清零、迁移、更多 Tensor 行为与 Layer 均未覆盖。
-4. **文档结构略超前**：README 中展示的部分目录、`tools/CMakeLists.txt` 和模块尚不存在或仍为空，应以实际源码和 CMake 为准。
+1. **部分 CUDA 返回值未检查**：部分 memcpy/memset 路径忽略 CUDA API 返回的 `cudaError_t`，失败时可能缺少及时、准确的错误信息；按当前约定可继续使用 `CHECK/LOG(FATAL)` 报错，无需引入额外错误类型。
+2. **测试覆盖仍较窄**：目前覆盖 CPU Buffer 分配、外部内存所有权、GPU allocator 构造与设备类型、Tensor `from_blob`、字节偏移和 CPU clone；GPU 内存操作、清零、迁移、更多 Tensor 行为与 Layer 均未覆盖。
+3. **文档结构略超前**：README 中展示的部分目录、`tools/CMakeLists.txt` 和模块尚不存在或仍为空，应以实际源码和 CMake 为准。
 
 ## 7. 修改入口速查
 
