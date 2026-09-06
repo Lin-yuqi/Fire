@@ -32,19 +32,25 @@ Fire 更关注理解框架设计，而不仅仅是快速实现功能。
 Fire/
 ├── include/Fire/
 │   ├── base/
-│   └── model/
+│   ├── tensor/
+│   └── op/
 ├── src/
 │   ├── base/
-│   ├── model/
+│   ├── tensor/
+│   ├── op/
+│   │   └── kernels/
+│   │       ├── cpu/
+│   │       └── cuda/
 │   └── CMakeLists.txt
 ├── test/
 │   ├── test_base/
-│   ├── test_model/
+│   ├── test_tensor/
+│   ├── test_op/
+│   ├── utils.cu
 │   └── CMakeLists.txt
 ├── tools/
-│   └── CMakeLists.txt
 ├── CMakeLists.txt
-└── README.md
+└── readme.md
 ```
 
 核心代码编译为：
@@ -71,22 +77,24 @@ libfire.a
 
 ```cpp
 #include "Fire/base/xxx.h"
-#include "Fire/model/xxx.h"
+#include "Fire/tensor/xxx.h"
+#include "Fire/op/xxx.h"
 ```
 
 ### `src`
 
-存放核心实现代码，后续将逐步加入：
+存放核心实现代码。当前已包含：
 
 ```text
 base/
+tensor/
 op/
-model/
-runtime/
-tokenizer/
+└── kernels/
+    ├── cpu/
+    └── cuda/
 ```
 
-其中 CUDA Kernel 也属于 `Fire::fire`。
+其中 CPU/CUDA Kernel 均编入 `Fire::fire`。
 
 ### `test`
 
@@ -116,8 +124,7 @@ Fire 使用 CMake 管理项目，主要依赖：
 ```text
 CMakeLists.txt
 ├── src/CMakeLists.txt
-├── test/CMakeLists.txt
-└── tools/CMakeLists.txt
+└── test/CMakeLists.txt
 ```
 
 ---
@@ -187,7 +194,10 @@ Autoregressive Inference
 
 > **Fire is under active development.**
 
-项目目前处于基础架构开发阶段，模块和 Roadmap 将持续更新。
+项目已经形成第一版基础抽象：内存管理、Tensor、Operator、执行上下文与
+CPU/CUDA kernel 分派均已接入构建，向量 Add 已具备 CPU 与 CUDA FP32 实现。
+近期将先补齐基础模块和 Add 的测试，再沿现有结构扩展其他算子；模型与 Runtime
+将在算子集合具备基本覆盖后继续推进。
 
 ---
 

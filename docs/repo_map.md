@@ -1,19 +1,22 @@
 # Fire 仓库地图
 
-> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后核对日期：2026-09-04。
+> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后核对日期：2026-09-06。
 
 ## 1. 项目定位与当前阶段
 
 Fire 是一个以学习和实验为目标、从零构建的轻量级 CUDA 推理框架，计划沿着“内存与 Buffer → Tensor → Operator → Model → Runtime → LLM 推理”的方向演进。
 
-当前仓库仍处于基础设施阶段：
+当前仓库已经完成第一版基础抽象，开发重点正从搭建框架转向补齐测试和扩展算子：
 
 - `base` 模块已经接入构建，提供 CPU/GPU 分配器、内存拷贝以及 Buffer 生命周期管理。
 - `tensor` 已接入 `Fire::fire`，具备接口和初步实现，并开始覆盖 Buffer 字节偏移与 clone 行为。
-- `op` 只有 Layer 元数据骨架，已接入构建但尚无计算逻辑和测试。
-- `model`、runtime、kernel、工具程序等仍是规划或空目录，尚无实现。
+- `op` 已建立 `Operator`、`ParamOperator` 与执行上下文 `OpContext`，并初步接通向量 Add。
+- Add 已提供 CPU（Armadillo）与 CUDA FP32 kernel，通过设备类型分派；GPU 测试已加入测试目标。
+- `model`、runtime、工具程序等仍是规划或空目录，尚无实现。
 
-因此，当前 Base、Tensor 和 Operator 均可链接，但只有 Base 与 Tensor 的少量路径经过测试。
+因此，当前 Base、Tensor、Operator 和 Add kernel 均已编入 `Fire::fire`；现有 Add 测试直接覆盖 CUDA kernel 路径，尚未覆盖 `VecAddOp::forward` 和 CPU kernel。
+
+现阶段将 `DeviceAllocator → Buffer → Tensor → Operator → kernel 分派` 视为可继续扩展的基础结构。近期不计划优先重构这些抽象，而是先用更完整的测试验证边界，再复用 Add 已建立的组织方式开发其他算子；实际开发中发现接口缺口时再做针对性调整。
 
 ## 2. 顶层导航
 
@@ -29,9 +32,10 @@ Fire/
 │   ├── tensor/
 │   │   └── tensor.h               # Tensor 元数据、存储、迁移接口
 │   └── op/
-│       └── layer.h                # LayerType 与 BaseLayer 骨架
+│       ├── operator.h             # Operator、参数与执行上下文
+│       └── add.h                  # VecAddOp 接口
 ├── src/
-│   ├── CMakeLists.txt             # fire 静态库定义；收集 base/op/tensor 源文件
+│   ├── CMakeLists.txt             # fire 静态库定义；收集模块及 CPU/CUDA kernel
 │   ├── base/
 │   │   ├── alloc.cpp              # 通用 memcpy/memset 与工厂静态实例
 │   │   ├── alloc_cpu.cpp          # malloc/free 后端
@@ -40,13 +44,18 @@ Fire/
 │   ├── tensor/
 │   │   └── tensor.cpp             # Tensor 初步实现
 │   ├── op/
-│   │   └── layer.cpp              # BaseLayer 属性实现
-│   └── model/                     # 预留空目录
+│   │   ├── operator.cpp           # Operator 公共检查与参数管理
+│   │   ├── add.cpp                # VecAddOp 校验与 kernel 调度
+│   │   └── kernels/
+│   │       ├── kernels_interface.*# 按设备类型分派 Add kernel
+│   │       ├── cpu/add_kernel.*   # Armadillo FP32 向量加法
+│   │       └── cuda/add_kernel.*  # CUDA FP32 向量加法
 ├── test/
 │   ├── CMakeLists.txt             # 单一 fire_tests 测试可执行文件
 │   ├── test_base/test_buffer.cpp  # Buffer 自有/外部内存测试
 │   ├── test_tensor/test_tensor.cpp# Tensor 字节偏移与 clone 测试
-│   └── test_model/                # 预留空目录
+│   ├── test_op/test_op.cpp        # CUDA Add kernel 初步测试
+│   └── utils.cu/.cuh              # CUDA 测试辅助函数
 ├── docs/
 │   └── repo_map.md                # 本文
 ├── tools/                         # 预留空目录
@@ -61,17 +70,19 @@ Fire/
 | --- | --- |
 | CUDA Toolkit | CUDA runtime、GPU 内存分配/拷贝；项目配置阶段即强制需要 |
 | glog | `CHECK`、`LOG` 断言与日志 |
-| Armadillo | 公开传递给 `fire`；当前源码尚未使用 |
+| Armadillo | CPU Add kernel 的向量运算后端 |
 | GoogleTest | 仅在 `BUILD_TESTING=ON` 时查找，用于测试 |
 
 构建目标：
 
 ```text
 Fire (project)
-├── fire / Fire::fire             # 静态库；包含 src/base、src/tensor、src/op
+├── fire / Fire::fire             # 静态库；包含 base、tensor、op 与 CPU/CUDA kernel
 └── fire_tests                    # 链接 Fire::fire + GTest::gtest_main
     ├── test_base/test_buffer.cpp
-    └── test_tensor/test_tensor.cpp
+    ├── test_tensor/test_tensor.cpp
+    ├── test_op/test_op.cpp
+    └── utils.cu
 ```
 
 常用命令：
@@ -82,7 +93,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-当前环境中已有 build 配置；本次核对时构建成功，CTest 发现并通过 6 个测试：2 个 Buffer、1 个 allocator 和 3 个 Tensor 测试。
+当前环境中已有 build 配置；本次核对时增量构建成功。由于当前运行环境禁止访问 GPU，CUDA Add 测试未能在本次文档更新中完成运行验证。
 
 ## 4. 模块关系
 
@@ -102,7 +113,12 @@ base::DeviceType / DataType / MemCpyKind
               tensor::Tensor
        （dtype、shape、stride、offset）
 
-op::BaseLayer ── 持有 LayerType、DataType、DeviceType 和名称
+op::VecAddOp ── 校验 Tensor 与执行上下文
+      │
+      ▼
+kernel::get_add_kernel(DeviceType)
+      ├── CPU ── Armadillo 向量加法
+      └── GPU ── CUDA FP32 kernel（支持可选 stream）
 ```
 
 ### `base`: 设备、分配器与 Buffer
@@ -131,32 +147,34 @@ Buffer 已接入库目标和测试目标，也是 Tensor 底层存储的基础�
 
 Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测试；设备迁移与更多行为测试仍待完善，详见第 6 节。
 
-### `op`: Layer 元数据骨架
+### `op`: Operator 与 Add
 
-命名空间为 `op`。`LayerType` 已列出 Linear、Embedding、RMSNorm、Matmul、MHA、Softmax、Add、SwiGLU 等预期算子类型；`BaseLayer` 目前只保存名称、Layer 类型、数据类型和设备类型，没有 forward 接口或计算逻辑。
+命名空间为 `op`。`Operator` 保存算子类型和名称，并提供 Tensor 非空、设备、数据类型及维度检查；`ParamOperator` 管理带量化配置的参数列表。`OpContext` 描述单次执行的设备、CUDA stream、allocator 和 workspace。
 
-该模块已接入构建，但没有测试。
+`VecAddOp::forward` 先检查三个 Tensor 的设备、数据类型与 shape，再根据 `OpContext::_device_type` 选择 CPU 或 CUDA kernel。当前 Add 只实现 FP32：CPU 路径通过 Armadillo `fvec` 相加，CUDA 路径由每个线程处理一个元素并进行边界检查，也可使用调用方传入的 stream。
+
+现有 `op_test.add` 创建 GPU Tensor、初始化两个输入、直接调用 GPU Add kernel，并将输出复制回主机检查结果；它尚未通过 `VecAddOp::forward`，也没有 CPU 路径测试。
 
 ## 5. 关键运行路径
 
-目前实际可运行的典型路径是：
+Add 的当前调用路径是：
 
-1. `CPUAllocatorFactory::get_instance()` 获取 CPU allocator。
-2. `Buffer(capacity, allocator)` 请求内存并记录所有权与设备类型。
-3. 使用 `Buffer::ptr()` 访问内存。
-4. Buffer 析构时，若拥有内存则调用创建它的 allocator 释放。
+1. 调用方准备设备、dtype 和 shape 一致的输入与输出 Tensor，并填写 `OpContext`。
+2. `VecAddOp::forward` 执行公共 Tensor 检查和 shape 检查。
+3. `get_add_kernel` 按 CPU/GPU 返回对应函数指针。
+4. CPU kernel 使用 Armadillo 写入输出；CUDA kernel 按元素写入输出，并使用可选 stream 启动。
 
 外部内存路径则由 `Buffer(ptr, capacity, device_type)` 包装；`owns_memory()` 为 false，调用方仍负责外部指针的生命周期。
 
-当前项目规模较小，错误处理采用 glog `CHECK/LOG(FATAL)` 快速终止的策略，暂不引入统一的异常、`Status` 或 `Result` 机制。内部约束和运行失败应提供足够明确的错误信息；这一约定不免除对 CUDA API 返回值的检查。
+Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约束和未知设备仍使用 glog `CHECK/LOG(FATAL)`。CUDA 运行失败仍应检查对应 API 或 kernel launch 的错误码。
 
 ## 6. 当前边界与已知技术债
 
 以下是阅读和继续开发时最重要的事实，不等同于本次要修复的任务清单：
 
 1. **部分 CUDA 返回值未检查**：部分 memcpy/memset 路径忽略 CUDA API 返回的 `cudaError_t`，失败时可能缺少及时、准确的错误信息；按当前约定可继续使用 `CHECK/LOG(FATAL)` 报错，无需引入额外错误类型。
-2. **测试覆盖仍较窄**：目前覆盖 CPU Buffer 分配、外部内存所有权、GPU allocator 构造与设备类型、Tensor `from_blob`、字节偏移和 CPU clone；GPU 内存操作、清零、迁移、更多 Tensor 行为与 Layer 均未覆盖。
-3. **文档结构略超前**：README 中展示的部分目录、`tools/CMakeLists.txt` 和模块尚不存在或仍为空，应以实际源码和 CMake 为准。
+2. **Add 测试仍是初步覆盖**：现有测试直接调用 CUDA kernel，尚未覆盖 `VecAddOp::forward`、CPU kernel、shape/device/dtype 错误分支、非空 stream 以及无 GPU 环境下的跳过逻辑。
+3. **后续模块仍处于规划阶段**：model、runtime、KV cache、模型加载与推理工具尚未接入源码和构建。
 
 ## 7. 修改入口速查
 
@@ -166,21 +184,21 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 | 修改 CPU/GPU 分配策略 | `include/Fire/base/alloc.h`、`src/base/alloc_*.cpp` | Buffer 行为与 allocator 测试 |
 | 修改存储所有权 | `include/Fire/base/buffer.h`、`src/base/buffer.cpp` | Buffer/Tensor 测试 |
 | 完善 Tensor | `include/Fire/tensor/tensor.h`、`src/tensor/tensor.cpp` | `src/CMakeLists.txt`、`test/test_tensor/` |
-| 增加 Operator | `include/Fire/op/`、`src/op/` | `src/CMakeLists.txt`、对应测试目录 |
+| 增加 Operator | `include/Fire/op/`、`src/op/` | `src/op/kernels/`、`src/CMakeLists.txt`、对应测试目录 |
 | 增加模型或 Runtime | 新建对应 public header 与 `src` 子目录 | CMake 源文件、测试、README/本文 |
 | 增加测试 | `test/test_<module>/` | `test/CMakeLists.txt` |
 | 增加命令行/benchmark 工具 | `tools/` | 顶层 `add_subdirectory(tools)` 与 tools CMake |
 
 新增实现文件时务必显式确认它已进入某个 CMake target；“文件存在”并不意味着会被编译。
 
-## 8. 建议的近期开发顺序
+## 8. 近期开发计划
 
-结合现有代码，最短闭环是：
+当前基础抽象已形成初步闭环，近期按以下顺序推进：
 
-1. 补齐 allocator、memcpy/memset 与 Buffer 生命周期测试，并为 CUDA 调用补充返回值检查。
-2. 继续建立 Tensor 的 CPU 构造、reshape、共享存储和迁移测试，再补 GPU 测试。
-3. 明确 Operator 抽象（输入输出、forward、参数和设备约束），之后再逐个加入 CUDA kernel。
-4. 在基础抽象稳定后，再扩展 model、runtime、KV cache、模型加载与推理工具。
+1. 补齐 Base 与 Tensor 测试，包括 allocator、memcpy/memset、Buffer 生命周期、reshape、共享存储和设备迁移等关键路径。
+2. 完善 Add 测试，覆盖 `VecAddOp::forward`、CPU/GPU kernel、参数错误分支、CUDA stream 和运行错误检查。
+3. 在测试固定现有抽象和调用约束后，复用 `Operator + OpContext + kernel 分派` 结构扩展其他算子，并为每个新算子同步加入 CPU/GPU 测试。
+4. 算子集合具备基本覆盖后，再推进 model、runtime、KV cache、模型加载与推理工具。
 
 ## 9. 文档维护约定
 

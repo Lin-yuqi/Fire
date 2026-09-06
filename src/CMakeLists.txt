@@ -5,11 +5,18 @@
 aux_source_directory(base/ BASE_DIR)
 aux_source_directory(op/ OP_DIR)
 aux_source_directory(tensor/ TENSOR_DIR)
+aux_source_directory(op/kernels/ KERNEL_DIR)
+aux_source_directory(op/kernels/cpu/ CPU_KERNEL_DIR)
+aux_source_directory(op/kernels/cuda/ CUDA_KERNEL_DIR)
 
 add_library(fire STATIC 
     ${BASE_DIR}
     ${OP_DIR}
     ${TENSOR_DIR}
+
+    ${KERNEL_DIR}
+    ${CPU_KERNEL_DIR}
+    ${CUDA_KERNEL_DIR}
 )
 
 
@@ -17,6 +24,7 @@ target_include_directories(fire
     PUBLIC
         ${PROJECT_SOURCE_DIR}/include
         ${ARMADILLO_INCLUDE_DIRS}
+         ${CMAKE_CURRENT_SOURCE_DIR}/op/kernels
 )
 
 target_link_libraries(fire

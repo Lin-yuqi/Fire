@@ -63,7 +63,7 @@ public:
         if(_buffer == nullptr){
             return nullptr;
         }
-        return reinterpret_cast<T*>(raw_ptr());
+        return reinterpret_cast<const T*>(raw_ptr());
     }
 
     void reshape(const std::vector<int32_t>& dims);
@@ -88,9 +88,9 @@ private:
 
 private:
     base::DataType _data_type =base::DataType::Unknown;
-    std::vector<int32_t> _dims;
+    std::vector<int32_t> _dims; //维度
     std::vector<int64_t> _strides;
-    size_t _size = 0;
+    size_t _size = 0; //元素个数
     // 相对于 Buffer 起始地址的字节偏移
     size_t _byte_offset = 0;
     std::shared_ptr<base::Buffer> _buffer;
