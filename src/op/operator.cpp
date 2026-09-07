@@ -1,9 +1,12 @@
 #include "Fire/base/base.h"
 #include <Fire/op/operator.h>
 #include <cstddef>
+#include <utility>
 
 // ----------------------op begin-------------------
 namespace op{
+Operator::Operator(OpType type, std::string name) : _type(type), _name(std::move(name)) {}
+
 OpType Operator::type() const {
     return _type;
 }

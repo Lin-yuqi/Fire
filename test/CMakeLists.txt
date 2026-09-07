@@ -1,10 +1,11 @@
 
+aux_source_directory(test_op/ test)
 
 add_executable(fire_tests
     test_base/test_buffer.cpp
     test_tensor/test_tensor.cpp
-    test_op/test_op.cpp
     utils.cu
+    ${test}
 )
 
 target_link_libraries(fire_tests
