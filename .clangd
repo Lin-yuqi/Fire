@@ -1,3 +1,10 @@
 CompileFlags:
+  Add:
+    - -x
+    - cuda
+    - --cuda-path=/usr/local/cuda
+    - -I/usr/local/cuda/include
+    - -I/usr/local/cuda/include/cccl
   Remove:
     - -forward-unknown-to-host-compiler
+    - -dc

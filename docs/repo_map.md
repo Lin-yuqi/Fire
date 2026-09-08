@@ -1,6 +1,6 @@
 # Fire 仓库地图
 
-> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后核对日期：2026-09-06。
+> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后核对日期：2026-09-08。
 
 ## 1. 项目定位与当前阶段
 
@@ -10,11 +10,12 @@ Fire 是一个以学习和实验为目标、从零构建的轻量级 CUDA 推理
 
 - `base` 模块已经接入构建，提供 CPU/GPU 分配器、内存拷贝以及 Buffer 生命周期管理。
 - `tensor` 已接入 `Fire::fire`，具备接口和初步实现，并开始覆盖 Buffer 字节偏移与 clone 行为。
-- `op` 已建立 `Operator`、`ParamOperator` 与执行上下文 `OpContext`，并初步接通向量 Add。
-- Add 已提供 CPU（Armadillo）与 CUDA FP32 kernel，通过设备类型分派；GPU 测试已加入测试目标。
+- `op` 已建立 `Operator`、`ParamOperator` 与执行上下文 `OpContext`，并接通向量 Add 和 RMSNorm。
+- Add 已提供 CPU（Armadillo）与 CUDA FP32 kernel，通过设备类型分派，并覆盖公共 `forward`、参数校验、边界尺寸和非默认 stream 测试。
+- RMSNorm 已提供 CPU 一维及 CUDA 一维/二维 FP32 kernel，支持自定义 epsilon 和 CUDA stream；非 4 整数倍行宽会在未对齐行使用标量路径，避免 `float4` 未对齐访问。
 - `model`、runtime、工具程序等仍是规划或空目录，尚无实现。
 
-因此，当前 Base、Tensor、Operator 和 Add kernel 均已编入 `Fire::fire`；现有 Add 测试直接覆盖 CUDA kernel 路径，尚未覆盖 `VecAddOp::forward` 和 CPU kernel。
+因此，当前 Base、Tensor、Operator、Add 和 RMSNorm kernel 均已编入 `Fire::fire`。RMSNorm 的量化配置已能表示，但当前算子会拒绝量化权重。
 
 现阶段将 `DeviceAllocator → Buffer → Tensor → Operator → kernel 分派` 视为可继续扩展的基础结构。近期不计划优先重构这些抽象，而是先用更完整的测试验证边界，再复用 Add 已建立的组织方式开发其他算子；实际开发中发现接口缺口时再做针对性调整。
 
@@ -33,7 +34,8 @@ Fire/
 │   │   └── tensor.h               # Tensor 元数据、存储、迁移接口
 │   └── op/
 │       ├── operator.h             # Operator、参数与执行上下文
-│       └── add.h                  # VecAddOp 接口
+│       ├── add.h                  # VecAddOp 接口
+│       └── rmsnorm.h              # RmsNormOp 接口与 epsilon 配置
 ├── src/
 │   ├── CMakeLists.txt             # fire 静态库定义；收集模块及 CPU/CUDA kernel
 │   ├── base/
@@ -46,15 +48,19 @@ Fire/
 │   ├── op/
 │   │   ├── operator.cpp           # Operator 公共检查与参数管理
 │   │   ├── add.cpp                # VecAddOp 校验与 kernel 调度
+│   │   ├── rmsnorm.cpp            # RmsNormOp 校验与 kernel 调度
 │   │   └── kernels/
-│   │       ├── kernels_interface.*# 按设备类型分派 Add kernel
+│   │       ├── kernels_interface.*# 按设备类型分派 Add/RMSNorm kernel
 │   │       ├── cpu/add_kernel.*   # Armadillo FP32 向量加法
-│   │       └── cuda/add_kernel.*  # CUDA FP32 向量加法
+│   │       ├── cpu/rmsnorm_kernel.* # CPU FP32 RMSNorm
+│   │       ├── cuda/add_kernel.*  # CUDA FP32 向量加法
+│   │       └── cuda/rmsnorm_kernel.* # CUDA FP32 RMSNorm
 ├── test/
 │   ├── CMakeLists.txt             # 单一 fire_tests 测试可执行文件
 │   ├── test_base/test_buffer.cpp  # Buffer 自有/外部内存测试
 │   ├── test_tensor/test_tensor.cpp# Tensor 字节偏移与 clone 测试
-│   ├── test_op/test_op.cpp        # CUDA Add kernel 初步测试
+│   ├── test_op/test_op.cpp        # Operator 与 Add 测试
+│   ├── test_op/test_rmsnorm.cpp   # RMSNorm CPU/CUDA 与错误分支测试
 │   └── utils.cu/.cuh              # CUDA 测试辅助函数
 ├── docs/
 │   └── repo_map.md                # 本文
@@ -64,7 +70,7 @@ Fire/
 
 ## 3. 构建与依赖
 
-顶层 `CMakeLists.txt` 声明 C++17 和 CUDA 14，并要求以下依赖：
+顶层 `CMakeLists.txt` 声明 C++17 和 CUDA 17，并要求以下依赖：
 
 | 依赖 | 当前用途 |
 | --- | --- |
@@ -82,6 +88,7 @@ Fire (project)
     ├── test_base/test_buffer.cpp
     ├── test_tensor/test_tensor.cpp
     ├── test_op/test_op.cpp
+    ├── test_op/test_rmsnorm.cpp
     └── utils.cu
 ```
 
@@ -93,7 +100,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-当前环境中已有 build 配置；本次核对时增量构建成功。由于当前运行环境禁止访问 GPU，CUDA Add 测试未能在本次文档更新中完成运行验证。
+当前环境中已有 build 配置；本次核对时增量构建成功。RMSNorm 的 CUDA 向量边界测试和二维非 4 整数倍行宽回归测试已在宿主 GPU 上通过。
 
 ## 4. 模块关系
 
@@ -119,6 +126,13 @@ op::VecAddOp ── 校验 Tensor 与执行上下文
 kernel::get_add_kernel(DeviceType)
       ├── CPU ── Armadillo 向量加法
       └── GPU ── CUDA FP32 kernel（支持可选 stream）
+
+op::RmsNormOp ── 校验输入、输出与 weight
+      │
+      ▼
+kernel::get_rmsnorm_kernel[_dim](DeviceType)
+      ├── CPU ── 一维 FP32 RMSNorm
+      └── GPU ── 一维/二维 FP32 RMSNorm（支持可选 stream）
 ```
 
 ### `base`: 设备、分配器与 Buffer
@@ -147,13 +161,15 @@ Buffer 已接入库目标和测试目标，也是 Tensor 底层存储的基础�
 
 Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测试；设备迁移与更多行为测试仍待完善，详见第 6 节。
 
-### `op`: Operator 与 Add
+### `op`: Operator、Add 与 RMSNorm
 
 命名空间为 `op`。`Operator` 保存算子类型和名称，并提供 Tensor 非空、设备、数据类型及维度检查；`ParamOperator` 管理带量化配置的参数列表。`OpContext` 描述单次执行的设备、CUDA stream、allocator 和 workspace。
 
 `VecAddOp::forward` 先检查三个 Tensor 的设备、数据类型与 shape，再根据 `OpContext::_device_type` 选择 CPU 或 CUDA kernel。当前 Add 只实现 FP32：CPU 路径通过 Armadillo `fvec` 相加，CUDA 路径由每个线程处理一个元素并进行边界检查，也可使用调用方传入的 stream。
 
-现有 `op_test.add` 创建 GPU Tensor、初始化两个输入、直接调用 GPU Add kernel，并将输出复制回主机检查结果；它尚未通过 `VecAddOp::forward`，也没有 CPU 路径测试。
+`RmsNormOp::forward` 从输入最后一维确定归一化宽度，检查 FP32 输入、输出和单个未量化 weight 参数，并按设备和输入维数选择 kernel。CPU 路径当前只接受一维输入；GPU 路径覆盖一维向量和二维 `{rows, width}` 输入。二维 kernel 在行起点满足 16 字节对齐时使用 `float4`，否则回退到标量访问，因此 width 不是 4 的整数倍时不会对后续行进行未对齐的 `float4` 访问。
+
+Add 测试已覆盖公共 `VecAddOp::forward` 的 CPU/GPU 路径、参数错误、边界尺寸和非默认 stream。RMSNorm 测试覆盖 CPU 正确性、自定义 epsilon、参数错误、CUDA 打包尾部以及二维非 4 整数倍行宽。
 
 ## 5. 关键运行路径
 
@@ -164,6 +180,13 @@ Add 的当前调用路径是：
 3. `get_add_kernel` 按 CPU/GPU 返回对应函数指针。
 4. CPU kernel 使用 Armadillo 写入输出；CUDA kernel 按元素写入输出，并使用可选 stream 启动。
 
+RMSNorm 的当前调用路径是：
+
+1. 调用方设置一个与最后一维等长的 FP32 weight，并准备与输入 shape 相同的输出 Tensor。
+2. `RmsNormOp::forward` 校验设备、dtype、shape、参数数量和量化状态。
+3. 一维输入通过 `get_rmsnorm_kernel` 分派；二维 GPU 输入通过 `get_rmsnorm_kernel_dim` 分派，每个 block 处理一行。
+4. CUDA kernel 对可安全打包的地址使用 `float4`，并用标量循环处理尾部或未对齐行。
+
 外部内存路径则由 `Buffer(ptr, capacity, device_type)` 包装；`owns_memory()` 为 false，调用方仍负责外部指针的生命周期。
 
 Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约束和未知设备仍使用 glog `CHECK/LOG(FATAL)`。CUDA 运行失败仍应检查对应 API 或 kernel launch 的错误码。
@@ -173,8 +196,8 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 以下是阅读和继续开发时最重要的事实，不等同于本次要修复的任务清单：
 
 1. **部分 CUDA 返回值未检查**：部分 memcpy/memset 路径忽略 CUDA API 返回的 `cudaError_t`，失败时可能缺少及时、准确的错误信息；按当前约定可继续使用 `CHECK/LOG(FATAL)` 报错，无需引入额外错误类型。
-2. **Add 测试仍是初步覆盖**：现有测试直接调用 CUDA kernel，尚未覆盖 `VecAddOp::forward`、CPU kernel、shape/device/dtype 错误分支、非空 stream 以及无 GPU 环境下的跳过逻辑。
-3. **后续模块仍处于规划阶段**：model、runtime、KV cache、模型加载与推理工具尚未接入源码和构建。
+2. **RMSNorm 支持范围有限**：当前只有 FP32 实现，CPU 仅支持一维输入，GPU 多行路径已验证二维 `{rows, width}`；更高维输入的所有前导维度尚未完整接入 block 调度。量化 weight 会返回 `InvalidArgument`。
+3. **模型和矩阵乘仍未接入**：model、runtime、模型参数下载/导入、MatMul 及其量化 kernel 尚未实现或接入构建。
 
 ## 7. 修改入口速查
 
@@ -185,6 +208,7 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 | 修改存储所有权 | `include/Fire/base/buffer.h`、`src/base/buffer.cpp` | Buffer/Tensor 测试 |
 | 完善 Tensor | `include/Fire/tensor/tensor.h`、`src/tensor/tensor.cpp` | `src/CMakeLists.txt`、`test/test_tensor/` |
 | 增加 Operator | `include/Fire/op/`、`src/op/` | `src/op/kernels/`、`src/CMakeLists.txt`、对应测试目录 |
+| 修改 RMSNorm | `include/Fire/op/rmsnorm.h`、`src/op/rmsnorm.cpp` | CPU/CUDA kernel、接口分派、`test/test_op/test_rmsnorm.cpp` |
 | 增加模型或 Runtime | 新建对应 public header 与 `src` 子目录 | CMake 源文件、测试、README/本文 |
 | 增加测试 | `test/test_<module>/` | `test/CMakeLists.txt` |
 | 增加命令行/benchmark 工具 | `tools/` | 顶层 `add_subdirectory(tools)` 与 tools CMake |
@@ -195,10 +219,11 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 
 当前基础抽象已形成初步闭环，近期按以下顺序推进：
 
-1. 补齐 Base 与 Tensor 测试，包括 allocator、memcpy/memset、Buffer 生命周期、reshape、共享存储和设备迁移等关键路径。
-2. 完善 Add 测试，覆盖 `VecAddOp::forward`、CPU/GPU kernel、参数错误分支、CUDA stream 和运行错误检查。
-3. 在测试固定现有抽象和调用约束后，复用 `Operator + OpContext + kernel 分派` 结构扩展其他算子，并为每个新算子同步加入 CPU/GPU 测试。
-4. 算子集合具备基本覆盖后，再推进 model、runtime、KV cache、模型加载与推理工具。
+1. 下载目标模型参数，确认权重文件、Tensor shape 和参数名到 Fire 参数结构的映射。
+2. 接入模型参数导入路径，并用少量已知参数验证 dtype、shape、设备迁移和数值一致性。
+3. 在真实模型 shape 上建立 FP32 MatMul 基线及正确性测试，明确 Operator、weight 布局和 kernel 分派接口。
+4. 在 FP32 基线稳定后准备 MatMul 量化路径；复用现有 `QuantConfig` 表达量化方式，并分别验证量化参数、数值误差和 CUDA kernel 边界。
+5. 后续再连接 Transformer 其他算子、KV cache、Tokenizer 与自回归 Runtime。
 
 ## 9. 文档维护约定
 

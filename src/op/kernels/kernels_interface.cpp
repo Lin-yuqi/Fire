@@ -1,4 +1,5 @@
 #include "kernels_interface.h"
+#include "Fire/base/base.h"
 #include "cpu/add_kernel.h"
 #include "cuda/add_kernel.cuh"
 #include "cpu/rmsnorm_kernel.h"
@@ -23,6 +24,15 @@ RMSNormKernel get_rmsnorm_kernel(base::DeviceType dtype){
         return rmsnorm_kernel_cpu;
     }else if(dtype==base::DeviceType::GPU){
         return rmsnorm_kernel_cu;
+    }else{
+        LOG(FATAL)<<"Unknown device type for get a add kernel.";
+        return nullptr;
+    }
+}
+
+RMSNormKernelDim get_rmsnorm_kernel_dim(base::DeviceType dtype){
+    if(dtype==base::DeviceType::GPU){
+        return rmsnorm_kernel_cu_dim;
     }else{
         LOG(FATAL)<<"Unknown device type for get a add kernel.";
         return nullptr;

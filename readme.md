@@ -94,7 +94,9 @@ op/
     └── cuda/
 ```
 
-其中 CPU/CUDA Kernel 均编入 `Fire::fire`。
+其中 CPU/CUDA Kernel 均编入 `Fire::fire`。当前已接入 FP32 Add 与
+RMSNorm；RMSNorm 支持自定义 epsilon、CUDA stream，以及按最后一维处理
+二维输入。
 
 ### `test`
 
@@ -150,6 +152,12 @@ ctest --test-dir build --output-on-failure
 ./build/test/fire_tests
 ```
 
+只运行 RMSNorm 测试：
+
+```bash
+./build/test/fire_tests --gtest_filter='rmsnorm_test.*:RmsNormCudaTest.*'
+```
+
 ---
 
 ## 🛣️ Roadmap
@@ -178,10 +186,11 @@ LLaMA-like Model
 Autoregressive Inference
 ```
 
-计划实现的功能包括：
+计划实现或继续完善的功能包括：
 
-* RMSNorm、RoPE、Softmax
-* GEMV / GEMM、SwiGLU
+* RoPE、Softmax、SwiGLU
+* 模型参数下载、格式映射与导入
+* MatMul/GEMV/GEMM 及相关量化路径
 * Attention、KV Cache
 * Model Loader、Tokenizer
 * Sampling
@@ -195,9 +204,12 @@ Autoregressive Inference
 > **Fire is under active development.**
 
 项目已经形成第一版基础抽象：内存管理、Tensor、Operator、执行上下文与
-CPU/CUDA kernel 分派均已接入构建，向量 Add 已具备 CPU 与 CUDA FP32 实现。
-近期将先补齐基础模块和 Add 的测试，再沿现有结构扩展其他算子；模型与 Runtime
-将在算子集合具备基本覆盖后继续推进。
+CPU/CUDA kernel 分派均已接入构建。向量 Add 已具备 CPU/CUDA FP32 实现；
+RMSNorm 已具备 CPU 一维和 CUDA 一维/二维 FP32 路径，并覆盖自定义 epsilon、
+非默认 stream、非 4 整数倍宽度及参数错误测试。RMSNorm 的量化权重尚不支持。
+
+下一阶段计划下载并导入模型参数，在真实权重与 shape 上建立 MatMul 基线，随后
+准备 MatMul 量化实现与验证。模型加载、完整 Transformer 和 Runtime 仍在开发中。
 
 ---
 

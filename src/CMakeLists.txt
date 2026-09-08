@@ -24,7 +24,8 @@ target_include_directories(fire
     PUBLIC
         ${PROJECT_SOURCE_DIR}/include
         ${ARMADILLO_INCLUDE_DIRS}
-         ${CMAKE_CURRENT_SOURCE_DIR}/op/kernels
+        ${CMAKE_CURRENT_SOURCE_DIR}/op/kernels
+        /usr/local/cuda/targets/x86_64-linux/include/cccl
 )
 
 target_link_libraries(fire

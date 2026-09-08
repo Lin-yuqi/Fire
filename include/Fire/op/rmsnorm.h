@@ -10,14 +10,16 @@ class RmsNormOp : public ParamOperator {
   public:
     explicit RmsNormOp();
 
-    base::Status forward(const tensor::Tensor& input, tensor::Tensor& output, int32_t dim,
+    explicit RmsNormOp(const float eps);
+
+    base::Status forward(const tensor::Tensor& input, tensor::Tensor& output,
                          OpContext context);
 
   private:
     base::Status _check(const tensor::Tensor& input, tensor::Tensor& output, int32_t dim,
                         OpContext context);
 
-    float eps = 1e-6;
+    float _eps = 1e-6;
 };
 
 } // namespace op
