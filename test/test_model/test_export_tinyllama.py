@@ -17,7 +17,9 @@ import fire_writer  # noqa: E402,F401
 @unittest.skip("export implementation intentionally deferred")
 class TinyLlamaExportContractTest(unittest.TestCase):
     def test_descriptor_contains_the_exact_201_tensor_profile(self) -> None:
-        self.fail("TODO: verify canonical names, shapes, and payload byte total")
+        self.fail(
+            "TODO: enable _build_tinyllama_descriptor and verify names, shapes, and bytes"
+        )
 
     def test_preflight_failure_does_not_create_output(self) -> None:
         self.fail("TODO: cover config, key, dtype, shape, and name failures")

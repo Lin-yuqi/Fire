@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import BinaryIO, Sequence
 
+import numpy as np
+from numpy.typing import NDArray
+
 
 MAGIC = b"FIRECKPT"
 FORMAT_VERSION = 1
@@ -58,7 +61,7 @@ class FireWriter:
         self,
         destination: BinaryIO,
         info: TensorInfo,
-        tensor: object,
+        tensor: NDArray[np.float32],
     ) -> None:
-        """Append one normalized FP32, C-contiguous tensor payload."""
+        """Append one normalized FP32, C-contiguous NumPy tensor payload."""
         raise NotImplementedError("FireWriter payload writing is not implemented yet")

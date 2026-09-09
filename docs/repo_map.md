@@ -188,9 +188,9 @@ Reader 源文件已经编入 `Fire::fire`。当前只有未打开状态测试是
 
 ### `tools`: exporter/writer 骨架
 
-`fire_writer.py` 固定 `.fire` v1 常量、wire dtype、规范化 `TensorInfo` 和 `FireWriter` 的 Header/Directory 与单 tensor payload 写入接口。`export_tinyllama.py` 固定 TinyLlama checkpoint、tensor 数量和文件大小，并保留私有 `_ExportEntry` seam 与 CLI；实际 metadata preflight、BF16 到 FP32 转换、exclusive-create 和 payload 写出尚未实现。
+`fire_writer.py` 固定 `.fire` v1 常量、wire dtype、规范化 `TensorInfo` 和 `FireWriter` 的 Header/Directory 与单个 FP32 C-contiguous NumPy tensor payload 写入接口。`export_tinyllama.py` 固定 TinyLlama config、source dtype、canonical name/shape patterns、tensor 数量和文件大小，并保留私有 descriptor/preflight/`_ExportEntry` seam 与 CLI；实际 metadata preflight、BF16 到 FP32 转换、exclusive-create 和 payload 写出尚未实现。
 
-独立 fixture 生成器与 Python exporter 测试均已创建，但实现相关用例保持 skipped。本阶段没有引入通用 model adapter、registry、provider、planner 或 streaming framework。
+独立 fixture 生成器与 Python exporter 测试均已创建；CMake 的非默认 `fire_v1_fixture` target 已固定 fixture 的 build-tree 路径，但生成器和实现相关用例仍保持未实现/skipped。本阶段没有引入通用 model adapter、registry、provider、planner 或 streaming framework。
 
 ### `op`: Operator、Add 与 RMSNorm
 

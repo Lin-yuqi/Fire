@@ -12,7 +12,8 @@ TEST(FireReaderTest, UnopenedReaderHasNoTensorOrMappedBuffer) {
 // The remaining tests are acceptance-test placeholders for the implementation
 // phase. Enable them one at a time during the red-green loop.
 TEST(FireReaderTest, DISABLED_OpensThePythonWireContractFixture) {
-    FAIL() << "TODO: validate both tensor records and their FP32 values";
+    FAIL() << "TODO: open " << FIRE_V1_FIXTURE_PATH
+           << " and validate both tensor records and their FP32 values";
 }
 
 TEST(FireReaderTest, DISABLED_RejectsMalformedHeaderDirectoryAndPayload) {
