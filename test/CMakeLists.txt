@@ -46,5 +46,8 @@ target_compile_definitions(
 
 add_test(
     NAME fire_export_tinyllama_scaffold
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_model/test_export_tinyllama.py
+    COMMAND
+        ${Python3_EXECUTABLE}
+        -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_model/test_export_tinyllama.py
 )
