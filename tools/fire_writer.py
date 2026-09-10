@@ -13,12 +13,18 @@ from typing import BinaryIO, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
-
+import struct
+import math
 
 MAGIC = b"FIRECKPT"
 FORMAT_VERSION = 1
 HEADER_SIZE = 32
 TENSOR_INFO_SIZE = 96
+
+_HEADER_STRUCT = struct.Struct("<8sIIIIQ")
+assert _HEADER_STRUCT.size == HEADER_SIZE
+_TENSOR_INFO_STRUCT = struct.Struct("<56sIIQQQQ")
+assert _TENSOR_INFO_STRUCT.size == TENSOR_INFO_SIZE
 
 
 class WireDType(IntEnum):
@@ -26,6 +32,14 @@ class WireDType(IntEnum):
 
     FP32 = 1
 
+
+def _encode_name(name: str) -> bytes:
+    raw = name.encode("utf-8")
+
+    if len(raw) >= 56:
+        raise ValueError(f"tensor name too long: {name}")
+
+    return raw + b"\0" * (56 - len(raw))
 
 @dataclass(frozen=True)
 class TensorInfo:
@@ -54,14 +68,154 @@ class FireWriter:
         destination: BinaryIO,
         tensors: Sequence[TensorInfo],
     ) -> None:
-        """Write the fixed header and complete tensor directory."""
-        raise NotImplementedError("FireWriter wire encoding is not implemented yet")
+        if destination.tell() != 0:
+            raise ValueError(
+                "header must be written at the beginning of the file"
+            )
 
+        data_offset = HEADER_SIZE + len(tensors) * TENSOR_INFO_SIZE
+        next_offset = data_offset
+
+        seen_names: set[str] = set()
+
+        # 1. 先校验所有 TensorInfo
+        for info in tensors:
+            if info.name in seen_names:
+                raise ValueError(
+                    f"duplicate tensor name: {info.name}"
+                )
+            seen_names.add(info.name)
+
+            if info.dtype != WireDType.FP32:
+                raise ValueError(
+                    f"unsupported wire dtype for {info.name}: {info.dtype}"
+                )
+
+            if len(info.shape) not in (1, 2):
+                raise ValueError(
+                    f"invalid rank for {info.name}: {len(info.shape)}"
+                )
+
+            if any(dim <= 0 for dim in info.shape):
+                raise ValueError(
+                    f"invalid shape for {info.name}: {info.shape}"
+                )
+
+            expected_size = math.prod(info.shape) * 4
+
+            if info.byte_size != expected_size:
+                raise ValueError(
+                    f"byte_size mismatch for {info.name}: "
+                    f"expected {expected_size}, got {info.byte_size}"
+                )
+
+            if info.byte_offset != next_offset:
+                raise ValueError(
+                    f"byte_offset mismatch for {info.name}: "
+                    f"expected {next_offset}, got {info.byte_offset}"
+                )
+
+            next_offset += info.byte_size
+
+        # 2. 写 Header
+        header = _HEADER_STRUCT.pack(
+            MAGIC,
+            FORMAT_VERSION,
+            len(tensors),
+            HEADER_SIZE,
+            TENSOR_INFO_SIZE,
+            0,  # reserved
+        )
+
+        written = destination.write(header)
+        if written != len(header):
+            raise OSError("failed to write complete Fire header")
+
+        # 3. 写 Tensor Directory
+        for info in tensors:
+            ndim = len(info.shape)
+
+            shape0 = info.shape[0]
+            shape1 = info.shape[1] if ndim == 2 else 0
+
+            encoded = _TENSOR_INFO_STRUCT.pack(
+                _encode_name(info.name),
+                int(info.dtype),
+                ndim,
+                shape0,
+                shape1,
+                info.byte_offset,
+                info.byte_size,
+            )
+
+            written = destination.write(encoded)
+            if written != len(encoded):
+                raise OSError(
+                    f"failed to write directory entry for {info.name}"
+                )
+
+        # 4. 确认现在刚好位于 payload 起点
+        if destination.tell() != data_offset:
+            raise OSError(
+                f"directory ended at unexpected offset: "
+                f"expected {data_offset}, got {destination.tell()}"
+            )   
+    
     def write_tensor(
         self,
         destination: BinaryIO,
         info: TensorInfo,
         tensor: NDArray[np.float32],
     ) -> None:
-        """Append one normalized FP32, C-contiguous NumPy tensor payload."""
-        raise NotImplementedError("FireWriter payload writing is not implemented yet")
+    # 1. Fire v1 当前只支持 FP32
+        if info.dtype != WireDType.FP32:
+            raise ValueError(
+                f"unsupported wire dtype for {info.name}: {info.dtype}"
+            )
+
+        # 2. 检查实际 tensor dtype
+        if tensor.dtype != np.dtype(np.float32):
+            raise ValueError(
+                f"dtype mismatch for {info.name}: "
+                f"expected float32, got {tensor.dtype}"
+            )
+
+        # 3. 检查 shape
+        if tuple(tensor.shape) != info.shape:
+            raise ValueError(
+                f"shape mismatch for {info.name}: "
+                f"expected {info.shape}, got {tuple(tensor.shape)}"
+            )
+
+        # 4. 必须是连续内存
+        if not tensor.flags.c_contiguous:
+            raise ValueError(
+                f"tensor is not C-contiguous: {info.name}"
+            )
+
+        # 5. 实际字节数必须和目录里记录的一样
+        if tensor.nbytes != info.byte_size:
+            raise ValueError(
+                f"payload size mismatch for {info.name}: "
+                f"expected {info.byte_size}, got {tensor.nbytes}"
+            )
+
+        # 6. 当前文件位置必须正好等于这个 tensor 的 offset
+        current_offset = destination.tell()
+
+        if current_offset != info.byte_offset:
+            raise ValueError(
+                f"write offset mismatch for {info.name}: "
+                f"expected {info.byte_offset}, got {current_offset}"
+            )
+
+        # 7. 直接把 NumPy 的原始内存当作 bytes 写入
+        payload = memoryview(tensor).cast("B")
+
+        written = destination.write(payload)
+
+        if written != len(payload):
+            raise OSError(
+                f"failed to write complete tensor payload for {info.name}: "
+                f"expected {len(payload)} bytes, wrote {written}"
+            )

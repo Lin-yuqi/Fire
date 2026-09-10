@@ -12,8 +12,16 @@ from dataclasses import dataclass
 from pathlib import Path
 import sys
 from typing import Mapping, Sequence
+from safetensors import safe_open
+import math
 
-from fire_writer import TensorInfo
+from fire_writer import (
+    HEADER_SIZE,
+    TENSOR_INFO_SIZE,
+    TensorInfo,
+    WireDType,
+    FireWriter
+)
 
 
 MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
@@ -128,26 +136,132 @@ class _ExportEntry:
 
 def _build_tinyllama_descriptor() -> tuple[_TensorPattern, ...]:
     """Expand the fixed patterns into 201 exact source/canonical entries."""
-    raise ExportError("TinyLlama descriptor expansion is not implemented yet")
+    result = []
+    result.append(_EMBEDDING_TENSOR)
+
+    for layer in range(22):
+        for pattern in _LAYER_TENSORS :
+            result.append(
+                _TensorPattern(
+                    source_name=pattern.source_name.format(layer=layer),
+                    fire_name=pattern.fire_name.format(layer=layer),
+                    shape=pattern.shape
+                )
+            )
+
+    result.extend(_FINAL_TENSORS)
+    return result
 
 
 def _validate_config(config: Mapping[str, object]) -> None:
     """Validate the model-semantic config fields before output creation."""
-    del config
-    raise ExportError("TinyLlama config validation is not implemented yet")
+    for key,expected_val in EXPECTED_CONFIG.items():
+        if key not in config :
+            raise ExportError(f"missing config field: {key}")
+
+        actual_value = config[key]
+
+        if actual_value!=expected_val:
+            raise ExportError(
+                f"config mismatch for {key}: "
+                f"expected {expected_val!r}, got {actual_value!r}"
+            )   
 
 
 def _build_export_entries(source_dir: Path) -> list[_ExportEntry]:
     """Read safetensors metadata and calculate every final byte offset."""
-    del source_dir
-    raise ExportError("TinyLlama metadata preflight is not implemented yet")
+    source_path = source_dir / "model.safetensors"
+
+    if not source_path.is_file():
+        raise ExportError(f"missing model.safetensors: {source_path}")
+
+    descriptor = _build_tinyllama_descriptor();
+
+    if len(descriptor) != EXPECTED_TENSOR_COUNT:
+        raise ExportError(
+            f"internal descriptor count mismatch: "
+            f"expected {EXPECTED_TENSOR_COUNT}, got {len(descriptor)}"
+        )
+
+    data_offset = HEADER_SIZE + len(descriptor) * TENSOR_INFO_SIZE
+    next_offset = data_offset
+
+    entries: list[_ExportEntry] = []
+
+    with safe_open(source_path,framework = "numpy") as handle:
+        expected_names = {
+            pattern.source_name
+            for pattern in descriptor
+        }
+
+        actual_names = set(handle.keys())
+
+        missing = expected_names - actual_names
+        extra = actual_names - expected_names
+
+        if missing:
+            raise ExportError(
+                f"missing source tensors: {sorted(missing)}"
+            )
+
+        if extra:
+            raise ExportError(
+                f"unexpected source tensors: {sorted(extra)}"
+            )
+
+        for pattern in descriptor:
+            tensor_slice = handle.get_slice(pattern.source_name)
+
+            actual_dtype = tensor_slice.get_dtype()
+            if actual_dtype != EXPECTED_SOURCE_DTYPE:
+                raise ExportError(
+                    f"dtype mismatch for {pattern.source_name}: "
+                    f"expected {EXPECTED_SOURCE_DTYPE}, got {actual_dtype}"
+                )
+
+            actual_shape = tuple(tensor_slice.get_shape())
+            if actual_shape != pattern.shape:
+                raise ExportError(
+                    f"shape mismatch for {pattern.source_name}: "
+                    f"expected {pattern.shape}, got {actual_shape}"
+                )
+
+            byte_size = math.prod(pattern.shape) * 4
+
+            info = TensorInfo(
+                name=pattern.fire_name,
+                dtype=WireDType.FP32,
+                shape=pattern.shape,
+                byte_offset=next_offset,
+                byte_size=byte_size,
+            )
+
+            entries.append(_ExportEntry(source_name=pattern.source_name,tensor_info= info))
+
+            next_offset+=byte_size
+
+    payload_bytes = next_offset - data_offset
+    if payload_bytes!=EXPECTED_FP32_PAYLOAD_BYTES:
+            raise ExportError(
+            f"FP32 payload size mismatch: "
+            f"expected {EXPECTED_FP32_PAYLOAD_BYTES}, got {payload_bytes}"
+        )
+
+    if next_offset != EXPECTED_FIRE_FILE_BYTES:
+        raise ExportError(
+            f"final .fire size mismatch: "
+            f"expected {EXPECTED_FIRE_FILE_BYTES}, got {next_offset}"
+        )
+    return entries
+        
+
+
 
 
 def export_tinyllama(source_dir: Path, output_path: Path) -> None:
     """Export the fixed TinyLlama v0.1 profile.
 
     Implementation sequence:
-
     1. Validate config and safetensors metadata without creating ``output``.
     2. Build the private ``_ExportEntry`` list and final byte offsets.
     3. Exclusive-create ``output`` and ask ``FireWriter`` for Header/Directory.
@@ -155,8 +269,44 @@ def export_tinyllama(source_dir: Path, output_path: Path) -> None:
        time, and release each temporary tensor immediately.
     5. Remove the file best-effort after normal exceptions or ``Ctrl-C``.
     """
-    del source_dir, output_path
-    raise ExportError("TinyLlama export scaffold is present; export is not implemented yet")
+    config_path = source_dir / "config.json"
+    if not config_path.is_file():
+        raise ExportError(f"missing config.json: {config_path}")
+
+    import json
+
+    with config_path.open("r",encoding="utf-8")as f:
+        config = json.load(f)
+
+    _validate_config(config)
+
+    entries = _build_export_entries(source_dir)
+
+    print(f"validated {len(entries)} tensors")
+
+    writer = FireWriter()
+
+    with output_path.open("xb") as dst:
+        writer.write_header_and_directory(
+            dst,
+            [entry.tensor_info for entry in entries]
+        )
+
+        with safe_open(
+            source_dir / "model.safetensors",
+            framework="pt",
+            device="cpu",
+        ) as handle:
+            for entry in entries:
+                tensor = handle.get_tensor(entry.source_name)
+                fp32 = tensor.float().numpy()
+
+                writer.write_tensor(
+                    dst,
+                    entry.tensor_info,
+                    fp32,
+                )
+
 
 
 def _build_parser() -> argparse.ArgumentParser:
