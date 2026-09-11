@@ -9,21 +9,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+import math
+import struct
 from typing import BinaryIO, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
-import struct
-import math
 
 MAGIC = b"FIRECKPT"
 FORMAT_VERSION = 1
 HEADER_SIZE = 32
 TENSOR_INFO_SIZE = 96
+_UINT32_MAX = (1 << 32) - 1
+_UINT64_MAX = (1 << 64) - 1
 
-_HEADER_STRUCT = struct.Struct("<8sIIIIQ")
+_HEADER_STRUCT = struct.Struct("<8sIIQQ")
 assert _HEADER_STRUCT.size == HEADER_SIZE
-_TENSOR_INFO_STRUCT = struct.Struct("<56sIIQQQQ")
+_TENSOR_INFO_STRUCT = struct.Struct("<64sQQIIBB6s")
 assert _TENSOR_INFO_STRUCT.size == TENSOR_INFO_SIZE
 
 
@@ -34,12 +36,19 @@ class WireDType(IntEnum):
 
 
 def _encode_name(name: str) -> bytes:
-    raw = name.encode("utf-8")
+    try:
+        raw = name.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"tensor name must be ASCII: {name!r}") from error
 
-    if len(raw) >= 56:
+    if not raw:
+        raise ValueError("tensor name must not be empty")
+    if b"\0" in raw:
+        raise ValueError(f"tensor name must not contain NUL: {name!r}")
+    if len(raw) >= 64:
         raise ValueError(f"tensor name too long: {name}")
 
-    return raw + b"\0" * (56 - len(raw))
+    return raw + b"\0" * (64 - len(raw))
 
 @dataclass(frozen=True)
 class TensorInfo:
@@ -73,10 +82,17 @@ class FireWriter:
                 "header must be written at the beginning of the file"
             )
 
-        data_offset = HEADER_SIZE + len(tensors) * TENSOR_INFO_SIZE
+        tensor_count = len(tensors)
+        if tensor_count > _UINT32_MAX:
+            raise ValueError(f"too many tensors for Fire v1: {tensor_count}")
+
+        data_offset = HEADER_SIZE + tensor_count * TENSOR_INFO_SIZE
+        if data_offset > _UINT64_MAX:
+            raise ValueError(f"tensor directory exceeds uint64 range: {data_offset}")
         next_offset = data_offset
 
         seen_names: set[str] = set()
+        encoded_names: list[bytes] = []
 
         # 1. 先校验所有 TensorInfo
         for info in tensors:
@@ -85,6 +101,7 @@ class FireWriter:
                     f"duplicate tensor name: {info.name}"
                 )
             seen_names.add(info.name)
+            encoded_names.append(_encode_name(info.name))
 
             if info.dtype != WireDType.FP32:
                 raise ValueError(
@@ -96,12 +113,17 @@ class FireWriter:
                     f"invalid rank for {info.name}: {len(info.shape)}"
                 )
 
-            if any(dim <= 0 for dim in info.shape):
+            if any(dim <= 0 or dim > _UINT32_MAX for dim in info.shape):
                 raise ValueError(
                     f"invalid shape for {info.name}: {info.shape}"
                 )
 
             expected_size = math.prod(info.shape) * 4
+            if expected_size > _UINT64_MAX:
+                raise ValueError(
+                    f"tensor byte_size exceeds uint64 range for {info.name}: "
+                    f"{expected_size}"
+                )
 
             if info.byte_size != expected_size:
                 raise ValueError(
@@ -115,16 +137,19 @@ class FireWriter:
                     f"expected {next_offset}, got {info.byte_offset}"
                 )
 
+            if next_offset > _UINT64_MAX - info.byte_size:
+                raise ValueError(
+                    f"tensor payload range exceeds uint64 for {info.name}"
+                )
             next_offset += info.byte_size
 
         # 2. 写 Header
         header = _HEADER_STRUCT.pack(
             MAGIC,
             FORMAT_VERSION,
-            len(tensors),
+            tensor_count,
             HEADER_SIZE,
-            TENSOR_INFO_SIZE,
-            0,  # reserved
+            data_offset,
         )
 
         written = destination.write(header)
@@ -132,20 +157,21 @@ class FireWriter:
             raise OSError("failed to write complete Fire header")
 
         # 3. 写 Tensor Directory
-        for info in tensors:
+        for info, encoded_name in zip(tensors, encoded_names):
             ndim = len(info.shape)
 
             shape0 = info.shape[0]
             shape1 = info.shape[1] if ndim == 2 else 0
 
             encoded = _TENSOR_INFO_STRUCT.pack(
-                _encode_name(info.name),
-                int(info.dtype),
-                ndim,
-                shape0,
-                shape1,
+                encoded_name,
                 info.byte_offset,
                 info.byte_size,
+                shape0,
+                shape1,
+                int(info.dtype),
+                ndim,
+                b"\0" * 6,
             )
 
             written = destination.write(encoded)

@@ -1,4 +1,11 @@
 CompileFlags:
+  CompilationDatabase: build
+
+---
+If:
+  PathMatch: '.*\.(cu|cuh)$'
+
+CompileFlags:
   Add:
     - -x
     - cuda

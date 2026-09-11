@@ -51,9 +51,9 @@ public:
     std::shared_ptr<base::Buffer> mapped_buffer() const;
 
 private:
-    std::shared_ptr<base::Buffer> mapped_buffer_;
-    std::vector<TensorInfo> tensors_;
-    std::unordered_map<std::string, size_t> tensor_index_;
+    std::shared_ptr<base::Buffer> _mapped_buffer;
+    std::vector<TensorInfo> _tensors;
+    std::unordered_map<std::string, size_t> _tensor_index;
 };
 
 }  // namespace model

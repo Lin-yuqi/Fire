@@ -65,3 +65,4 @@ Thumbs.db
 __pycache__/
 *.pyc
 *.pyo
+.mypy__cache

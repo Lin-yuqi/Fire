@@ -35,9 +35,8 @@ add_custom_command(
     VERBATIM
 )
 
-# Kept out of the default build until the fixture encoder and Reader are
-# implemented. The target already fixes the future test's build-tree path.
 add_custom_target(fire_v1_fixture DEPENDS ${FIRE_V1_FIXTURE_PATH})
+add_dependencies(fire_tests fire_v1_fixture)
 
 target_compile_definitions(
     fire_tests
@@ -45,7 +44,7 @@ target_compile_definitions(
 )
 
 add_test(
-    NAME fire_export_tinyllama_scaffold
+    NAME fire_export_tinyllama_contract
     COMMAND
         ${Python3_EXECUTABLE}
         -B

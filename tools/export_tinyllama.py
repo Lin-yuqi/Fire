@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from io import BytesIO
+import json
+import math
 from pathlib import Path
 import sys
 from typing import Mapping, Sequence
+
 from safetensors import safe_open
-import math
 
 from fire_writer import (
     HEADER_SIZE,
@@ -150,7 +153,7 @@ def _build_tinyllama_descriptor() -> tuple[_TensorPattern, ...]:
             )
 
     result.extend(_FINAL_TENSORS)
-    return result
+    return tuple(result)
 
 
 def _validate_config(config: Mapping[str, object]) -> None:
@@ -269,13 +272,14 @@ def export_tinyllama(source_dir: Path, output_path: Path) -> None:
        time, and release each temporary tensor immediately.
     5. Remove the file best-effort after normal exceptions or ``Ctrl-C``.
     """
+    if sys.byteorder != "little":
+        raise ExportError("Fire v1 export requires a little-endian host")
+
     config_path = source_dir / "config.json"
     if not config_path.is_file():
         raise ExportError(f"missing config.json: {config_path}")
 
-    import json
-
-    with config_path.open("r",encoding="utf-8")as f:
+    with config_path.open("r", encoding="utf-8") as f:
         config = json.load(f)
 
     _validate_config(config)
@@ -285,26 +289,84 @@ def export_tinyllama(source_dir: Path, output_path: Path) -> None:
     print(f"validated {len(entries)} tensors")
 
     writer = FireWriter()
+    tensor_infos = [entry.tensor_info for entry in entries]
 
-    with output_path.open("xb") as dst:
-        writer.write_header_and_directory(
-            dst,
-            [entry.tensor_info for entry in entries]
-        )
+    # FireWriter owns the canonical-name and wire-range checks. Exercise those
+    # checks before exclusive-create so no metadata failure can leave output.
+    writer.write_header_and_directory(BytesIO(), tensor_infos)
 
-        with safe_open(
-            source_dir / "model.safetensors",
-            framework="pt",
-            device="cpu",
-        ) as handle:
-            for entry in entries:
-                tensor = handle.get_tensor(entry.source_name)
-                fp32 = tensor.float().numpy()
+    created = False
+    completed = False
+    try:
+        with output_path.open("xb", buffering=0) as dst:
+            created = True
+            writer.write_header_and_directory(dst, tensor_infos)
 
-                writer.write_tensor(
-                    dst,
-                    entry.tensor_info,
-                    fp32,
+            with safe_open(
+                source_dir / "model.safetensors",
+                framework="pt",
+                device="cpu",
+            ) as handle:
+                for entry in entries:
+                    tensor = handle.get_tensor(entry.source_name)
+                    actual_dtype = str(tensor.dtype)
+                    if actual_dtype not in ("torch.bfloat16", "bfloat16"):
+                        raise ExportError(
+                            f"payload dtype mismatch for {entry.source_name}: "
+                            f"expected torch.bfloat16, got {actual_dtype}"
+                        )
+
+                    actual_shape = tuple(tensor.shape)
+                    if actual_shape != entry.tensor_info.shape:
+                        raise ExportError(
+                            f"payload shape mismatch for {entry.source_name}: "
+                            f"expected {entry.tensor_info.shape}, got {actual_shape}"
+                        )
+
+                    expected_source_bytes = math.prod(actual_shape) * 2
+                    actual_source_bytes = tensor.numel() * tensor.element_size()
+                    if actual_source_bytes != expected_source_bytes:
+                        raise ExportError(
+                            f"payload byte size mismatch for {entry.source_name}: "
+                            f"expected {expected_source_bytes}, got {actual_source_bytes}"
+                        )
+
+                    fp32_tensor = tensor.float().contiguous()
+                    fp32 = fp32_tensor.numpy()
+                    writer.write_tensor(dst, entry.tensor_info, fp32)
+
+                    expected_position = (
+                        entry.tensor_info.byte_offset + entry.tensor_info.byte_size
+                    )
+                    if dst.tell() != expected_position:
+                        raise ExportError(
+                            f"payload position mismatch for {entry.tensor_info.name}: "
+                            f"expected {expected_position}, got {dst.tell()}"
+                        )
+
+                    del fp32
+                    del fp32_tensor
+                    del tensor
+
+            expected_file_size = HEADER_SIZE + len(entries) * TENSOR_INFO_SIZE
+            if entries:
+                final_info = entries[-1].tensor_info
+                expected_file_size = final_info.byte_offset + final_info.byte_size
+            if dst.tell() != expected_file_size:
+                raise ExportError(
+                    f"final file size mismatch for {output_path}: "
+                    f"expected {expected_file_size}, got {dst.tell()}"
+                )
+        completed = True
+    finally:
+        if created and not completed:
+            try:
+                output_path.unlink()
+            except OSError as cleanup_error:
+                print(
+                    f"warning: failed to remove partial output {output_path}: "
+                    f"{cleanup_error}",
+                    file=sys.stderr,
                 )
 
 
