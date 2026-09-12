@@ -33,7 +33,8 @@ Fire/
 ├── include/Fire/
 │   ├── base/
 │   ├── tensor/
-│   └── op/
+│   ├── op/
+│   └── model/
 ├── src/
 │   ├── base/
 │   ├── tensor/
@@ -41,14 +42,22 @@ Fire/
 │   │   └── kernels/
 │   │       ├── cpu/
 │   │       └── cuda/
+│   ├── model/
 │   └── CMakeLists.txt
 ├── test/
 │   ├── test_base/
 │   ├── test_tensor/
 │   ├── test_op/
+│   ├── test_model/
 │   ├── utils.cu
 │   └── CMakeLists.txt
 ├── tools/
+│   ├── fire_writer.py
+│   └── export_tinyllama.py
+├── docs/
+│   ├── model_export_v0_1.md
+│   └── repo_map.md
+├── CONTEXT.md
 ├── CMakeLists.txt
 └── readme.md
 ```
@@ -65,7 +74,7 @@ Fire::fire
 libfire.a
 ```
 
-测试和工具程序通过链接 `Fire::fire` 使用框架功能。
+C++ 测试通过链接 `Fire::fire` 使用框架功能；Python Writer/exporter 作为独立工具运行。
 
 ---
 
@@ -79,6 +88,7 @@ libfire.a
 #include "Fire/base/xxx.h"
 #include "Fire/tensor/xxx.h"
 #include "Fire/op/xxx.h"
+#include "Fire/model/fire_reader.h"
 ```
 
 ### `src`
@@ -88,27 +98,34 @@ libfire.a
 ```text
 base/
 tensor/
+model/
 op/
 └── kernels/
     ├── cpu/
     └── cuda/
 ```
 
-其中 CPU/CUDA Kernel 均编入 `Fire::fire`。当前已接入 FP32 Add 与
-RMSNorm；RMSNorm 支持自定义 epsilon、CUDA stream，以及按最后一维处理
-二维输入。
+其中 CPU/CUDA Kernel 和 `.fire` v1 `FireReader` 均编入 `Fire::fire`。
+当前已接入 FP32 Add 与 RMSNorm；RMSNorm 支持自定义 epsilon、
+CUDA stream，以及按最后一维处理二维输入。
 
 ### `test`
 
-使用 GoogleTest 对各模块进行测试，最终生成：
+使用 GoogleTest 对 C++ 模块进行测试，最终生成：
 
 ```text
 fire_tests
 ```
 
+CMake 会在构建 `fire_tests` 前用独立 stdlib Python 脚本生成
+260-byte `.fire` v1 fixture；CTest 还会运行 Writer/TinyLlama exporter 的
+Python 合同测试。
+
 ### `tools`
 
-存放推理、Benchmark、模型转换和 Profiling 等独立工具。
+当前包含 model-agnostic `.fire` v1 `FireWriter` 和 model-specific TinyLlama
+两遍 exporter。Exporter 将精确匹配 profile 的本地 BF16 safetensors
+逐 tensor 转为 FP32，不加载完整 `state_dict`。
 
 ---
 
@@ -120,6 +137,9 @@ Fire 使用 CMake 管理项目，主要依赖：
 * GoogleTest
 * glog
 * Armadillo
+* Python 3（fixture、合同测试与 exporter CLI）
+* NumPy、safetensors（Writer/exporter 合同测试与实际导出）
+* PyTorch（真实 TinyLlama payload 导出）
 
 构建结构：
 
@@ -158,6 +178,32 @@ ctest --test-dir build --output-on-failure
 ./build/test/fire_tests --gtest_filter='rmsnorm_test.*:RmsNormCudaTest.*'
 ```
 
+只运行 `.fire` Reader 合同测试：
+
+```bash
+./build/test/fire_tests --gtest_filter='FireReaderTest.*'
+```
+
+单独运行 Writer/exporter 合同测试：
+
+```bash
+python3 -B test/test_model/test_export_tinyllama.py
+```
+
+---
+
+## 📦 TinyLlama 导出
+
+输入目录需包含精确匹配 `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
+profile 的 `config.json` 和单个 `model.safetensors`：
+
+```bash
+python3 tools/export_tinyllama.py --hf /path/to/TinyLlama /path/to/model.fire
+```
+
+输出路径必须不存在。格式、固定 tensor mapping 和验收边界详见
+[`docs/model_export_v0_1.md`](docs/model_export_v0_1.md)。
+
 ---
 
 ## 🛣️ Roadmap
@@ -189,10 +235,10 @@ Autoregressive Inference
 计划实现或继续完善的功能包括：
 
 * RoPE、Softmax、SwiGLU
-* 模型参数下载、格式映射与导入
+* TinyLlama 全量导出/回读验收与 ModelLoader
 * MatMul/GEMV/GEMM 及相关量化路径
 * Attention、KV Cache
-* Model Loader、Tokenizer
+* Tokenizer
 * Sampling
 * Kernel Fusion、CUDA Stream
 * Nsight Compute Profiling
@@ -208,8 +254,13 @@ CPU/CUDA kernel 分派均已接入构建。向量 Add 已具备 CPU/CUDA FP32 �
 RMSNorm 已具备 CPU 一维和 CUDA 一维/二维 FP32 路径，并覆盖自定义 epsilon、
 非默认 stream、非 4 整数倍宽度及参数错误测试。RMSNorm 的量化权重尚不支持。
 
-下一阶段计划下载并导入模型参数，在真实权重与 shape 上建立 MatMul 基线，随后
-准备 MatMul 量化实现与验证。模型加载、完整 Transformer 和 Runtime 仍在开发中。
+`.fire` v1 的 Writer、TinyLlama-specific exporter、mmap FireReader 与自动化
+wire/profile 合同测试已完成。真实 checkpoint 的 metadata 已确认为
+201 项，但完整 4.4 GB FP32 导出、FireReader 全量解析与选定元素
+bit-exact 回读尚未执行，因此 Export Compatibility 仍未宣称完成。
+
+下一阶段先完成该真实导出/回读里程碑，再实现 TinyLlama ModelLoader
+并在真实 shape 上建立 MatMul 基线。完整 Transformer 和 Runtime 仍在开发中。
 
 ---
 

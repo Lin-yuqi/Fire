@@ -2,6 +2,8 @@
 
 > 状态：Accepted。Q1-Q15 的格式、职责、失败语义和验收边界已经确认。
 
+> 实现进度（2026-09-11）：FireWriter、TinyLlama-specific exporter、FireReader 与 core wire/profile 合同测试已完成并接入 CTest。真实 checkpoint 的 metadata 已确认为 201 项、`data_offset = 19,328`、计划文件长度 `4,400,212,864` bytes。完整 4.4 GB payload 导出、FireReader 的 201 项解析与选定真实权重数值回读尚未执行，TinyLlama ModelLoader 也尚未实现；因此 Export Compatibility 和 Model Support 均仍未宣称完成。
+
 ## 1. 目标
 
 Fire v0.1 只为 `TinyLlama/TinyLlama-1.1B-Chat-v1.0` 建立一条极简模型导入路径：
@@ -182,7 +184,7 @@ wire dtype 编号不复用 C++ `base::DataType` 的枚举序号；FireReader 负
 Python 实现应避免两个不必要的内存放大点：
 
 - 不用 `AutoModelForCausalLM` 或完整 `state_dict` 加载模型；metadata pass 使用 `safe_open(..., framework="numpy")` 与 `get_slice()`。
-- payload 使用 little-endian FP32 的 `fp32.numpy().tofile(dst)`，不用会复制整个 tensor 的 `.tobytes()`；v0.1 exporter 在非 little-endian host 上直接拒绝运行。
+- payload 将 little-endian FP32 NumPy view 转为 `memoryview(fp32).cast("B")` 并直接交给目标文件的 `write()`，不用会复制整个 tensor 的 `.tobytes()`；v0.1 exporter 在非 little-endian host 上直接拒绝运行。
 
 对当前 TinyLlama 的本地验证结果：metadata pass 峰值 RSS 约 27 MiB。payload pass 在 Python 对象层面只同时持有当前 tensor，算法层最大约为 125 MiB BF16 输入加 250 MiB FP32 输出；使用单个长期存在的 safetensors context 时，已触碰的 mmap 页面仍可能累计计入进程 RSS，本地实测峰值约 2.6 GiB。v0.1 接受该代价，以避免重复打开 safetensors，同时仍避免完整 4.4 GB FP32 模型作为 tensor 对象常驻。
 
@@ -237,6 +239,8 @@ std::shared_ptr<base::Buffer> FireReader::mapped_buffer() const;
 
 ## 12. 最小验收测试
 
+截至 2026-09-11，本节的 core 合同已自动化：CMake 在构建 `fire_tests` 前生成独立 fixture，6 个 FireReader GTest 用例覆盖有效文件、坏文件矩阵、显式 `uint64` 溢出、Status 分类和 mapping lifetime；CTest 项 `fire_export_tinyllama_contract` 运行 13 个 Writer/exporter unittest。这些测试验证 wire 和 profile 合同，不代替本节末尾的真实权重里程碑。
+
 ### Wire contract fixture
 
 Core test 使用独立的 stdlib Python `struct.pack` 脚本生成一个精确 260-byte `.fire` fixture，不调用 FireWriter，也不要求安装 Torch：
@@ -272,3 +276,5 @@ Python writer 测试还应验证：preflight 失败时不创建目标；目标�
 ### 本地里程碑验收
 
 完整 TinyLlama 导出不进入 core test。发布 v0.1 前必须在本地执行真实导出，确认 FireReader 解析 201 项、TinyLlama ModelLoader 接受完整 profile，并对 embedding、首尾层、final norm 和 output 的选定元素做 bit-exact FP32 回读。
+
+当前只完成了真实 source metadata 的只读核对；全量 payload 写出、上述 FireReader 回读和 ModelLoader profile 验收仍待完成。
