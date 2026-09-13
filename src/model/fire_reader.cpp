@@ -59,7 +59,7 @@ uint64_t read_u64_le(const uint8_t* ptr) {
 
 class MMapBuffer final : public base::Buffer {
   public:
-    MMapBuffer(void* ptr, size_t size)
+    MMapBuffer(void* ptr, size_t size) //mmap 默认是往cpu加载
         : base::Buffer(ptr, size, base::DeviceType::CPU), _mapping(ptr), _mapping_size(size) {}
 
     ~MMapBuffer() override {

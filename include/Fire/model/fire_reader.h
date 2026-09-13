@@ -28,7 +28,7 @@ struct TensorInfo {
 // FireReader only understands the container format. Model-specific tensor
 // requirements belong to ModelLoader.
 class FireReader final {
-public:
+  public:
     FireReader() = default;
     ~FireReader() = default;
 
@@ -50,10 +50,10 @@ public:
     // empty shared_ptr before a successful open.
     std::shared_ptr<base::Buffer> mapped_buffer() const;
 
-private:
-    std::shared_ptr<base::Buffer> _mapped_buffer;
-    std::vector<TensorInfo> _tensors;
-    std::unordered_map<std::string, size_t> _tensor_index;
+  private:
+    std::shared_ptr<base::Buffer> _mapped_buffer;          // 管理整个.fire文件的mmap内存
+    std::vector<TensorInfo> _tensors;                      // 管理所有tensor的元信息
+    std::unordered_map<std::string, size_t> _tensor_index; // 根据tensor名字映射到_tensors里的位置
 };
 
-}  // namespace model
+} // namespace model

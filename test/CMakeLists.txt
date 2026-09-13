@@ -1,12 +1,13 @@
 
-aux_source_directory(test_op/ test)
-
+aux_source_directory(test_op/ OP)
+aux_source_directory(test_model MODEL)
 add_executable(fire_tests
     test_base/test_buffer.cpp
     test_model/test_fire_reader.cpp
     test_tensor/test_tensor.cpp
     utils.cu
-    ${test}
+    ${OP}
+    ${MODEL}
 )
 
 target_link_libraries(fire_tests
@@ -22,6 +23,7 @@ gtest_discover_tests(fire_tests)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(FIRE_V1_FIXTURE_PATH "${CMAKE_CURRENT_BINARY_DIR}/fixtures/fire_v1_contract.fire")
+set(FIRE_TINYLLAMA_PATH "${CMAKE_SOURCE_DIR}/tmp/llama.fire")
 
 add_custom_command(
     OUTPUT ${FIRE_V1_FIXTURE_PATH}
@@ -41,6 +43,7 @@ add_dependencies(fire_tests fire_v1_fixture)
 target_compile_definitions(
     fire_tests
     PRIVATE FIRE_V1_FIXTURE_PATH="${FIRE_V1_FIXTURE_PATH}"
+    PRIVATE FIRE_TINYLLAMA_PATH="${FIRE_TINYLLAMA_PATH}"
 )
 
 add_test(
