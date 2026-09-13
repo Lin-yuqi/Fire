@@ -4,6 +4,8 @@
 #include "cuda/add_kernel.cuh"
 #include "cpu/rmsnorm_kernel.h"
 #include "cuda/rmsnorm_kernel.cuh"
+#include "cpu/matmul.h"
+#include "cuda/matmul.cuh"
 
 // -----------------kernel begin------------------
 namespace kernel {
@@ -34,11 +36,21 @@ RMSNormKernelDim get_rmsnorm_kernel_dim(base::DeviceType dtype){
     if(dtype==base::DeviceType::GPU){
         return rmsnorm_kernel_cu_dim;
     }else{
-        LOG(FATAL)<<"Unknown device type for get a add kernel.";
+        LOG(FATAL)<<"Unknown device type for get a rmsnorm kernel.";
         return nullptr;
     }
 }
 
+MatmulKernel get_matmul_kernel(base::DeviceType dtype){
+    if(dtype==base::DeviceType::CPU){
+        return matmul_kernel_cpu;
+    }else if(dtype==base::DeviceType::GPU){
+        return matmul_kernel_cu;
+    }else{
+        LOG(FATAL)<<"Unknown device type for get a matmul kernel.";
+        return nullptr;
+    }
+}
 
 }
 // -----------------kernel end--------------------

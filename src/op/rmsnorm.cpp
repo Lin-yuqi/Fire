@@ -17,7 +17,7 @@ base::Status RmsNormOp::forward(const tensor::Tensor& input, tensor::Tensor& out
 
 
     // 这里如果要量化的话，可能还得做细分
-    auto weight = _params[0]._data;
+    auto& weight = _params[0]._data;
     auto dtype = context._device_type;
     if(input.dims().size()!=1){
         kernel::get_rmsnorm_kernel_dim(dtype)(input,weight,output,_eps,context._stream);
