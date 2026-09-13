@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <memory>
 #include <glog/logging.h>
+#include <map>
 
 // ----------------base begin---------------
 namespace base{
@@ -34,11 +35,26 @@ public:
     void* allocate(size_t sz)const override;
 };
 
+struct CudaMemoryBuffer {
+  void* data;
+  size_t byte_size;
+  bool busy;
+
+  CudaMemoryBuffer() = default;
+
+  CudaMemoryBuffer(void* data, size_t byte_size, bool busy)
+      : data(data), byte_size(byte_size), busy(busy) {}
+};
+
 class GPUAllocator : public DeviceAllocator{
 public:
     explicit GPUAllocator();
     void release(void* ptr) const override;
     void* allocate(size_t sz)const override;
+    private:
+  mutable std::map<int, size_t> _no_busy_cnt;
+  mutable std::map<int, std::vector<CudaMemoryBuffer>> _big_buffers_map;
+  mutable std::map<int, std::vector<CudaMemoryBuffer>> _cuda_buffers_map;
 };
 
 class CPUAllocatorFactory{
