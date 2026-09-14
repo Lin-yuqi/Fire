@@ -2,7 +2,7 @@
 
 > 状态：Accepted。Q1-Q15 的格式、职责、失败语义和验收边界已经确认。
 
-> 实现进度（2026-09-11）：FireWriter、TinyLlama-specific exporter、FireReader 与 core wire/profile 合同测试已完成并接入 CTest。真实 checkpoint 的 metadata 已确认为 201 项、`data_offset = 19,328`、计划文件长度 `4,400,212,864` bytes。完整 4.4 GB payload 导出、FireReader 的 201 项解析与选定真实权重数值回读尚未执行，TinyLlama ModelLoader 也尚未实现；因此 Export Compatibility 和 Model Support 均仍未宣称完成。
+> 实现进度（2026-09-14）：FireWriter、TinyLlama-specific exporter、FireReader 与 core wire/profile 合同测试已完成并接入 CTest。`TinyllamaLoader` 已支持按名字读取单个 CPU mmap Tensor view；完整 `load_weights()` 入口和结构化权重类型已建立，201 项语义校验与组装仍未实现。真实 checkpoint 的 metadata 已确认为 201 项、`data_offset = 19,328`、计划文件长度 `4,400,212,864` bytes；完整 payload 导出、FireReader 全量解析与选定真实权重数值回读尚无完整验收记录，因此 Export Compatibility 和 Model Support 均仍未宣称完成。模型接口与后续执行设计见 [模型层设计](model_design_v0_1.md)。
 
 ## 1. 目标
 
@@ -14,7 +14,8 @@ Hugging Face checkpoint
         -> .fire
         -> C++ FireReader (mmap)
         -> TinyLlama ModelLoader
-        -> Tensor / Layer
+        -> TinyLlamaWeights
+        -> TinyLlamaModel / Operator（待实现模型组装与执行）
 ```
 
 `.fire` 是可 mmap 的 Fire Tensor Container，而不是通用或自描述的模型 checkpoint。它通过 tensor directory 消除 exporter 与 loader 对隐式 tensor 排列顺序的依赖。
@@ -52,15 +53,18 @@ v0.1 的输入边界是本地、精确匹配该 Model Profile 的 `config.json` 
 - 使用 `open + fstat + mmap` 打开整个 `.fire` 文件。
 - 验证 Header、Tensor Directory 和 payload 范围。
 - 建立 `name -> TensorInfo` 索引；`find(name)` 在未打开或名称不存在时均返回 `nullptr`。
+- 通过 `tensor_count()` 返回目录项数；尚未成功打开时为 `0`，具体模型应有多少项由 Loader 判断。
 - 通过 `mapped_buffer()` 提供共享 mmap backing storage，使 Tensor 可以独立于 Reader 生命周期持有 mapping。
 - 不创建模型、Layer 或 Operator，也不理解具体 Model Profile。
 
 ### TinyLlama ModelLoader
 
-- 内置 TinyLlama v0.1 的精确模型配置和所需 tensor 清单。
-- 严格验证 201 个 canonical tensor 的名称、FP32 dtype、shape 和 byte size。
-- 用 FireReader 的共享 mmap Buffer 和绝对 byte offset 构造 CPU Tensor view，或同步复制到 CUDA Tensor。
-- 将 tensor 绑定到对应 Layer；不解析 HF/safetensors。
+- 与模型组装共用 `TinyLlamaProfile` 的精确配置，按 canonical name 读取 tensor；不解析 HF/safetensors。
+- 完整加载入口应严格验证 201 个 canonical tensor 的名称、FP32 dtype、shape 和 byte size，再交付 `TinyLlamaWeights`。
+- 用 FireReader 的共享 mmap Buffer 和绝对 byte offset 构造 CPU Tensor view。
+- 权重迁移是绑定前的显式步骤；具体 Model 负责将结构化权重绑定到 Operator。
+
+当前 `open()` 只验证 `.fire` 容器；`loader_tensor()` 只读取单个具名 Tensor，均不能证明 TinyLlama profile 完整有效。`load_weights()` 暂时调用 `base::error::FunctionNotImplement()` 返回未实现状态，并保持输出权重不变；完整校验与组装是下一步工作。
 
 ## 4. `.fire` Format Version 1
 
@@ -132,7 +136,7 @@ wire dtype 编号不复用 C++ `base::DataType` 的枚举序号；FireReader 负
 
 ## 7. TinyLlama 固定模型配置
 
-`.fire` v1 不保存模型 metadata。TinyLlama ModelLoader 固定持有并使用：
+`.fire` v1 不保存模型 metadata。C++ 固定配置定义于 `include/Fire/model/tinyllama_weights.h` 的 `TinyLlamaProfile`，由 Loader 与模型组装共用：
 
 | Field | Value |
 | --- | ---: |
@@ -230,12 +234,13 @@ Python 实现应避免两个不必要的内存放大点：
 ```cpp
 base::Status FireReader::open(const std::string& path);
 const TensorInfo* FireReader::find(std::string_view name) const;
+size_t FireReader::tensor_count() const noexcept;
 std::shared_ptr<base::Buffer> FireReader::mapped_buffer() const;
 ```
 
-`find()` 只做 lookup：未打开或名称不存在均返回 `nullptr`，不返回 `InvalidArgument`。`mapped_buffer()` 在未打开时返回空 `shared_ptr`。TinyLlama ModelLoader 将缺少 required tensor、额外 tensor 或 dtype/rank/shape profile 不匹配报告为 `ModelParseError`；只有完整 profile 通过后才构造并交付模型。
+`find()` 只做 lookup：未打开或名称不存在均返回 `nullptr`，不返回 `InvalidArgument`。`tensor_count()` 在尚未成功打开时返回 `0`；`mapped_buffer()` 此时返回空 `shared_ptr`。完整 TinyLlama 加载的目标合同是：将缺少 required tensor、额外 tensor 或 dtype/rank/shape profile 不匹配报告为 `ModelParseError`；只有完整 profile 通过后才交付结构化权重，失败时输出保持原状。当前 `load_weights()` 尚未实现该校验。
 
-`find()` 返回的指针由 Reader 持有，只在该 Reader 存活期间有效；需要跨越 Reader 生命周期的数据所有权必须通过 `mapped_buffer()` 交给 Tensor。实现不得使用现有会进入 `LOG(FATAL)` 的 `STATUS_CHECK` 宏处理 Reader/ModelLoader 的外部输入错误，而应显式返回相应 `base::Status`。
+`find()` 返回的指针由 Reader 持有，只在该 Reader 存活且未成功重新打开文件期间有效；v0.1 仍按每个文件使用新 Reader 的约定。需要跨越 Reader 生命周期的数据所有权必须通过 `mapped_buffer()` 交给 Tensor。实现不得使用现有会进入 `LOG(FATAL)` 的 `STATUS_CHECK` 宏处理 Reader/ModelLoader 的外部输入错误，而应显式返回相应 `base::Status`。
 
 ## 12. 最小验收测试
 
@@ -277,4 +282,4 @@ Python writer 测试还应验证：preflight 失败时不创建目标；目标�
 
 完整 TinyLlama 导出不进入 core test。发布 v0.1 前必须在本地执行真实导出，确认 FireReader 解析 201 项、TinyLlama ModelLoader 接受完整 profile，并对 embedding、首尾层、final norm 和 output 的选定元素做 bit-exact FP32 回读。
 
-当前只完成了真实 source metadata 的只读核对；全量 payload 写出、上述 FireReader 回读和 ModelLoader profile 验收仍待完成。
+当前有真实 source metadata 的只读核对记录；全量 payload 写出、上述 FireReader 回读和完整 ModelLoader profile 校验尚无完整验收记录。已有单个 Norm 权重读取与 CUDA RMSNorm 集成测试，不能替代这些验收。

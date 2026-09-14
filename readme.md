@@ -56,6 +56,7 @@ Fire/
 │   └── export_tinyllama.py
 ├── docs/
 │   ├── model_export_v0_1.md
+│   ├── model_design_v0_1.md
 │   └── repo_map.md
 ├── CONTEXT.md
 ├── CMakeLists.txt
@@ -106,8 +107,14 @@ op/
 ```
 
 其中 CPU/CUDA Kernel 和 `.fire` v1 `FireReader` 均编入 `Fire::fire`。
-当前已接入 FP32 Add 与 RMSNorm；RMSNorm 支持自定义 epsilon、
-CUDA stream，以及按最后一维处理二维输入。
+当前已接入 FP32 Add、RMSNorm、Matmul 与 Linear；RMSNorm 支持自定义
+epsilon、CUDA stream，以及按最后一维处理二维输入。Matmul/Linear
+已有 CPU/CUDA kernel 路径，现有数值测试覆盖 CPU 基线。
+
+模型层已有 `Model` 纯接口、TinyLlama 固定 profile、结构化权重和 Block
+参数组织；Loader 已支持按名字读取单个 mmap Tensor view，完整权重加载
+入口仍为占位。设计与实施边界见
+[`docs/model_design_v0_1.md`](docs/model_design_v0_1.md)。
 
 ### `test`
 
@@ -235,8 +242,8 @@ Autoregressive Inference
 计划实现或继续完善的功能包括：
 
 * RoPE、Softmax、SwiGLU
-* TinyLlama 全量导出/回读验收与 ModelLoader
-* MatMul/GEMV/GEMM 及相关量化路径
+* TinyLlama 全量导出/回读验收、完整 profile 校验与结构化权重加载
+* MatMul 真实 shape/CUDA 验证、性能优化及量化路径
 * Attention、KV Cache
 * Tokenizer
 * Sampling
@@ -253,14 +260,20 @@ Autoregressive Inference
 CPU/CUDA kernel 分派均已接入构建。向量 Add 已具备 CPU/CUDA FP32 实现；
 RMSNorm 已具备 CPU 一维和 CUDA 一维/二维 FP32 路径，并覆盖自定义 epsilon、
 非默认 stream、非 4 整数倍宽度及参数错误测试。RMSNorm 的量化权重尚不支持。
+Matmul/Linear 已有 FP32 实现与 CPU 数值测试；CUDA 与真实模型 shape 的
+验证仍需补齐。
 
 `.fire` v1 的 Writer、TinyLlama-specific exporter、mmap FireReader 与自动化
 wire/profile 合同测试已完成。真实 checkpoint 的 metadata 已确认为
 201 项，但完整 4.4 GB FP32 导出、FireReader 全量解析与选定元素
-bit-exact 回读尚未执行，因此 Export Compatibility 仍未宣称完成。
+bit-exact 回读尚无完整验收记录，因此 Export Compatibility 仍未宣称完成。
 
-下一阶段先完成该真实导出/回读里程碑，再实现 TinyLlama ModelLoader
-并在真实 shape 上建立 MatMul 基线。完整 Transformer 和 Runtime 仍在开发中。
+`Model` 的 `config/prepare/forward/reset` 契约、`TinyLlamaProfile`、
+`TinyLlamaWeights` 与 `TinyLlamaBlock` 参数结构已建立。
+`TinyllamaLoader::load_weights()` 暂时返回未实现状态，不交付完整权重；
+具体 `TinyLlamaModel`、参数绑定、Runtime 和完整推理尚未实现。
+下一阶段补齐 Loader 的 201 项校验和结构化加载，完成真实导出/回读验收，
+再连接缺失算子、KV Cache 与模型执行。
 
 ---
 

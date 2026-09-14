@@ -1,6 +1,6 @@
 # Fire 仓库地图
 
-> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后核对日期：2026-09-11。
+> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后核对日期：2026-09-14。
 
 ## 1. 项目定位与当前阶段
 
@@ -10,17 +10,19 @@ Fire 是一个以学习和实验为目标、从零构建的轻量级 CUDA 推理
 
 - `base` 模块已经接入构建，提供 CPU/GPU 分配器、内存拷贝以及 Buffer 生命周期管理。
 - `tensor` 已接入 `Fire::fire`，具备接口和初步实现，并开始覆盖 Buffer 字节偏移与 clone 行为。
-- `op` 已建立 `Operator`、`ParamOperator` 与执行上下文 `OpContext`，并接通向量 Add 和 RMSNorm。
+- `op` 已建立 `Operator`、`ParamOperator` 与执行上下文 `OpContext`，并接通 Add、RMSNorm、Matmul 和 Linear。`ParamOperator` 显式允许移动、禁止复制，支持按值组织 Block 中的参数算子。
 - Add 已提供 CPU（Armadillo）与 CUDA FP32 kernel，通过设备类型分派，并覆盖公共 `forward`、参数校验、边界尺寸和非默认 stream 测试。
 - RMSNorm 已提供 CPU 一维及 CUDA 一维/二维 FP32 kernel，支持自定义 epsilon 和 CUDA stream；非 4 整数倍行宽会在未对齐行使用标量路径，避免 `float4` 未对齐访问。
+- Matmul/Linear 已具备 FP32 CPU/CUDA kernel 路径与 CPU 数值测试；CUDA 和真实模型 shape 的验证仍需补齐。
 - `model` 已实现 `FireReader`：通过 `open + fstat + mmap` 校验 `.fire` v1，建立 name index，并通过共享 `Buffer` 维持 mapping 生命周期。
 - `tools` 已实现 model-specific TinyLlama exporter 与最小 FireWriter：验证固定的 201 tensor profile，并按两遍流程写出 FP32 `.fire`。
 - 独立 260-byte fixture、Reader 异常矩阵、mapping ownership 和 exporter/writer 失败语义均已接入自动化测试。
-- runtime、TinyLlama ModelLoader 和模型执行结构仍未建立。
+- `TinyllamaLoader` 已支持按名字读取单个 CPU mmap Tensor view；`load_weights()` 已留出完整加载入口，目前返回未实现状态，不修改输出。
+- `Model` 纯接口、`TinyLlamaProfile`、`TinyLlamaWeights` 与 `TinyLlamaBlock` 参数结构已建立；完整 profile 校验、参数绑定、具体 `TinyLlamaModel` 和 Runtime 尚未实现。
 
-因此，当前 Base、Tensor、Operator、Add、RMSNorm kernel 和 FireReader 均已编入 `Fire::fire`；Python exporter/writer 作为独立工具运行。RMSNorm 的量化配置已能表示，但当前算子会拒绝量化权重。
+因此，当前 Base、Tensor、Operator、已实现的 CPU/CUDA kernel、FireReader 和 Loader 均已编入 `Fire::fire`；Python exporter/writer 作为独立工具运行。RMSNorm 和 Linear 的量化配置已能表示，但当前算子会拒绝量化权重。
 
-现阶段将 `DeviceAllocator → Buffer → Tensor → Operator → kernel 分派` 和 `Source Checkpoint → exporter → FireWriter → FireReader` 视为可继续扩展的基础结构。下一步先完成真实 TinyLlama 全量导出与回读里程碑，再进入 ModelLoader 和模型执行；实际开发中发现接口缺口时再做针对性调整。
+现阶段将 `DeviceAllocator → Buffer → Tensor → Operator → kernel 分派` 和 `Source Checkpoint → exporter → FireWriter → FireReader → 单 Tensor view` 视为可继续扩展的基础结构。下一步补齐 Loader 的完整 profile 校验与结构化加载，完成真实 TinyLlama 全量导出与回读验收，再连接模型执行。模型层契约与分阶段设计见 [模型层设计](model_design_v0_1.md)。
 
 ## 2. 顶层导航
 
@@ -37,11 +39,17 @@ Fire/
 │   ├── tensor/
 │   │   └── tensor.h               # Tensor 元数据、存储、迁移接口
 │   ├── model/
-│   │   └── fire_reader.h          # .fire Reader 与解码后 TensorInfo 接口
+│   │   ├── fire_reader.h          # .fire Reader、TensorInfo 与目录项数查询
+│   │   ├── tinyllama_loader.h     # 单 Tensor view 读取与完整加载占位接口
+│   │   ├── model.h                # ModelConfig 与 Model 纯接口
+│   │   ├── tinyllama_weights.h    # 固定 profile 与结构化权重
+│   │   └── tinyllama.h            # TinyLlamaBlock 参数结构；尚无模型执行
 │   └── op/
 │       ├── operator.h             # Operator、参数与执行上下文
 │       ├── add.h                  # VecAddOp 接口
-│       └── rmsnorm.h              # RmsNormOp 接口与 epsilon 配置
+│       ├── rmsnorm.h              # RmsNormOp 接口与 epsilon 配置
+│       ├── matmul.h               # 无绑定参数的 MatmulOp
+│       └── linear.h               # 绑定 weight/可选 bias 的 LinearOp
 ├── src/
 │   ├── CMakeLists.txt             # fire 静态库定义；收集模块及 CPU/CUDA kernel
 │   ├── base/
@@ -52,30 +60,39 @@ Fire/
 │   ├── tensor/
 │   │   └── tensor.cpp             # Tensor 初步实现
 │   ├── model/
-│   │   └── fire_reader.cpp        # v1 校验、mmap ownership 与 name index
+│   │   ├── fire_reader.cpp        # v1 校验、mmap ownership 与 name index
+│   │   └── tinyllama_loader.cpp   # 单 Tensor view 读取；load_weights 返回未实现
 │   ├── op/
 │   │   ├── operator.cpp           # Operator 公共检查与参数管理
 │   │   ├── add.cpp                # VecAddOp 校验与 kernel 调度
 │   │   ├── rmsnorm.cpp            # RmsNormOp 校验与 kernel 调度
+│   │   ├── matmul.cpp             # MatmulOp 校验与 kernel 调度
+│   │   ├── linear.cpp             # LinearOp 参数检查与 kernel 调度
 │   │   └── kernels/
-│   │       ├── kernels_interface.*# 按设备类型分派 Add/RMSNorm kernel
+│   │       ├── kernels_interface.*# 按设备类型分派 Add/RMSNorm/Matmul kernel
 │   │       ├── cpu/add_kernel.*   # Armadillo FP32 向量加法
 │   │       ├── cpu/rmsnorm_kernel.* # CPU FP32 RMSNorm
+│   │       ├── cpu/matmul.*       # Armadillo FP32 矩阵乘
 │   │       ├── cuda/add_kernel.*  # CUDA FP32 向量加法
-│   │       └── cuda/rmsnorm_kernel.* # CUDA FP32 RMSNorm
+│   │       ├── cuda/rmsnorm_kernel.* # CUDA FP32 RMSNorm
+│   │       └── cuda/matmul.*      # CUDA FP32 分块矩阵乘
 ├── test/
 │   ├── CMakeLists.txt             # 单一 fire_tests 测试可执行文件
 │   ├── test_base/test_buffer.cpp  # Buffer 自有/外部内存测试
 │   ├── test_tensor/test_tensor.cpp# Tensor 字节偏移与 clone 测试
 │   ├── test_model/
 │   │   ├── test_fire_reader.cpp   # Reader wire/error/lifetime 合同测试
+│   │   ├── test_model.cpp         # Block 移动语义与 TinyLlama Norm epsilon
+│   │   ├── test_tinyllama_loader.cpp # 单个真实 Norm 权重的 CUDA 集成测试
 │   │   ├── test_export_tinyllama.py # Writer/exporter Python 合同测试
 │   │   └── generate_fire_v1_fixture.py # 独立 260-byte v1 fixture 生成器
 │   ├── test_op/test_op.cpp        # Operator 与 Add 测试
 │   ├── test_op/test_rmsnorm.cpp   # RMSNorm CPU/CUDA 与错误分支测试
+│   ├── test_op/test_matmul.cpp    # CPU Matmul/Linear 数值测试
 │   └── utils.cu/.cuh              # CUDA 测试辅助函数
 ├── docs/
 │   ├── model_export_v0_1.md       # TinyLlama 导出、.fire v1 与验收设计
+│   ├── model_design_v0_1.md       # Model 契约、权重与执行设计及实施边界
 │   └── repo_map.md                # 本文
 ├── tools/
 │   ├── fire_writer.py             # model-agnostic .fire v1 writer
@@ -91,7 +108,7 @@ Fire/
 | --- | --- |
 | CUDA Toolkit | CUDA runtime、GPU 内存分配/拷贝；项目配置阶段即强制需要 |
 | glog | `CHECK`、`LOG` 断言与日志 |
-| Armadillo | CPU Add kernel 的向量运算后端 |
+| Armadillo | CPU Add/Matmul kernel 的运算后端 |
 | GoogleTest | 仅在 `BUILD_TESTING=ON` 时查找，用于测试 |
 | Python 3 | `BUILD_TESTING=ON` 时生成独立 fixture 并运行 Writer/exporter 合同测试；也用于 exporter CLI |
 | NumPy、safetensors | Writer/exporter 合同测试与实际导出的 Python 运行时依赖 |
@@ -101,14 +118,17 @@ Fire/
 
 ```text
 Fire (project)
-├── fire / Fire::fire             # 静态库；包含 base、tensor、op、FireReader 与 CPU/CUDA kernel
+├── fire / Fire::fire             # 静态库；包含 base、tensor、op、model 与 CPU/CUDA kernel
 ├── fire_v1_fixture               # build-tree 内生成独立 260-byte fixture
 └── fire_tests                    # 依赖 fixture，链接 Fire::fire + GTest::gtest_main
     ├── test_base/test_buffer.cpp
     ├── test_tensor/test_tensor.cpp
     ├── test_model/test_fire_reader.cpp
+    ├── test_model/test_model.cpp
+    ├── test_model/test_tinyllama_loader.cpp
     ├── test_op/test_op.cpp
     ├── test_op/test_rmsnorm.cpp
+    ├── test_op/test_matmul.cpp
     └── utils.cu
 
 CTest registration
@@ -123,7 +143,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-当前 build 配置的最近验证结果为 CTest 26 项、0 失败、4 项因现有 CUDA/环境条件跳过；Python Writer/exporter 合同的 13 个 unittest 均通过。真实 TinyLlama metadata 已确认为 201 项、`data_offset = 19,328`、计划文件长度 `4,400,212,864` bytes，但未在本阶段执行完整 4.4 GB payload 导出与回读。
+CTest 注册 C++ GTest 与 Python Writer/exporter 合同测试；具体通过与跳过数量以当前运行结果为准。真实 TinyLlama metadata 已确认为 201 项、`data_offset = 19,328`、计划文件长度 `4,400,212,864` bytes；完整 payload 导出与选定数值回读尚无完整验收记录。
 
 ## 4. 模块关系
 
@@ -192,15 +212,20 @@ Buffer 已接入库目标和测试目标，也是 Tensor 底层存储的基础�
 
 Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测试；设备迁移与更多行为测试仍待完善，详见第 6 节。
 
-### `model`: FireReader
+### `model`: Reader、Loader 与模型骨架
 
 命名空间为 `model`。`TensorInfo` 是 FireReader 对调用方返回的 name、dtype、dims、绝对 byte offset 和 byte size；它不是 96-byte wire struct。`FireReader` 提供以下公共 seam：
 
 - `open(path)` 使用 `open + fstat + mmap` 读取文件，对 Header、Directory、payload 范围、连续性和文件尾执行完整 v1 校验，并返回 `base::Status`。
 - `find(name)` 在 Reader 未打开或名称不存在时返回 `nullptr`。
+- `tensor_count()` 返回已解析的目录项数，尚未成功打开时为 `0`；Reader 不判断某个模型需要多少项。
 - `mapped_buffer()` 返回整个 mmap 的共享 ownership；由此构造的 Tensor view 可以活得比 Reader 更久。
 
 `open()` 先在局部 RAII 状态中完成解析与 name index 构建，成功后才提交成员状态。Reader 已编入 `Fire::fire`；独立 wire fixture、坏文件矩阵、`uint64` 溢出、Status 分类和 mapping lifetime 测试均为 active。
+
+`TinyllamaLoader::open()` 复用 Reader 的容器校验；`loader_tensor(name, output)` 根据 metadata 构造共享 mmap 的 CPU Tensor view，不验证 TinyLlama profile。`load_weights(output)` 是完整 profile 加载的占位入口，目前调用 `base::error::FunctionNotImplement()` 返回未实现状态且不修改输出。目标是完整验证后一次性交付 `TinyLlamaWeights`，由模型组装负责绑定 Operator。
+
+`model.h` 定义单序列 `Model` 的 `config/prepare/forward/reset` 纯接口；`tinyllama_weights.h` 定义唯一的 C++ 固定 profile 与按层组织的 Tensor 字段；`tinyllama.h` 当前只有 `TinyLlamaBlock` 的 Norm/Linear 成员。Block 默认不绑定权重，也没有 forward；具体 `TinyLlamaModel`、Runtime、KV Cache 和完整执行留待后续实现。
 
 ### `tools`: exporter/writer
 
@@ -210,15 +235,17 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 独立 fixture 生成器与 Python 合同测试已接入 CTest；`fire_v1_fixture` 是 `fire_tests` 的构建依赖，而非需要手动运行的非默认前置。本阶段没有引入通用 model adapter、registry、provider、planner 或 streaming framework。
 
-### `op`: Operator、Add 与 RMSNorm
+### `op`: Operator、Add、RMSNorm、Matmul 与 Linear
 
-命名空间为 `op`。`Operator` 保存算子类型和名称，并提供 Tensor 非空、设备、数据类型及维度检查；`ParamOperator` 管理带量化配置的参数列表。`OpContext` 描述单次执行的设备、CUDA stream、allocator 和 workspace。
+命名空间为 `op`。`Operator` 保存算子类型和名称，并提供 Tensor 非空、设备、数据类型及维度检查；`ParamOperator` 管理带量化配置的参数列表，显式禁止复制并支持移动，使参数算子可按值放入 Block 容器。`OpContext` 描述单次执行的设备、CUDA stream、allocator 和 workspace。
 
 `VecAddOp::forward` 先检查三个 Tensor 的设备、数据类型与 shape，再根据 `OpContext::_device_type` 选择 CPU 或 CUDA kernel。当前 Add 只实现 FP32：CPU 路径通过 Armadillo `fvec` 相加，CUDA 路径由每个线程处理一个元素并进行边界检查，也可使用调用方传入的 stream。
 
 `RmsNormOp::forward` 从输入最后一维确定归一化宽度，检查 FP32 输入、输出和单个未量化 weight 参数，并按设备和输入维数选择 kernel。CPU 路径当前只接受一维输入；GPU 路径覆盖一维向量和二维 `{rows, width}` 输入。二维 kernel 在行起点满足 16 字节对齐时使用 `float4`，否则回退到标量访问，因此 width 不是 4 的整数倍时不会对后续行进行未对齐的 `float4` 访问。
 
 Add 测试已覆盖公共 `VecAddOp::forward` 的 CPU/GPU 路径、参数错误、边界尺寸和非默认 stream。RMSNorm 测试覆盖 CPU 正确性、自定义 epsilon、参数错误、CUDA 打包尾部以及二维非 4 整数倍行宽。
+
+`MatmulOp` 接受一维或二维输入和 `[out_features, in_features]` 权重，计算 `scale * input * weight^T`。CPU 使用 Armadillo，CUDA 使用分块 kernel。`LinearOp` 绑定 weight 和可选 bias，复用 Matmul/Add kernel，并拒绝量化参数。现有 Matmul/Linear 数值测试覆盖 CPU 向量/矩阵及向量 bias；CUDA 和真实模型 shape 的验收仍需补齐。
 
 ## 5. 关键运行路径
 
@@ -241,7 +268,8 @@ RMSNorm 的当前调用路径是：
 1. `export_tinyllama.py` 在目标创建前校验 config 和 201 项 source metadata。
 2. `FireWriter` 按规划好的绝对 offset 写入 Header、Directory 和逐项 FP32 payload。
 3. `FireReader::open` mmap 整个文件并验证所有 v1 不变量，`find` 按 canonical name 返回解码后 metadata。
-4. 调用方用 `mapped_buffer()` 与 absolute byte offset 构造 Tensor view；TinyLlama ModelLoader 尚未实现。
+4. `TinyllamaLoader::loader_tensor` 用 `mapped_buffer()` 与 absolute byte offset 构造单个 CPU Tensor view。
+5. 完整 `load_weights()` 校验与组装仍为占位；它尚不能输出完整 `TinyLlamaWeights` 或建立可运行模型。
 
 外部内存路径则由 `Buffer(ptr, capacity, device_type)` 包装；`owns_memory()` 为 false，调用方仍负责外部指针的生命周期。
 
@@ -253,7 +281,8 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 
 1. **部分 CUDA 返回值未检查**：部分 memcpy/memset 路径忽略 CUDA API 返回的 `cudaError_t`，失败时可能缺少及时、准确的错误信息；按当前约定可继续使用 `CHECK/LOG(FATAL)` 报错，无需引入额外错误类型。
 2. **RMSNorm 支持范围有限**：当前只有 FP32 实现，CPU 仅支持一维输入，GPU 多行路径已验证二维 `{rows, width}`；更高维输入的所有前导维度尚未完整接入 block 调度。量化 weight 会返回 `InvalidArgument`。
-3. **模型导入尚未完整闭环**：`.fire` v1 写入、TinyLlama-specific 两遍 exporter、mmap Reader 及自动化 wire/profile 合同测试已完成；完整 4.4 GB 真实导出与选定数值回读、TinyLlama ModelLoader、runtime、MatMul 及其量化 kernel 仍未完成。因此尚不宣称 Export Compatibility 或 Model Support 达标。
+3. **模型导入尚未完整闭环**：`.fire` v1 写入、TinyLlama-specific 两遍 exporter、mmap Reader 和单 Tensor view 读取已实现。完整 4.4 GB 真实导出与选定数值回读尚无完整验收记录；Loader 的 201 项校验与结构化加载、参数绑定、具体模型和 Runtime 尚未实现，因此尚不宣称 Export Compatibility 或 Model Support 达标。
+4. **Matmul 验证与量化仍待补齐**：已有 FP32 CPU/CUDA 实现及 CPU 数值测试；真实模型 shape、CUDA 验证、性能优化和量化路径属于后续工作。
 
 ## 7. 修改入口速查
 
@@ -278,8 +307,8 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 当前基础抽象已形成初步闭环，近期按以下顺序推进：
 
 1. 执行真实 TinyLlama 全量导出，用 FireReader 解析 201 项并对选定元素做 bit-exact FP32 回读，完成 Export Compatibility 验收。
-2. 实现 TinyLlama ModelLoader，再接入模型 Layer 和端到端生成校验。
-3. 在真实模型 shape 上建立 FP32 MatMul 基线及正确性测试，明确 Operator、weight 布局和 kernel 分派接口。
+2. 实现 `TinyllamaLoader::load_weights()` 的完整校验与结构化加载，再补齐 Block 参数绑定、缺失算子、KV Cache 和 `TinyLlamaModel` 执行。
+3. 在现有 FP32 Matmul/Linear 基线上补齐真实模型 shape 与 CUDA 正确性测试。
 4. 在 FP32 基线稳定后准备 MatMul 量化路径；复用现有 `QuantConfig` 表达量化方式，并分别验证量化参数、数值误差和 CUDA kernel 边界。
 5. 后续再连接 Transformer 其他算子、KV cache、Tokenizer 与自回归 Runtime。
 

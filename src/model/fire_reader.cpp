@@ -349,6 +349,8 @@ const TensorInfo* FireReader::find(std::string_view name) const {
     return &_tensors.at(entry->second);
 }
 
+size_t FireReader::tensor_count() const noexcept { return _tensors.size(); }
+
 std::shared_ptr<base::Buffer> FireReader::mapped_buffer() const { return _mapped_buffer; }
 
 } // namespace model

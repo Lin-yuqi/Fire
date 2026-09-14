@@ -125,6 +125,11 @@ public:
 
     virtual ~ParamOperator() = default;
 
+    ParamOperator(const ParamOperator&) = delete;
+    ParamOperator& operator=(const ParamOperator&) = delete;
+    ParamOperator(ParamOperator&&) = default;
+    ParamOperator& operator=(ParamOperator&&) = default;
+
 public:
     size_t param_size() const;
 

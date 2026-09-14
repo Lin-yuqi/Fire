@@ -118,6 +118,7 @@ TEST(FireReaderTest, UnopenedReaderHasNoTensorOrMappedBuffer) {
 
     EXPECT_EQ(reader.find("norm.weight"), nullptr);
     EXPECT_EQ(reader.mapped_buffer(), nullptr);
+    EXPECT_EQ(reader.tensor_count(), 0U);
 }
 
 TEST(FireReaderTest, OpensTheIndependentWireContractFixture) {
@@ -125,6 +126,7 @@ TEST(FireReaderTest, OpensTheIndependentWireContractFixture) {
     const base::Status status = reader.open(FIRE_V1_FIXTURE_PATH);
     ASSERT_TRUE(status.ok()) << status.message();
     EXPECT_EQ(status.code(), base::StatusCode::Success);
+    EXPECT_EQ(reader.tensor_count(), 2U);
 
     const std::shared_ptr<base::Buffer> mapping = reader.mapped_buffer();
     ASSERT_NE(mapping, nullptr);

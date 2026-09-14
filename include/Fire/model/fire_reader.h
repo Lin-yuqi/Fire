@@ -42,9 +42,13 @@ class FireReader final {
     base::Status open(const std::string& path);
 
     // Returns Reader-owned metadata. The pointer is valid only while this
-    // Reader remains alive. An unopened Reader and a missing name both return
-    // nullptr.
+    // Reader remains alive and is not successfully reopened. An unopened Reader
+    // and a missing name both return nullptr.
     const TensorInfo* find(std::string_view name) const;
+
+    // Number of directory entries, or zero before the first successful open.
+    // Model-specific expectations about this count belong to the Loader.
+    size_t tensor_count() const noexcept;
 
     // Shares ownership of the whole mmap with CPU Tensor views. Returns an
     // empty shared_ptr before a successful open.

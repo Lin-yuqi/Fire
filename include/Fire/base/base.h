@@ -45,6 +45,12 @@ enum StatusCode : uint8_t {
   InvalidArgument = 7,
 };
 
+enum TokenizerType{
+    Unknown = -1,
+    SPE =0,
+    BPE
+};
+
 class Status {
 public:
     Status() = default;
