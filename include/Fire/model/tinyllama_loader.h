@@ -20,9 +20,8 @@ class TinyllamaLoader {
     // TinyLlama profile. The returned CPU view shares the mmap's lifetime.
     base::Status loader_tensor(const std::string& name, tensor::Tensor& output_tensor) const;
 
-    // Planned complete-profile entry: validate all 201 names/dtypes/shapes, then
-    // publish CPU views as one result. Failure leaves output_weights unchanged.
-    // Scaffold only: currently returns FunctionUnImplement without modifying output.
+    // Validates all 201 names/dtypes/shapes, then publishes CPU views as one
+    // result. Failure leaves output_weights unchanged.
     base::Status load_weights(TinyLlamaWeights& output_weights) const;
 
   private:

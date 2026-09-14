@@ -11,7 +11,7 @@ v0.1 只面向 `TinyLlama/TinyLlama-1.1B-Chat-v1.0` 的单序列、单 token、F
 | 内容 | 当前状态 | 代码入口 |
 | --- | --- | --- |
 | `ModelConfig`、`Model` | 已定义纯抽象接口，无运行状态成员 | [model.h](../include/Fire/model/model.h) |
-| 固定 `TinyLlamaProfile`、结构化权重 | 已定义；默认构造的权重不代表合法模型 | [tinyllama_weights.h](../include/Fire/model/tinyllama_weights.h) |
+| 固定 `TinyLlamaProfile`、结构化权重 | 已定义；默认构造的权重不代表合法模型 | [model_weights.h](../include/Fire/model/model_weights.h) |
 | `TinyLlamaBlock` | 已组织两处 Norm 和七个 Linear；未绑定权重、无 block forward | [tinyllama.h](../include/Fire/model/tinyllama.h) |
 | `ParamOperator` 移动语义 | 已显式提供移动构造/赋值，继续禁止复制，支持按值存放 Block | [operator.h](../include/Fire/op/operator.h) |
 | `FireReader::tensor_count()` | 已实现通用目录数量查询，未打开时为 0 | [fire_reader.h](../include/Fire/model/fire_reader.h) |

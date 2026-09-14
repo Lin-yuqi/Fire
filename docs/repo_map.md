@@ -42,7 +42,7 @@ Fire/
 │   │   ├── fire_reader.h          # .fire Reader、TensorInfo 与目录项数查询
 │   │   ├── tinyllama_loader.h     # 单 Tensor view 读取与完整加载占位接口
 │   │   ├── model.h                # ModelConfig 与 Model 纯接口
-│   │   ├── tinyllama_weights.h    # 固定 profile 与结构化权重
+│   │   ├── model_weights.h        # 固定 profile 与结构化权重
 │   │   └── tinyllama.h            # TinyLlamaBlock 参数结构；尚无模型执行
 │   └── op/
 │       ├── operator.h             # Operator、参数与执行上下文
@@ -225,7 +225,7 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 `TinyllamaLoader::open()` 复用 Reader 的容器校验；`loader_tensor(name, output)` 根据 metadata 构造共享 mmap 的 CPU Tensor view，不验证 TinyLlama profile。`load_weights(output)` 是完整 profile 加载的占位入口，目前调用 `base::error::FunctionNotImplement()` 返回未实现状态且不修改输出。目标是完整验证后一次性交付 `TinyLlamaWeights`，由模型组装负责绑定 Operator。
 
-`model.h` 定义单序列 `Model` 的 `config/prepare/forward/reset` 纯接口；`tinyllama_weights.h` 定义唯一的 C++ 固定 profile 与按层组织的 Tensor 字段；`tinyllama.h` 当前只有 `TinyLlamaBlock` 的 Norm/Linear 成员。Block 默认不绑定权重，也没有 forward；具体 `TinyLlamaModel`、Runtime、KV Cache 和完整执行留待后续实现。
+`model.h` 定义单序列 `Model` 的 `config/prepare/forward/reset` 纯接口；`model_weights.h` 定义唯一的 C++ 固定 profile 与按层组织的 Tensor 字段；`tinyllama.h` 当前只有 `TinyLlamaBlock` 的 Norm/Linear 成员。Block 默认不绑定权重，也没有 forward；具体 `TinyLlamaModel`、Runtime、KV Cache 和完整执行留待后续实现。
 
 ### `tools`: exporter/writer
 

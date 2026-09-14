@@ -136,7 +136,7 @@ wire dtype 编号不复用 C++ `base::DataType` 的枚举序号；FireReader 负
 
 ## 7. TinyLlama 固定模型配置
 
-`.fire` v1 不保存模型 metadata。C++ 固定配置定义于 `include/Fire/model/tinyllama_weights.h` 的 `TinyLlamaProfile`，由 Loader 与模型组装共用：
+`.fire` v1 不保存模型 metadata。C++ 固定配置定义于 `include/Fire/model/model_weights.h` 的 `TinyLlamaProfile`，由 Loader 与模型组装共用：
 
 | Field | Value |
 | --- | ---: |

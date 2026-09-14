@@ -1,9 +1,11 @@
 #include "Fire/model/model.h"
 #include "Fire/model/tinyllama.h"
+#include "Fire/model/tinyllama_loader.h"
 
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <filesystem>
 #include <type_traits>
 #include <vector>
 
@@ -11,6 +13,49 @@ static_assert(std::is_abstract_v<model::Model>);
 static_assert(!std::is_copy_constructible_v<model::TinyLlamaBlock>);
 static_assert(std::is_move_constructible_v<model::TinyLlamaBlock>);
 static_assert(std::is_move_assignable_v<model::TinyLlamaBlock>);
+
+TEST(ModelStructureTest, LoadsTinyLlamaWeights) {
+    if (!std::filesystem::exists(FIRE_TINYLLAMA_PATH)) {
+        GTEST_SKIP() << "TinyLlama .fire file is unavailable: " << FIRE_TINYLLAMA_PATH;
+    }
+
+    model::TinyLlamaWeights weights;
+    float final_norm_first_value = 0.0f;
+    {
+        model::TinyllamaLoader loader;
+        auto status = loader.open(FIRE_TINYLLAMA_PATH);
+        ASSERT_TRUE(status.ok()) << status.message();
+
+        status = loader.load_weights(weights);
+        ASSERT_TRUE(status.ok()) << status.message();
+
+        ASSERT_EQ(weights.layers.size(),
+                  static_cast<size_t>(model::TinyLlamaProfile::num_layers));
+        EXPECT_EQ(weights.embedding.dims(),
+                  (std::vector<int32_t>{model::TinyLlamaProfile::model.vocab_size,
+                                        model::TinyLlamaProfile::hidden_size}));
+        EXPECT_EQ(weights.layers.front().wq.dims(),
+                  (std::vector<int32_t>{model::TinyLlamaProfile::hidden_size,
+                                        model::TinyLlamaProfile::hidden_size}));
+        EXPECT_EQ(weights.layers.back().w3.dims(),
+                  (std::vector<int32_t>{model::TinyLlamaProfile::intermediate_size,
+                                        model::TinyLlamaProfile::hidden_size}));
+        EXPECT_EQ(weights.norm.dims(),
+                  (std::vector<int32_t>{model::TinyLlamaProfile::hidden_size}));
+        EXPECT_EQ(weights.output.dims(),
+                  (std::vector<int32_t>{model::TinyLlamaProfile::model.vocab_size,
+                                        model::TinyLlamaProfile::hidden_size}));
+
+        EXPECT_EQ(weights.embedding.device_type(), base::DeviceType::CPU);
+        EXPECT_FALSE(weights.embedding.is_empty());
+        EXPECT_FALSE(weights.layers.back().w3.is_empty());
+        EXPECT_FALSE(weights.output.is_empty());
+        final_norm_first_value = weights.norm.ptr<float>()[0];
+    }
+
+    // Structured Tensor views own the shared mmap after Loader destruction.
+    EXPECT_FLOAT_EQ(weights.norm.ptr<float>()[0], final_norm_first_value);
+}
 
 TEST(ModelStructureTest, BlockVectorGrowthPreservesBoundParameters) {
     auto allocator = base::CPUAllocatorFactory::get_instance();
