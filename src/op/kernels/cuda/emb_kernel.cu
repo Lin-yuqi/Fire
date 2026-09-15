@@ -1,4 +1,4 @@
-#include "emb.cuh"
+#include "emb_kernel.cuh"
 
 namespace kernel {
 

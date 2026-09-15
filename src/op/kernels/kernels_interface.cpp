@@ -4,10 +4,10 @@
 #include "cuda/add_kernel.cuh"
 #include "cpu/rmsnorm_kernel.h"
 #include "cuda/rmsnorm_kernel.cuh"
-#include "cpu/matmul.h"
-#include "cuda/matmul.cuh"
-#include "cpu/emb.h"
-#include "cuda/emb.cuh"
+#include "cpu/matmul_kernel.h"
+#include "cuda/matmul_kernel.cuh"
+#include "cpu/emb_kernel.h"
+#include "cuda/emb_kernel.cuh"
 
 // -----------------kernel begin------------------
 namespace kernel {

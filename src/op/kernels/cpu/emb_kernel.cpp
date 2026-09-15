@@ -1,4 +1,4 @@
-#include "emb.h"
+#include "emb_kernel.h"
 #include "Fire/base/alloc.h"
 #include <armadillo>
 #include <cstdint>

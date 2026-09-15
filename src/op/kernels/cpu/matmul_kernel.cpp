@@ -1,4 +1,4 @@
-#include "matmul.h"
+#include "matmul_kernel.h"
 #include <armadillo>
 namespace kernel {
 

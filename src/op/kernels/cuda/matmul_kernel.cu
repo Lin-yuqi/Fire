@@ -1,4 +1,4 @@
-#include "matmul.cuh"
+#include "matmul_kernel.cuh"
 namespace kernel {
 /*简单实现，一个线程搬运一个数据*/
 // __global__ void matmul_kernel_cu_fp32(const float* input1, const float* input2, float scale,

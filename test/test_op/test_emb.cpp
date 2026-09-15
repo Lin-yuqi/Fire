@@ -10,8 +10,8 @@
 #include "Fire/base/alloc.h"
 #include "Fire/op/embedding.h"
 #include "Fire/tensor/tensor.h"
-#include "cpu/emb.h"
-#include "cuda/emb.cuh"
+#include "cpu/emb_kernel.h"
+#include "cuda/emb_kernel.cuh"
 #include "kernels_interface.h"
 
 namespace {

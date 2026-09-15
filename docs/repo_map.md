@@ -72,10 +72,10 @@ Fire/
 │   │       ├── kernels_interface.*# 按设备类型分派 Add/RMSNorm/Matmul kernel
 │   │       ├── cpu/add_kernel.*   # Armadillo FP32 向量加法
 │   │       ├── cpu/rmsnorm_kernel.* # CPU FP32 RMSNorm
-│   │       ├── cpu/matmul.*       # Armadillo FP32 矩阵乘
+│   │       ├── cpu/matmul_kernel.* # Armadillo FP32 矩阵乘
 │   │       ├── cuda/add_kernel.*  # CUDA FP32 向量加法
 │   │       ├── cuda/rmsnorm_kernel.* # CUDA FP32 RMSNorm
-│   │       └── cuda/matmul.*      # CUDA FP32 分块矩阵乘
+│   │       └── cuda/matmul_kernel.* # CUDA FP32 分块矩阵乘
 ├── test/
 │   ├── CMakeLists.txt             # 单一 fire_tests 测试可执行文件
 │   ├── test_base/test_buffer.cpp  # Buffer 自有/外部内存测试
