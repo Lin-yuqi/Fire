@@ -8,6 +8,8 @@
 #include "cuda/matmul_kernel.cuh"
 #include "cpu/emb_kernel.h"
 #include "cuda/emb_kernel.cuh"
+#include "cpu/rope_kernel.h"
+#include "cuda/rope_kernel.cuh"
 
 // -----------------kernel begin------------------
 namespace kernel {
@@ -61,6 +63,17 @@ EmbeddingKernel get_embedding_kernel(base::DeviceType dtype) {
         return emb_kernel_cu;
     } else {
         LOG(FATAL) << "Unknown device type for get a emb kernel.";
+        return nullptr;
+    }
+}
+
+RoPEKernel get_rope_kernel(base::DeviceType dtype) {
+    if (dtype == base::DeviceType::CPU) {
+        return rope_kernel_cpu;
+    } else if (dtype == base::DeviceType::GPU) {
+        return rope_kernel_cu;
+    } else {
+        LOG(FATAL) << "Unknown device type for get a rope kernel.";
         return nullptr;
     }
 }
