@@ -6,51 +6,64 @@
 #include "cuda/rmsnorm_kernel.cuh"
 #include "cpu/matmul.h"
 #include "cuda/matmul.cuh"
+#include "cpu/emb.h"
+#include "cuda/emb.cuh"
 
 // -----------------kernel begin------------------
 namespace kernel {
 
-AddKernel get_add_kernel(base::DeviceType dtype){
-    if(dtype==base::DeviceType::CPU){
+AddKernel get_add_kernel(base::DeviceType dtype) {
+    if (dtype == base::DeviceType::CPU) {
         return add_kernel_cpu;
-    }else if(dtype==base::DeviceType::GPU){
+    } else if (dtype == base::DeviceType::GPU) {
         return add_kernel_cu;
-    }else{
-        LOG(FATAL)<<"Unknown device type for get a add kernel.";
+    } else {
+        LOG(FATAL) << "Unknown device type for get a add kernel.";
         return nullptr;
     }
 }
 
-RMSNormKernel get_rmsnorm_kernel(base::DeviceType dtype){
-    if(dtype==base::DeviceType::CPU){
+RMSNormKernel get_rmsnorm_kernel(base::DeviceType dtype) {
+    if (dtype == base::DeviceType::CPU) {
         return rmsnorm_kernel_cpu;
-    }else if(dtype==base::DeviceType::GPU){
+    } else if (dtype == base::DeviceType::GPU) {
         return rmsnorm_kernel_cu;
-    }else{
-        LOG(FATAL)<<"Unknown device type for get a add kernel.";
+    } else {
+        LOG(FATAL) << "Unknown device type for get a add kernel.";
         return nullptr;
     }
 }
 
-RMSNormKernelDim get_rmsnorm_kernel_dim(base::DeviceType dtype){
-    if(dtype==base::DeviceType::GPU){
+RMSNormKernelDim get_rmsnorm_kernel_dim(base::DeviceType dtype) {
+    if (dtype == base::DeviceType::GPU) {
         return rmsnorm_kernel_cu_dim;
-    }else{
-        LOG(FATAL)<<"Unknown device type for get a rmsnorm kernel.";
+    } else {
+        LOG(FATAL) << "Unknown device type for get a rmsnorm kernel.";
         return nullptr;
     }
 }
 
-MatmulKernel get_matmul_kernel(base::DeviceType dtype){
-    if(dtype==base::DeviceType::CPU){
+MatmulKernel get_matmul_kernel(base::DeviceType dtype) {
+    if (dtype == base::DeviceType::CPU) {
         return matmul_kernel_cpu;
-    }else if(dtype==base::DeviceType::GPU){
+    } else if (dtype == base::DeviceType::GPU) {
         return matmul_kernel_cu;
-    }else{
-        LOG(FATAL)<<"Unknown device type for get a matmul kernel.";
+    } else {
+        LOG(FATAL) << "Unknown device type for get a matmul kernel.";
         return nullptr;
     }
 }
 
+EmbeddingKernel get_embedding_kernel(base::DeviceType dtype) {
+    if (dtype == base::DeviceType::CPU) {
+        return emb_kernel_cpu;
+    } else if (dtype == base::DeviceType::GPU) {
+        return emb_kernel_cu;
+    } else {
+        LOG(FATAL) << "Unknown device type for get a emb kernel.";
+        return nullptr;
+    }
 }
+
+} // namespace kernel
 // -----------------kernel end--------------------
