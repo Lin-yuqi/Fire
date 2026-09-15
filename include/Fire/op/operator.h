@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <Fire/base/base.h>
 #include <initializer_list>
@@ -51,6 +52,14 @@ struct Parameter {
 
     bool is_quantized() const {
         return _quant_config._quant_type != QuantType::None;
+    }
+
+    void to_cuda(){
+        _data.to_cuda();
+    }
+
+    void to_cpu(){
+        _data.to_cpu();
     }
 };
 
@@ -140,6 +149,10 @@ public:
     const Parameter& get_param(size_t idx) const;
 
     void set_param(size_t idx,const Parameter& param);
+
+    void set_param(size_t idx,const tensor::Tensor& data);
+
+    void to_cuda();
 protected:
     std::vector<Parameter> _params;
 };
