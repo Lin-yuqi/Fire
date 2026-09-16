@@ -10,6 +10,10 @@
 #include "cuda/emb_kernel.cuh"
 #include "cpu/rope_kernel.h"
 #include "cuda/rope_kernel.cuh"
+#include "cpu/softmax_kernel.h"
+#include "cuda/softmax_kernel.cuh"
+#include "cpu/swiglu_kernel.h"
+#include "cuda/swiglu_kernel.cuh"
 
 // -----------------kernel begin------------------
 namespace kernel {
@@ -78,13 +82,35 @@ RoPEKernel get_rope_kernel(base::DeviceType dtype) {
     }
 }
 
-RoPECacheKernel get_rope_cache_kernel(base::DeviceType dtype){
+RoPECacheKernel get_rope_cache_kernel(base::DeviceType dtype) {
     if (dtype == base::DeviceType::CPU) {
         return sin_cos_cache_kernel_cpu;
     } else if (dtype == base::DeviceType::GPU) {
         return sin_cos_cache_kernel_cu;
     } else {
         LOG(FATAL) << "Unknown device type for get a rope kernel.";
+        return nullptr;
+    }
+}
+
+SwiGLUKernel get_swiglu_kernel(base::DeviceType dtype) {
+    if (dtype == base::DeviceType::CPU) {
+        return swiglu_kernel_cpu;
+    } else if (dtype == base::DeviceType::GPU) {
+        return swiglu_kernel_cu;
+    } else {
+        LOG(FATAL) << "Unknown device type for get a swiglu kernel.";
+        return nullptr;
+    }
+}
+
+SoftmaxKernel get_softmax_kernel(base::DeviceType dtype) {
+    if (dtype == base::DeviceType::CPU) {
+        return softmax_kernel_cpu;
+    } else if (dtype == base::DeviceType::GPU) {
+        return softmax_kernel_cu;
+    } else {
+        LOG(FATAL) << "Unknown device type for get a swiglu kernel.";
         return nullptr;
     }
 }
