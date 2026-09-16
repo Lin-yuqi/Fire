@@ -78,5 +78,16 @@ RoPEKernel get_rope_kernel(base::DeviceType dtype) {
     }
 }
 
+RoPECacheKernel get_rope_cache_kernel(base::DeviceType dtype){
+    if (dtype == base::DeviceType::CPU) {
+        return sin_cos_cache_kernel_cpu;
+    } else if (dtype == base::DeviceType::GPU) {
+        return sin_cos_cache_kernel_cu;
+    } else {
+        LOG(FATAL) << "Unknown device type for get a rope kernel.";
+        return nullptr;
+    }
+}
+
 } // namespace kernel
 // -----------------kernel end--------------------

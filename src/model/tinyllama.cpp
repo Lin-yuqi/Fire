@@ -3,6 +3,7 @@
 #include "Fire/base/base.h"
 #include "Fire/model/model_weights.h"
 #include "Fire/tensor/tensor.h"
+#include "../op/kernels/kernels_interface.h"
 #include <memory>
 #include <utility>
 
@@ -71,22 +72,41 @@ base::Status TinyLlamaModel::prepare(int32_t capacity, const op::OpContext& cont
         base::DataType::Fp32, {TinyLlamaProfile::num_kv_heads, TinyLlamaProfile::head_dim}, alloc);
 
     // attention
-    runtime->attention_score = tensor::Tensor(base::DataType::Fp32,{TinyLlamaProfile::num_attention_heads,capacity});
-    runtime->attention_output = tensor::Tensor(base::DataType::Fp32,{TinyLlamaProfile::hidden_size},alloc);
-    runtime->attention_projected = tensor::Tensor(base::DataType::Fp32,{TinyLlamaProfile::hidden_size},alloc);
-    runtime->attention_projected = tensor::Tensor(base::DataType::Fp32,{TinyLlamaProfile::hidden_size},alloc);
-    runtime->attention_residual = tensor::Tensor(base::DataType::Fp32,{TinyLlamaProfile::hidden_size},alloc);
-
+    runtime->attention_score =
+        tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::num_attention_heads, capacity});
+    runtime->attention_output =
+        tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::hidden_size}, alloc);
+    runtime->attention_projected =
+        tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::hidden_size}, alloc);
+    runtime->attention_projected =
+        tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::hidden_size}, alloc);
+    runtime->attention_residual =
+        tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::hidden_size}, alloc);
 
     // FFN
-    runtime->ffn_gate = tensor::Tensor(base::DataType::Fp32,{TinyLlamaProfile::intermediate_size},alloc);
-    runtime->ffn_activated = tensor::Tensor(base::DataType::Fp32,{TinyLlamaProfile::intermediate_size},alloc);
-    runtime->ffn_up = tensor::Tensor(base::DataType::Fp32,{TinyLlamaProfile::intermediate_size},alloc);
-    runtime->ffn_down =tensor::Tensor(base::DataType::Fp32,{TinyLlamaProfile::hidden_size},alloc);
+    runtime->ffn_gate =
+        tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::intermediate_size}, alloc);
+    runtime->ffn_activated =
+        tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::intermediate_size}, alloc);
+    runtime->ffn_up =
+        tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::intermediate_size}, alloc);
+    runtime->ffn_down =
+        tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::hidden_size}, alloc);
     // 5. 分配 KVCache
-    runtime->kv_cache.allocate(TinyLlamaProfile::num_layers, capacity, TinyLlamaProfile::num_kv_heads, TinyLlamaProfile::head_dim, alloc);
+    runtime->kv_cache.allocate(TinyLlamaProfile::num_layers, capacity,
+                               TinyLlamaProfile::num_kv_heads, TinyLlamaProfile::head_dim, alloc);
     // 6. 准备 RoPE cache
-    //TODO
+    // {max_seq_len, head_size / 2}，每对前后半区元素共用一份 sin/cos。
+    runtime->rope_cos =
+        tensor::Tensor(base::DataType::Fp32,
+                       {TinyLlamaProfile::model.max_seq_len, TinyLlamaProfile::head_dim / 2}, alloc);
+    runtime->rope_sin =
+        tensor::Tensor(base::DataType::Fp32,
+                       {TinyLlamaProfile::model.max_seq_len, TinyLlamaProfile::head_dim / 2}, alloc);
+    kernel::get_rope_cache_kernel(context._device_type)(
+        TinyLlamaProfile::head_dim, TinyLlamaProfile::model.max_seq_len,
+        TinyLlamaProfile::rope_theta, runtime->rope_sin, runtime->rope_cos, context._stream);
+
     // 7. 全部成功后再发布到 _runtime
     _runtime = std::move(runtime);
     return base::error::Success();
@@ -95,10 +115,9 @@ base::Status TinyLlamaModel::prepare(int32_t capacity, const op::OpContext& cont
 base::Status TinyLlamaModel::forward(int32_t token_id, int32_t pos, tensor::Tensor& logits,
                                      const op::OpContext& context) {}
 
-base::Status TinyLlamaModel::reset(const op::OpContext& ) {
+base::Status TinyLlamaModel::reset(const op::OpContext&) {
     if (_runtime == nullptr) {
-        return base::error::InternalError(
-            "TinyLlamaModel has not been prepared");
+        return base::error::InternalError("TinyLlamaModel has not been prepared");
     }
 
     _runtime->kv_cache.reset();

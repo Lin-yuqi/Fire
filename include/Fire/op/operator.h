@@ -18,7 +18,8 @@ enum class OpType:uint8_t{
     MHA,
     Softmax,
     Add,
-    SwiGLU
+    SwiGLU,
+    RoPE
 };
 
 enum class QuantType : uint8_t {
