@@ -34,6 +34,10 @@ typedef void (*SwiGLUKernel)(const tensor::Tensor& input1, const tensor::Tensor&
 
 typedef void (*SoftmaxKernel)(const tensor::Tensor& inuput, tensor::Tensor& output, void* stream);
 
+typedef void (*MHAKernel)(const tensor::Tensor& input_q, const tensor::Tensor& key_cache,
+                          const tensor::Tensor& val_cache, tensor::Tensor& score,
+                          tensor::Tensor& output, int32_t layer_idx, int32_t pos, void* stream);
+
 AddKernel get_add_kernel(base::DeviceType dtype);
 
 RMSNormKernel get_rmsnorm_kernel(base::DeviceType dtype);
@@ -51,6 +55,8 @@ RoPECacheKernel get_rope_cache_kernel(base::DeviceType dtype);
 SwiGLUKernel get_swiglu_kernel(base::DeviceType dtype);
 
 SoftmaxKernel get_softmax_kernel(base::DeviceType dtype);
+
+MHAKernel get_mha_kernel(base::DeviceType dtype);
 
 } // namespace kernel
 // -----------------kernel end--------------------

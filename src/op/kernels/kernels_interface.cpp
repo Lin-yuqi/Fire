@@ -14,6 +14,8 @@
 #include "cuda/softmax_kernel.cuh"
 #include "cpu/swiglu_kernel.h"
 #include "cuda/swiglu_kernel.cuh"
+#include "cpu/mha_kernel.h"
+#include "cuda/mha_kernel.cuh"
 
 // -----------------kernel begin------------------
 namespace kernel {
@@ -111,6 +113,17 @@ SoftmaxKernel get_softmax_kernel(base::DeviceType dtype) {
         return softmax_kernel_cu;
     } else {
         LOG(FATAL) << "Unknown device type for get a swiglu kernel.";
+        return nullptr;
+    }
+}
+
+MHAKernel get_mha_kernel(base::DeviceType dtype) {
+    if (dtype == base::DeviceType::CPU) {
+        return mha_kernel_cpu;
+    } else if (dtype == base::DeviceType::GPU) {
+        return mha_kernel_cu;
+    } else {
+        LOG(FATAL) << "Unknown device type for get a mha kernel.";
         return nullptr;
     }
 }

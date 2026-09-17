@@ -73,7 +73,7 @@ base::Status TinyLlamaModel::prepare(int32_t capacity, const op::OpContext& cont
 
     // attention
     runtime->attention_score =
-        tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::num_attention_heads, capacity});
+        tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::num_attention_heads, capacity},alloc);
     runtime->attention_output =
         tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::hidden_size}, alloc);
     runtime->attention_projected =
