@@ -1,6 +1,6 @@
 # Fire 仓库地图
 
-> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后核对日期：2026-09-14。
+> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后核对日期：2026-09-17。
 
 ## 1. 项目定位与当前阶段
 
@@ -10,19 +10,22 @@ Fire 是一个以学习和实验为目标、从零构建的轻量级 CUDA 推理
 
 - `base` 模块已经接入构建，提供 CPU/GPU 分配器、内存拷贝以及 Buffer 生命周期管理。
 - `tensor` 已接入 `Fire::fire`，具备接口和初步实现，并开始覆盖 Buffer 字节偏移与 clone 行为。
-- `op` 已建立 `Operator`、`ParamOperator` 与执行上下文 `OpContext`，并接通 Add、RMSNorm、Matmul 和 Linear。`ParamOperator` 显式允许移动、禁止复制，支持按值组织 Block 中的参数算子。
+- `op` 已建立 `Operator`、`ParamOperator` 与执行上下文 `OpContext`，并接通 Add、RMSNorm、Matmul、Linear、Embedding、RoPE 和 SwiGLU。Softmax 已有 CPU/CUDA kernel 与直接数值测试，但尚无公开 Operator 包装；MHA 仍为空骨架。`ParamOperator` 显式允许移动、禁止复制，支持按值组织 Block 中的参数算子。
 - Add 已提供 CPU（Armadillo）与 CUDA FP32 kernel，通过设备类型分派，并覆盖公共 `forward`、参数校验、边界尺寸和非默认 stream 测试。
 - RMSNorm 已提供 CPU 一维及 CUDA 一维/二维 FP32 kernel，支持自定义 epsilon 和 CUDA stream；非 4 整数倍行宽会在未对齐行使用标量路径，避免 `float4` 未对齐访问。
 - Matmul/Linear 已具备 FP32 CPU/CUDA kernel 路径与 CPU 数值测试；CUDA 和真实模型 shape 的验证仍需补齐。
+- Embedding 已提供 CPU/CUDA FP32 查表 kernel、公开参数检查和单/多 token 测试。
+- RoPE 已按 HF/TinyLlama 的前后半区配对实现 CPU/CUDA 旋转及紧凑 `[max_seq_len, head_dim / 2]` sin/cos cache，并覆盖非零位置、GQA head 数和非默认 stream 测试。
+- SwiGLU 已提供 CPU/CUDA FP32 逐元素实现，检查输入/输出 shape，并验证数值、输入只读性及 CUDA block 边界；Softmax kernel 覆盖一维/二维、原地/非原地、长行和数值稳定性。
 - `model` 已实现 `FireReader`：通过 `open + fstat + mmap` 校验 `.fire` v1，建立 name index，并通过共享 `Buffer` 维持 mapping 生命周期。
 - `tools` 已实现 model-specific TinyLlama exporter 与最小 FireWriter：验证固定的 201 tensor profile，并按两遍流程写出 FP32 `.fire`。
 - 独立 260-byte fixture、Reader 异常矩阵、mapping ownership 和 exporter/writer 失败语义均已接入自动化测试。
-- `TinyllamaLoader` 已支持按名字读取单个 CPU mmap Tensor view；`load_weights()` 已留出完整加载入口，目前返回未实现状态，不修改输出。
-- `Model` 纯接口、`TinyLlamaProfile`、`TinyLlamaWeights` 与 `TinyLlamaBlock` 参数结构已建立；完整 profile 校验、参数绑定、具体 `TinyLlamaModel` 和 Runtime 尚未实现。
+- `TinyllamaLoader` 已支持按名字读取单个 CPU mmap Tensor view；`load_weights()` 会校验 201 项 canonical tensor 的数量、名称、FP32 dtype 和 shape，在全部成功后发布结构化权重。
+- `Model` 纯接口、固定 profile、结构化权重和 Block 参数结构已建立。`TinyLlamaModel` 已有参数绑定、Runtime/KVCache 分配、RoPE cache 准备与 reset 骨架，但完整 token `forward`、MHA 和 KVCache 写入/长度提交尚未实现，因此模型仍不能执行端到端推理。
 
 因此，当前 Base、Tensor、Operator、已实现的 CPU/CUDA kernel、FireReader 和 Loader 均已编入 `Fire::fire`；Python exporter/writer 作为独立工具运行。RMSNorm 和 Linear 的量化配置已能表示，但当前算子会拒绝量化权重。
 
-现阶段将 `DeviceAllocator → Buffer → Tensor → Operator → kernel 分派` 和 `Source Checkpoint → exporter → FireWriter → FireReader → 单 Tensor view` 视为可继续扩展的基础结构。下一步补齐 Loader 的完整 profile 校验与结构化加载，完成真实 TinyLlama 全量导出与回读验收，再连接模型执行。模型层契约与分阶段设计见 [模型层设计](model_design_v0_1.md)。
+现阶段将 `DeviceAllocator → Buffer → Tensor → Operator → kernel 分派` 和 `Source Checkpoint → exporter → FireWriter → FireReader → TinyLlamaWeights` 视为可继续扩展的基础结构。下一步是补强 Loader 的失败矩阵和真实模型验收，并连接 MHA、KVCache 状态推进与完整模型执行。模型层契约与分阶段设计见 [模型层设计](model_design_v0_1.md)。
 
 ## 2. 顶层导航
 
@@ -40,16 +43,21 @@ Fire/
 │   │   └── tensor.h               # Tensor 元数据、存储、迁移接口
 │   ├── model/
 │   │   ├── fire_reader.h          # .fire Reader、TensorInfo 与目录项数查询
-│   │   ├── tinyllama_loader.h     # 单 Tensor view 读取与完整加载占位接口
+│   │   ├── tinyllama_loader.h     # 单 Tensor view 与 201 项结构化加载接口
 │   │   ├── model.h                # ModelConfig 与 Model 纯接口
 │   │   ├── model_weights.h        # 固定 profile 与结构化权重
-│   │   └── tinyllama.h            # TinyLlamaBlock 参数结构；尚无模型执行
+│   │   ├── kv_cache.h             # TinyLlama K/V 连续存储骨架
+│   │   └── tinyllama.h            # Block、部分模型组装与 typed Runtime
 │   └── op/
 │       ├── operator.h             # Operator、参数与执行上下文
 │       ├── add.h                  # VecAddOp 接口
+│       ├── embedding.h            # EmbeddingOp 参数绑定与查表接口
 │       ├── rmsnorm.h              # RmsNormOp 接口与 epsilon 配置
 │       ├── matmul.h               # 无绑定参数的 MatmulOp
-│       └── linear.h               # 绑定 weight/可选 bias 的 LinearOp
+│       ├── linear.h               # 绑定 weight/可选 bias 的 LinearOp
+│       ├── rope.h                 # half-split RoPE 原地旋转接口
+│       ├── swiglu.h               # SwiGLU 逐元素算子接口
+│       └── mha.h                  # MHA 占位头文件
 ├── src/
 │   ├── CMakeLists.txt             # fire 静态库定义；收集模块及 CPU/CUDA kernel
 │   ├── base/
@@ -61,21 +69,35 @@ Fire/
 │   │   └── tensor.cpp             # Tensor 初步实现
 │   ├── model/
 │   │   ├── fire_reader.cpp        # v1 校验、mmap ownership 与 name index
-│   │   └── tinyllama_loader.cpp   # 单 Tensor view 读取；load_weights 返回未实现
+│   │   ├── tinyllama_loader.cpp   # 201 项 profile 校验与结构化 CPU views
+│   │   ├── kv_cache.cpp           # K/V Tensor 分配与 reset 骨架
+│   │   └── tinyllama.cpp          # 参数绑定、Runtime 准备；forward 尚未接通
 │   ├── op/
 │   │   ├── operator.cpp           # Operator 公共检查与参数管理
 │   │   ├── add.cpp                # VecAddOp 校验与 kernel 调度
+│   │   ├── embedding.cpp          # EmbeddingOp 校验与 kernel 调度
 │   │   ├── rmsnorm.cpp            # RmsNormOp 校验与 kernel 调度
 │   │   ├── matmul.cpp             # MatmulOp 校验与 kernel 调度
 │   │   ├── linear.cpp             # LinearOp 参数检查与 kernel 调度
+│   │   ├── rope.cpp               # RoPE shape/cache 校验与 kernel 调度
+│   │   ├── swiglu.cpp             # SwiGLU 校验与 kernel 调度
+│   │   ├── mha.cpp                # MHA 空占位
 │   │   └── kernels/
-│   │       ├── kernels_interface.*# 按设备类型分派 Add/RMSNorm/Matmul kernel
+│   │       ├── kernels_interface.*# 按设备类型分派已接入的 CPU/CUDA kernel
 │   │       ├── cpu/add_kernel.*   # Armadillo FP32 向量加法
+│   │       ├── cpu/emb_kernel.*   # FP32 embedding 行拷贝
 │   │       ├── cpu/rmsnorm_kernel.* # CPU FP32 RMSNorm
 │   │       ├── cpu/matmul_kernel.* # Armadillo FP32 矩阵乘
+│   │       ├── cpu/rope_kernel.*  # half-split RoPE 与 cache 生成
+│   │       ├── cpu/softmax_kernel.* # 稳定 FP32 softmax
+│   │       ├── cpu/swiglu_kernel.* # FP32 SwiGLU
 │   │       ├── cuda/add_kernel.*  # CUDA FP32 向量加法
+│   │       ├── cuda/emb_kernel.*  # CUDA embedding 行拷贝
 │   │       ├── cuda/rmsnorm_kernel.* # CUDA FP32 RMSNorm
-│   │       └── cuda/matmul_kernel.* # CUDA FP32 分块矩阵乘
+│   │       ├── cuda/matmul_kernel.* # CUDA FP32 分块矩阵乘
+│   │       ├── cuda/rope_kernel.* # CUDA RoPE 与 cache 生成
+│   │       ├── cuda/softmax_kernel.* # CUDA 稳定 softmax
+│   │       └── cuda/swiglu_kernel.* # CUDA FP32 SwiGLU
 ├── test/
 │   ├── CMakeLists.txt             # 单一 fire_tests 测试可执行文件
 │   ├── test_base/test_buffer.cpp  # Buffer 自有/外部内存测试
@@ -87,8 +109,12 @@ Fire/
 │   │   ├── test_export_tinyllama.py # Writer/exporter Python 合同测试
 │   │   └── generate_fire_v1_fixture.py # 独立 260-byte v1 fixture 生成器
 │   ├── test_op/test_op.cpp        # Operator 与 Add 测试
+│   ├── test_op/test_emb.cpp       # Embedding 校验、CPU/CUDA 数值测试
 │   ├── test_op/test_rmsnorm.cpp   # RMSNorm CPU/CUDA 与错误分支测试
 │   ├── test_op/test_matmul.cpp    # CPU Matmul/Linear 数值测试
+│   ├── test_op/test_rope.cpp      # compact cache、half-split 与 GQA 测试
+│   ├── test_op/test_softmax.cpp   # CPU/CUDA 数值稳定性和宽度边界
+│   ├── test_op/test_swiglu.cpp    # SwiGLU 数值、校验及输入只读性测试
 │   └── utils.cu/.cuh              # CUDA 测试辅助函数
 ├── docs/
 │   ├── model_export_v0_1.md       # TinyLlama 导出、.fire v1 与验收设计
@@ -108,7 +134,7 @@ Fire/
 | --- | --- |
 | CUDA Toolkit | CUDA runtime、GPU 内存分配/拷贝；项目配置阶段即强制需要 |
 | glog | `CHECK`、`LOG` 断言与日志 |
-| Armadillo | CPU Add/Matmul kernel 的运算后端 |
+| Armadillo | CPU Add/Matmul/SwiGLU kernel 的运算后端 |
 | GoogleTest | 仅在 `BUILD_TESTING=ON` 时查找，用于测试 |
 | Python 3 | `BUILD_TESTING=ON` 时生成独立 fixture 并运行 Writer/exporter 合同测试；也用于 exporter CLI |
 | NumPy、safetensors | Writer/exporter 合同测试与实际导出的 Python 运行时依赖 |
@@ -127,8 +153,12 @@ Fire (project)
     ├── test_model/test_model.cpp
     ├── test_model/test_tinyllama_loader.cpp
     ├── test_op/test_op.cpp
+    ├── test_op/test_emb.cpp
     ├── test_op/test_rmsnorm.cpp
     ├── test_op/test_matmul.cpp
+    ├── test_op/test_rope.cpp
+    ├── test_op/test_softmax.cpp
+    ├── test_op/test_swiglu.cpp
     └── utils.cu
 
 CTest registration
@@ -177,6 +207,17 @@ kernel::get_rmsnorm_kernel[_dim](DeviceType)
       ├── CPU ── 一维 FP32 RMSNorm
       └── GPU ── 一维/二维 FP32 RMSNorm（支持可选 stream）
 
+EmbeddingOp / RoPEOp / SwiGLUOp
+      │  校验 dtype、shape、device 与算子特有约束
+      ▼
+kernel::get_*_kernel(DeviceType)
+      ├── CPU ── FP32 reference/Armadillo 路径
+      └── GPU ── CUDA FP32 kernel（支持调用方 stream）
+
+Softmax（当前仅 kernel 接口）
+      ├── CPU ── 稳定逐行 softmax
+      └── GPU ── block reduction；长行使用通用循环路径
+
 TinyLlama source checkpoint
       │
       ▼
@@ -223,9 +264,9 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 `open()` 先在局部 RAII 状态中完成解析与 name index 构建，成功后才提交成员状态。Reader 已编入 `Fire::fire`；独立 wire fixture、坏文件矩阵、`uint64` 溢出、Status 分类和 mapping lifetime 测试均为 active。
 
-`TinyllamaLoader::open()` 复用 Reader 的容器校验；`loader_tensor(name, output)` 根据 metadata 构造共享 mmap 的 CPU Tensor view，不验证 TinyLlama profile。`load_weights(output)` 是完整 profile 加载的占位入口，目前调用 `base::error::FunctionNotImplement()` 返回未实现状态且不修改输出。目标是完整验证后一次性交付 `TinyLlamaWeights`，由模型组装负责绑定 Operator。
+`TinyllamaLoader::open()` 复用 Reader 的容器校验；`loader_tensor(name, output)` 根据 metadata 构造共享 mmap 的 CPU Tensor view，不验证 TinyLlama profile。`load_weights(output)` 要求目录数量为 201，按 canonical name 逐项校验 FP32 dtype 和固定 shape，在局部对象中完成全部 view 组装后才移动发布 `TinyLlamaWeights`；任一失败不会发布部分结果。当前真实 `.fire` 集成测试会在文件存在时验证结构和 Loader 销毁后的 mmap ownership，但系统性的缺项、额外项和错误 shape 测试仍待补齐。
 
-`model.h` 定义单序列 `Model` 的 `config/prepare/forward/reset` 纯接口；`model_weights.h` 定义唯一的 C++ 固定 profile 与按层组织的 Tensor 字段；`tinyllama.h` 当前只有 `TinyLlamaBlock` 的 Norm/Linear 成员。Block 默认不绑定权重，也没有 forward；具体 `TinyLlamaModel`、Runtime、KV Cache 和完整执行留待后续实现。
+`model.h` 定义单序列 `Model` 的 `config/prepare/forward/reset` 纯接口；`model_weights.h` 定义唯一的 C++ 固定 profile 与按层组织的 Tensor 字段。`TinyLlamaModel::create` 已把结构化权重绑定到 Embedding、Norm 和 Linear 参数算子，`prepare` 已分配 typed Runtime、K/V Tensor 和紧凑 RoPE cache，`reset` 会清零当前 cache length。当前 `TinyLlamaModel::forward` 仍为空，`KVCache` 也尚无写入、view 和长度提交接口，因此这些模型代码属于部分组装状态，不构成可运行推理路径。
 
 ### `tools`: exporter/writer
 
@@ -235,7 +276,7 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 独立 fixture 生成器与 Python 合同测试已接入 CTest；`fire_v1_fixture` 是 `fire_tests` 的构建依赖，而非需要手动运行的非默认前置。本阶段没有引入通用 model adapter、registry、provider、planner 或 streaming framework。
 
-### `op`: Operator、Add、RMSNorm、Matmul 与 Linear
+### `op`: Operator 与 FP32 算子
 
 命名空间为 `op`。`Operator` 保存算子类型和名称，并提供 Tensor 非空、设备、数据类型及维度检查；`ParamOperator` 管理带量化配置的参数列表，显式禁止复制并支持移动，使参数算子可按值放入 Block 容器。`OpContext` 描述单次执行的设备、CUDA stream、allocator 和 workspace。
 
@@ -246,6 +287,14 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 Add 测试已覆盖公共 `VecAddOp::forward` 的 CPU/GPU 路径、参数错误、边界尺寸和非默认 stream。RMSNorm 测试覆盖 CPU 正确性、自定义 epsilon、参数错误、CUDA 打包尾部以及二维非 4 整数倍行宽。
 
 `MatmulOp` 接受一维或二维输入和 `[out_features, in_features]` 权重，计算 `scale * input * weight^T`。CPU 使用 Armadillo，CUDA 使用分块 kernel。`LinearOp` 绑定 weight 和可选 bias，复用 Matmul/Add kernel，并拒绝量化参数。现有 Matmul/Linear 数值测试覆盖 CPU 向量/矩阵及向量 bias；CUDA 和真实模型 shape 的验收仍需补齐。
+
+`EmbeddingOp` 绑定一个未量化 FP32 `[vocab_size, embedding_dim]` weight，接收同设备 INT32 token Tensor，并要求输出元素数等于 token 数乘 embedding width。CPU/CUDA kernel 都按 token 顺序复制权重行；测试覆盖单/多 token、错误参数和 CUDA 非对齐尾部。
+
+`RoPEOp` 原地修改二维 `[heads, head_dim]` query/key。`head_dim` 必须为正偶数，key heads 不得多于 query heads；sin/cos cache 使用 `[max_seq_len, head_dim / 2]`，每个 head 内按前后半区配对，符合未 permutation 的 HF Q/K 权重布局。CPU/CUDA cache 生成与旋转测试覆盖非零位置、GQA 和非默认 stream。
+
+`SwiGLUOp` 对同 shape FP32 Tensor 计算 `SiLU(gate) * up`。CPU/CUDA 实现都写入独立输出并保持 const 输入不变；测试覆盖一维/二维、错误 Tensor、selector 和 CUDA block 边界。
+
+Softmax 当前通过 `get_softmax_kernel` 和 CPU/CUDA kernel 暴露，支持一维向量或二维逐行计算、原地或非原地输出；CUDA 对宽度不超过 2048 的行使用固定寄存器项数，对更长行使用通用循环。它已有宽度边界、极值、等值 logits 和 `-inf` mask 测试，但尚无 `SoftmaxOp` 公共包装。
 
 ## 5. 关键运行路径
 
@@ -268,8 +317,8 @@ RMSNorm 的当前调用路径是：
 1. `export_tinyllama.py` 在目标创建前校验 config 和 201 项 source metadata。
 2. `FireWriter` 按规划好的绝对 offset 写入 Header、Directory 和逐项 FP32 payload。
 3. `FireReader::open` mmap 整个文件并验证所有 v1 不变量，`find` 按 canonical name 返回解码后 metadata。
-4. `TinyllamaLoader::loader_tensor` 用 `mapped_buffer()` 与 absolute byte offset 构造单个 CPU Tensor view。
-5. 完整 `load_weights()` 校验与组装仍为占位；它尚不能输出完整 `TinyLlamaWeights` 或建立可运行模型。
+4. `TinyllamaLoader::load_weights` 按 canonical name 校验 201 项 dtype/shape，用 `mapped_buffer()` 与 absolute byte offset 组装结构化 CPU Tensor views。
+5. `TinyLlamaModel::create/prepare` 已能绑定参数并准备部分 Runtime；完整模型 `forward` 尚未连接，不能产出 logits。
 
 外部内存路径则由 `Buffer(ptr, capacity, device_type)` 包装；`owns_memory()` 为 false，调用方仍负责外部指针的生命周期。
 
@@ -281,8 +330,9 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 
 1. **部分 CUDA 返回值未检查**：部分 memcpy/memset 路径忽略 CUDA API 返回的 `cudaError_t`，失败时可能缺少及时、准确的错误信息；按当前约定可继续使用 `CHECK/LOG(FATAL)` 报错，无需引入额外错误类型。
 2. **RMSNorm 支持范围有限**：当前只有 FP32 实现，CPU 仅支持一维输入，GPU 多行路径已验证二维 `{rows, width}`；更高维输入的所有前导维度尚未完整接入 block 调度。量化 weight 会返回 `InvalidArgument`。
-3. **模型导入尚未完整闭环**：`.fire` v1 写入、TinyLlama-specific 两遍 exporter、mmap Reader 和单 Tensor view 读取已实现。完整 4.4 GB 真实导出与选定数值回读尚无完整验收记录；Loader 的 201 项校验与结构化加载、参数绑定、具体模型和 Runtime 尚未实现，因此尚不宣称 Export Compatibility 或 Model Support 达标。
+3. **模型导入与执行尚未完整闭环**：`.fire` v1 写入、TinyLlama-specific 两遍 exporter、mmap Reader、201 项 Loader 校验、参数绑定和 Runtime 分配均已有实现。完整 4.4 GB 真实导出与选定数值回读尚无完整验收记录；模型 `forward`、MHA、KVCache 写入/view/长度提交仍缺失，因此尚不宣称 Export Compatibility 或 Model Support 达标。
 4. **Matmul 验证与量化仍待补齐**：已有 FP32 CPU/CUDA 实现及 CPU 数值测试；真实模型 shape、CUDA 验证、性能优化和量化路径属于后续工作。
+5. **Softmax 尚未形成 Operator**：CPU/CUDA kernel 和直接测试已完成，但调用方目前需要直接使用 kernel 接口；MHA 接通前还需补公共校验/调度层或明确由 MHA 内部封装。
 
 ## 7. 修改入口速查
 
@@ -307,10 +357,10 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 当前基础抽象已形成初步闭环，近期按以下顺序推进：
 
 1. 执行真实 TinyLlama 全量导出，用 FireReader 解析 201 项并对选定元素做 bit-exact FP32 回读，完成 Export Compatibility 验收。
-2. 实现 `TinyllamaLoader::load_weights()` 的完整校验与结构化加载，再补齐 Block 参数绑定、缺失算子、KV Cache 和 `TinyLlamaModel` 执行。
+2. 补齐 `TinyllamaLoader::load_weights()` 的失败矩阵测试，并修正 `TinyLlamaModel::create/prepare` 与 KVCache 的状态和错误处理契约。
 3. 在现有 FP32 Matmul/Linear 基线上补齐真实模型 shape 与 CUDA 正确性测试。
 4. 在 FP32 基线稳定后准备 MatMul 量化路径；复用现有 `QuantConfig` 表达量化方式，并分别验证量化参数、数值误差和 CUDA kernel 边界。
-5. 后续再连接 Transformer 其他算子、KV cache、Tokenizer 与自回归 Runtime。
+5. 连接 Softmax/MHA、KVCache 写入与长度提交、Block/TinyLlama `forward`，之后再接 Tokenizer 与自回归生成循环。
 
 ## 9. 文档维护约定
 
