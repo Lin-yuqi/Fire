@@ -7,7 +7,11 @@
 
 namespace op {
 MultiHeadAttentionOp::MultiHeadAttentionOp() : Operator(OpType::MHA) {}
-
+// q:         [num_attention_heads, head_dim]
+// key_cache: [num_layers, capacity, num_kv_heads, head_dim]
+// val_cache: [num_layers, capacity, num_kv_heads, head_dim]
+// score:     [num_attention_heads, capacity]
+// output:    [num_attention_heads, head_dim]
 base::Status MultiHeadAttentionOp::forward(const tensor::Tensor& input_q,
                                            const tensor::Tensor& key_cache,
                                            const tensor::Tensor& val_cache, tensor::Tensor& score,

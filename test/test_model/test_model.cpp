@@ -111,3 +111,67 @@ TEST(ModelStructureTest, BlockNormsUseTinyLlamaEpsilon) {
         EXPECT_NEAR(output.ptr<float>()[1], 0.002f * inverse_rms, 1e-6f);
     }
 }
+
+TEST(KVCacheTest, WritesKeyAndValueSeparatelyAndCommitsOneToken) {
+    auto allocator = base::CPUAllocatorFactory::get_instance();
+    model::KVCache cache;
+    ASSERT_TRUE(cache.allocate(2, 3, 2, 2, allocator).ok());
+
+    tensor::Tensor key(base::DataType::Fp32, {2, 2}, allocator);
+    tensor::Tensor value(base::DataType::Fp32, {2, 2}, allocator);
+    for (int32_t i = 0; i < 4; ++i) {
+        key.ptr<float>()[i] = static_cast<float>(i + 1);
+        value.ptr<float>()[i] = static_cast<float>(i + 11);
+    }
+
+    ASSERT_TRUE(cache.write(1, 0, key, value).ok());
+    constexpr size_t cache_offset = 12;
+    for (int32_t i = 0; i < 4; ++i) {
+        EXPECT_FLOAT_EQ(cache.key().ptr<float>()[cache_offset + i], key.ptr<float>()[i]);
+        EXPECT_FLOAT_EQ(cache.value().ptr<float>()[cache_offset + i], value.ptr<float>()[i]);
+    }
+
+    EXPECT_EQ(cache.length(), 0);
+    ASSERT_TRUE(cache.commit(0).ok());
+    EXPECT_EQ(cache.length(), 1);
+    EXPECT_EQ(cache.commit(0).code(), base::InvalidArgument);
+
+    cache.reset();
+    EXPECT_EQ(cache.length(), 0);
+}
+
+TEST(KVCacheTest, RejectsIncorrectWriteShapeAndCommitPosition) {
+    auto allocator = base::CPUAllocatorFactory::get_instance();
+    model::KVCache cache;
+    ASSERT_TRUE(cache.allocate(1, 2, 2, 2, allocator).ok());
+
+    tensor::Tensor flat_key(base::DataType::Fp32, {4}, allocator);
+    tensor::Tensor value(base::DataType::Fp32, {2, 2}, allocator);
+    EXPECT_EQ(cache.write(0, 0, flat_key, value).code(), base::InvalidArgument);
+    EXPECT_EQ(cache.commit(1).code(), base::InvalidArgument);
+    EXPECT_EQ(cache.length(), 0);
+}
+
+TEST(TinyLlamaPrepareTest, RejectsInvalidExecutionResourcesBeforeAllocation) {
+    model::TinyLlamaWeights weights;
+    weights.layers.resize(model::TinyLlamaProfile::num_layers);
+
+    op::OpContext create_context;
+    create_context._device_type = base::DeviceType::CPU;
+    std::unique_ptr<model::TinyLlamaModel> tinyllama;
+    ASSERT_TRUE(model::TinyLlamaModel::create(weights, create_context, tinyllama).ok());
+
+    op::OpContext context;
+    context._device_type = base::DeviceType::CPU;
+    EXPECT_EQ(tinyllama->prepare(1, context).code(), base::InvalidArgument);
+
+    context._allocator = base::GPUAllocatorFactory::get_instance();
+    EXPECT_EQ(tinyllama->prepare(1, context).code(), base::InvalidArgument);
+
+    context._device_type = base::DeviceType::Unknown;
+    context._allocator = base::CPUAllocatorFactory::get_instance();
+    EXPECT_EQ(tinyllama->prepare(1, context).code(), base::InvalidArgument);
+
+    context._device_type = base::DeviceType::CPU;
+    EXPECT_EQ(tinyllama->prepare(1, context).code(), base::InvalidArgument);
+}

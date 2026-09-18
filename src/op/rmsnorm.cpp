@@ -7,29 +7,28 @@
 namespace op {
 
 RmsNormOp::RmsNormOp() : ParamOperator(OpType::RMSNorm) {};
-RmsNormOp::RmsNormOp(const float eps):ParamOperator(OpType::RMSNorm),_eps(eps){};
+RmsNormOp::RmsNormOp(const float eps) : ParamOperator(OpType::RMSNorm), _eps(eps) {};
 base::Status RmsNormOp::forward(const tensor::Tensor& input, tensor::Tensor& output,
-                                OpContext context) {
+                                const OpContext& context) {
     const int32_t dim = input.dims().empty() ? 0 : input.dims().back();
     auto status = _check(input, output, dim, context);
     if (!status)
         return status;
 
-
     // 这里如果要量化的话，可能还得做细分
     auto& weight = _params[0]._data;
     auto dtype = context._device_type;
-    if(input.dims().size()!=1){
-        kernel::get_rmsnorm_kernel_dim(dtype)(input,weight,output,_eps,context._stream);
-    }else{
-        kernel::get_rmsnorm_kernel(dtype)(input,weight,output,_eps,context._stream);
+    if (input.dims().size() != 1) {
+        kernel::get_rmsnorm_kernel_dim(dtype)(input, weight, output, _eps, context._stream);
+    } else {
+        kernel::get_rmsnorm_kernel(dtype)(input, weight, output, _eps, context._stream);
     }
 
     return base::error::Success();
 }
 
 base::Status RmsNormOp::_check(const tensor::Tensor& input, tensor::Tensor& output, int32_t dim,
-                               OpContext context) {
+                               const OpContext& context) {
     if (dim <= 0) {
         return base::error::InvalidArgument("rmsnorm dimension must be positive");
     }

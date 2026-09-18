@@ -7,7 +7,7 @@ namespace op {
 SwiGLUOp::SwiGLUOp() : Operator(OpType::SwiGLU) {}
 
 base::Status SwiGLUOp::forward(const tensor::Tensor& input1, const tensor::Tensor& input2,
-                               tensor::Tensor& output, OpContext& context) {
+                               tensor::Tensor& output, const OpContext& context) {
     auto status = _check(input1, input2, output, context);
     if (!status)
         return status;
@@ -20,7 +20,7 @@ base::Status SwiGLUOp::forward(const tensor::Tensor& input1, const tensor::Tenso
 }
 
 base::Status SwiGLUOp::_check(const tensor::Tensor& input1, const tensor::Tensor& input2,
-                              tensor::Tensor& output, OpContext& context) {
+                              tensor::Tensor& output, const OpContext& context) {
     const auto device_type = context._device_type;
     if (device_type != base::DeviceType::CPU && device_type != base::DeviceType::GPU) {
         return base::error::InvalidArgument("swiglu requires a CPU or GPU device");

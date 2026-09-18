@@ -6,10 +6,10 @@ class SwiGLUOp : public Operator {
     explicit SwiGLUOp();
 
     base::Status forward(const tensor::Tensor& input1, const tensor::Tensor& input2,
-                         tensor::Tensor& output, OpContext& context);
+                         tensor::Tensor& output, const OpContext& context);
 
   private:
     base::Status _check(const tensor::Tensor& input1, const tensor::Tensor& input2,
-                        tensor::Tensor& output, OpContext& context);
+                        tensor::Tensor& output, const OpContext& context);
 };
 } // namespace op

@@ -1,4 +1,5 @@
 #include "emb_kernel.cuh"
+#include <cstdint>
 
 namespace kernel {
 
@@ -49,6 +50,7 @@ __global__ void emb_kernel_cu_fp32(int32_t dim, const int32_t* input, const floa
     }
 }
 
+
 void emb_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
                    tensor::Tensor& output, void* stream) {
     CHECK(!input.is_empty());
@@ -57,11 +59,11 @@ void emb_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
     int32_t dim = weight.get_dim(1);
 
     constexpr int thread_num = 256;
+    const float* wei = weight.ptr<float>();
+    float* out = output.ptr<float>();
     cudaStream_t _stream = static_cast<cudaStream_t>(stream);
 
     const int32_t* in = input.ptr<int32_t>();
-    const float* wei = weight.ptr<float>();
-    float* out = output.ptr<float>();
     if (_stream)
         emb_kernel_cu_fp32<<<input_num, thread_num, 0, _stream>>>(dim, in, wei, out);
     else

@@ -77,6 +77,8 @@ __global__ void rope_kernel_cu_fp32(float* q, float* k, const float* cos, const 
     }
 }
 
+// input_q [num_attention_head,head_size]
+// input k [num_kv_head,head_size]
 void rope_kernel_cu(tensor::Tensor& input_q, tensor::Tensor& input_k, const tensor::Tensor& cos,
                     const tensor::Tensor& sin, int32_t pos, void* stream) {
     int32_t head_size = input_q.get_dim(1);

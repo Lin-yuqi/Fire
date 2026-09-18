@@ -2,11 +2,15 @@
 
 #include "Fire/model/model.h"
 #include "Fire/model/model_weights.h"
+#include "Fire/op/add.h"
 #include "Fire/op/linear.h"
+#include "Fire/op/mha.h"
 #include "Fire/op/operator.h"
 #include "Fire/op/rmsnorm.h"
 #include "Fire/model/kv_cache.h"
 #include "Fire/op/embedding.h"
+#include "Fire/op/rope.h"
+#include "Fire/op/swiglu.h"
 namespace model {
 
 // Parameter organization only. A default block has no bound weights and is
@@ -25,27 +29,34 @@ struct TinyLlamaBlock {
 };
 
 struct TinyLlamaRuntime {
-    tensor::Tensor hidden;
-    tensor::Tensor block_output;
-    tensor::Tensor norm_output;
+    // 模型输入与逐层传递的隐藏状态。
+    tensor::Tensor token;        // INT32 [1]：当前 pos 位置的 token id，作为 Embedding 输入。
+    tensor::Tensor hidden;       // FP32 [hidden_size]：Embedding 输出，也是当前 Block 的输入。
+    tensor::Tensor block_output; // FP32 [hidden_size]：当前 Block 的最终输出，供下一层使用。
+    tensor::Tensor norm_output;  // FP32 [hidden_size]：Attention/FFN/final RMSNorm 的复用输出。
 
-    tensor::Tensor query;
-    tensor::Tensor key;
-    tensor::Tensor value;
+    // 当前 Transformer Block 的 Q/K/V；第一维是 head，第二维是单个 head 的宽度。
+    tensor::Tensor query; // FP32 [hidden_size] 投影后 reshape 为 [num_attention_heads, head_dim]。
+    tensor::Tensor key;   // FP32 [kv_dim] 投影后 reshape 为 [num_kv_heads, head_dim] 并写入 cache。
+    tensor::Tensor value; // FP32 [kv_dim] 投影后 reshape 为 [num_kv_heads, head_dim] 并写入 cache。
 
-    tensor::Tensor attention_score;
-    tensor::Tensor attention_output;
-    tensor::Tensor attention_projected;
-    tensor::Tensor attention_residual;
+    // Attention 中间结果，只使用 attention_score 在 [0, pos] 范围内的有效前缀。
+    tensor::Tensor attention_score;     // FP32 [num_attention_heads, capacity]：QK 注意力分数。
+    tensor::Tensor attention_output;    // FP32 [num_attention_heads, head_dim]，Wo 前展平为 [hidden_size]。
+    tensor::Tensor attention_projected; // FP32 [hidden_size]：Wo 对 attention_output 的投影。
+    tensor::Tensor attention_residual;  // FP32 [hidden_size]：hidden 加 attention_projected。
 
-    tensor::Tensor ffn_gate;
-    tensor::Tensor ffn_up;
-    tensor::Tensor ffn_activated;
-    tensor::Tensor ffn_down;
+    // FFN 中间结果；gate/up/activated 位于 intermediate_size 空间，down 回到 hidden_size。
+    tensor::Tensor ffn_gate;      // FP32 [intermediate_size]：W1 gate 投影结果。
+    tensor::Tensor ffn_up;        // FP32 [intermediate_size]：W3 up 投影结果。
+    tensor::Tensor ffn_activated; // FP32 [intermediate_size]：SwiGLU(gate, up) 输出。
+    tensor::Tensor ffn_down;      // FP32 [hidden_size]：W2 down 投影结果，等待残差相加。
 
-    tensor::Tensor rope_cos;
-    tensor::Tensor rope_sin;
+    // RoPE 查找表；forward 使用第 pos 行，每个值对应一个前后半区维度对。
+    tensor::Tensor rope_cos; // FP32 [max_seq_len, head_dim / 2]：各位置的 cos 值。
+    tensor::Tensor rope_sin; // FP32 [max_seq_len, head_dim / 2]：各位置的 sin 值。
 
+    // K/V 均为 FP32 [num_layers, capacity, num_kv_heads, head_dim]，pos 是序列位置维。
     KVCache kv_cache;
 };
 
@@ -87,10 +98,15 @@ class TinyLlamaModel final : public Model {
 
     op::EmbeddingOp _embedding;
     std::vector<TinyLlamaBlock> _layers;
+    op::RoPEOp _rope;
+    op::MultiHeadAttentionOp _mha;
+    op::VecAddOp _add;
 
     op::RmsNormOp _norm{TinyLlamaProfile::rms_norm_eps};
 
     op::LinearOp _output;
+
+    op::SwiGLUOp _swiglu;
 
     // nullptr 表示尚未成功 prepare。
     std::unique_ptr<TinyLlamaRuntime> _runtime;
