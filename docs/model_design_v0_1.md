@@ -1,31 +1,32 @@
 # Fire v0.1 模型层设计
 
-> 设计已确认；实现状态最后核对日期：2026-09-17。本文分别记录当前实现和后续执行契约，不表示 TinyLlama 已能推理。
+> 设计已确认；实现状态最后核对日期：2026-09-18。TinyLlama FP32 单 token forward 已在 CPU/CUDA 上跑通；Tokenizer、Sampler 与完整聊天生成循环仍在接入。
 
 ## 1. 范围与当前进度
 
 v0.1 只面向 `TinyLlama/TinyLlama-1.1B-Chat-v1.0` 的单序列、单 token、FP32 文本自回归推理。v0.2 接入 Qwen3 时，再根据真实重复代码提取公共实现；Qwen3.5 放在 v0.3。
 
-当前已经越过纯设计骨架阶段，但模型执行链仍未闭合：
+当前模型核心执行链已经闭合，处于 v0.1 发布前验证阶段：
 
 | 内容 | 当前状态 | 代码入口 |
 | --- | --- | --- |
 | `ModelConfig`、`Model` | 已定义纯抽象接口，无运行状态成员 | [model.h](../include/Fire/model/model.h) |
 | 固定 `TinyLlamaProfile`、结构化权重 | 已定义；默认构造的权重不代表合法模型 | [model_weights.h](../include/Fire/model/model_weights.h) |
-| `TinyLlamaBlock` | 已组织两处 Norm 和七个 Linear；由 `TinyLlamaModel` 构造时绑定权重，仍无 block forward | [tinyllama.h](../include/Fire/model/tinyllama.h) |
+| `TinyLlamaBlock` | 已组织两处 Norm 和七个 Linear；由 `TinyLlamaModel` 绑定权重并在模型 forward 中按层调度 | [tinyllama.h](../include/Fire/model/tinyllama.h) |
 | `ParamOperator` 移动语义 | 已显式提供移动构造/赋值，继续禁止复制，支持按值存放 Block | [operator.h](../include/Fire/op/operator.h) |
 | `FireReader::tensor_count()` | 已实现通用目录数量查询，未打开时为 0 | [fire_reader.h](../include/Fire/model/fire_reader.h) |
 | `TinyllamaLoader::open/loader_tensor` | 已实现容器打开与单 Tensor CPU mmap view 查询；不校验完整 profile | [tinyllama_loader.cpp](../src/model/tinyllama_loader.cpp) |
 | `TinyllamaLoader::load_weights` | 已校验 201 项 canonical tensor 的数量、名称、FP32 dtype 和 shape；全部成功后发布共享 mmap views | [tinyllama_loader.cpp](../src/model/tinyllama_loader.cpp) |
 | Embedding、RoPE、SwiGLU | 已提供 Operator、CPU/CUDA kernel 与数值/错误分支测试 | `include/Fire/op/`、`test/test_op/` |
 | Softmax | CPU/CUDA kernel 与直接数值测试已完成；尚无公开 Operator 包装 | [kernels_interface.h](../src/op/kernels/kernels_interface.h) |
-| `TinyLlamaModel`、Runtime、KVCache | 已有参数绑定、Runtime/K/V 分配、紧凑 RoPE cache 准备与 reset 骨架；完整 forward 和 cache 提交仍未实现 | 本文第 6、7 节 |
+| MHA | 已提供公共 Operator、CPU/CUDA GQA kernel、参数校验与数值测试 | [mha.h](../include/Fire/op/mha.h) |
+| `TinyLlamaModel`、Runtime、KVCache | 已实现参数绑定、Runtime 分配、紧凑 RoPE cache、K/V 写入与提交、完整 forward 和 reset | 本文第 6、7 节 |
 
 文件格式、canonical tensor 名称和导出流程以 [模型导出设计](model_export_v0_1.md) 为准，本文不另定义 wire format。仓库现状见 [仓库地图](repo_map.md)。
 
 ## 2. 职责与目标数据流
 
-以下是完整目标路径。Loader、参数绑定和 Runtime 分配已有实现；Block/Model forward、MHA 与 KVCache 状态推进尚待完成：
+以下路径中，从 `.fire` 加载到单 token logits 的模型核心链路已经实现；Tokenizer、Sampler 和停止条件仍属于发布前的上层生成工作：
 
 ```text
 .fire 文件
@@ -98,14 +99,14 @@ base::Status reset(const op::OpContext& context);
 
 `profile_name` 使用指向静态字符串的 `string_view`，具体 `config()` 应返回生命周期足够长的不可变配置。TinyLlama 直接使用 `TinyLlamaProfile::model`。
 
-### 生命周期契约（部分实现）
+### 生命周期契约（已实现）
 
-1. 具体模型的 `create(weights, output)` 验证内存中的权重结构并绑定参数。成功后才发布实例，失败保持原输出；它不是通用模型工厂。
-2. `prepare(capacity, context)` 要求 `1 <= capacity <= max_seq_len`。在局部 Runtime 中完成准备，成功后替换旧状态并开始空序列；失败保留旧 Runtime。它不迁移权重。
+1. `TinyLlamaModel::create(weights, context, output)` 接收 Loader 已验证的权重，检查层数、绑定参数，并在 GPU context 下迁移参数。成功后才发布实例，失败保持原输出；它不是通用模型工厂。
+2. `prepare(capacity, context)` 要求 `1 <= capacity <= max_seq_len`，并检查 allocator、参数与执行设备一致。在局部 Runtime 中完成准备，成功后替换旧状态并开始空序列。
 3. `forward` 要求已成功 prepare，消费一个 token，输出下一 token 的 FP32 logits。
 4. `reset(context)` 要求已 prepare，清空序列状态但保留容量、权重及可复用数据。保留 Context 参数，允许具体模型在重置时执行设备操作。
 
-当前 `TinyLlamaModel::create` 已绑定参数，`prepare` 已分配 typed Runtime、K/V Tensor 和 RoPE cache，`reset` 已重置 cache length；这些实现尚未完整兑现上述失败保持与设备检查契约。`forward` 仍为空，因此 prefix 推进和 logits 语义尚未落地。
+当前 `TinyLlamaModel::create/prepare/forward/reset` 已覆盖上述核心生命周期：forward 校验 token、位置和设备，逐层写入 K/V，生成 logits，并只在全部计算成功后提交 cache length。真实模型双 token 测试会额外验证位置不能重复提交。
 
 一个实例维护一条序列，forward 非 const；暂不允许同一实例被并发调用或交错执行多条序列。Runtime 在类型上独立、所有权上属于具体模型；当前不为外置状态引入 `ModelState` 多态体系。
 
@@ -171,15 +172,15 @@ Reader 继续只处理通用 wire 不变量、范围和字节数；Loader 不重
 
 当前真实 `.fire` 可用时的集成测试覆盖完整结构化加载、关键 shape 和 Loader 销毁后的 mmap ownership。缺项、额外项、错误 dtype/shape、目录顺序变化以及失败不污染既有输出的独立 fixture 测试仍需补齐。
 
-## 6. Block 与 TinyLlamaModel（部分实现）
+## 6. Block 与 TinyLlamaModel（已实现）
 
 按 `std::vector<TinyLlamaBlock>` 组织模型，每个 Block 对应一个 `TinyLlamaLayerWeights`。优势是层内参数集中、forward 和绑定关系直接、减少并行 vector 的长度与索引不变量。
 
 AoS 连续存储的是算子对象和 Tensor 句柄，不代表权重数据也连续，更不保证 CUDA kernel 更快。磁盘顺序、C++ 对象组织与 GPU 参数布局应分别决定。Qwen3 到来时可在具体 Block 增加 Q/K Norm，无需修改 TinyLlama 的结构或统一 Norm 索引公式。
 
-当前 `TinyLlamaBlock` 只提供参数成员，没有自己的 forward。两个 `RmsNormOp` 显式使用 profile 的 `1e-5`，而不依赖通用算子的 `1e-6` 默认值；`ParamOperator` 的显式 move 使 Block 在 vector 扩容时仍能移动已绑定参数。`TinyLlamaModel` 构造函数已经按层绑定全部 Norm/Linear 参数，并绑定 embedding、final norm 和 output projection。
+`TinyLlamaBlock` 只提供参数成员，不单独暴露 forward；逐层执行顺序由 `TinyLlamaModel::forward` 统一编排。两个 `RmsNormOp` 显式使用 profile 的 `1e-5`，而不依赖通用算子的 `1e-6` 默认值；`ParamOperator` 的显式 move 使 Block 在 vector 扩容时仍能移动已绑定参数。`TinyLlamaModel` 构造函数按层绑定全部 Norm/Linear 参数，并绑定 embedding、final norm 和 output projection。
 
-`TinyLlamaModel` 已持有 embedding 算子、Block vector、final Norm、output Linear 和唯一拥有的 typed Runtime；未 prepare 时 Runtime 为空，基类没有 `_initialized`。当前 `forward` 尚未实现，后续接入 RoPE/MHA/SwiGLU/Add 时按以下计算次序执行：
+`TinyLlamaModel` 持有 embedding、RoPE、MHA、Add、SwiGLU、Block vector、final Norm、output Linear 和唯一拥有的 typed Runtime；未 prepare 时 Runtime 为空，基类没有 `_initialized`。当前 forward 已按以下次序执行：
 
 ```text
 x -> attention_norm -> Wq/Wk/Wv -> Q/K RoPE -> 写 KV -> GQA -> Wo
@@ -194,23 +195,24 @@ Model 的整体路径为 embedding → 22 个 Block → final Norm → output Li
 
 Fire exporter 保留 HF Q/K 权重排列，没有 transpose 或 permutation。因此 RoPE 在每个 head 内配对前后半区 `(i, i + head_dim/2)`，sin/cos cache 只保存 `[max_seq_len, head_dim / 2]`。CPU/CUDA 实现和测试已按该布局落地；测试包含非零位置、非对称输入、GQA head 数和非默认 CUDA stream，避免仅以 `pos=0` 掩盖配对错误。[HF Llama 参考实现](https://github.com/huggingface/transformers/blob/v4.35.0/src/transformers/models/llama/modeling_llama.py#L172)
 
-## 7. Typed Runtime 与 KVCache（部分实现）
+## 7. Typed Runtime 与 KVCache（已实现）
 
-`TinyLlamaRuntime` 已使用有名字的 Tensor 字段，不使用 `enum -> map<Tensor>`。`prepare` 当前创建一套逐层复用的中间 Tensor、紧凑 RoPE cache 和连续 K/V Tensor；后续在完整数值基线通过后再按算子的别名契约复用存储。
+`TinyLlamaRuntime` 使用有名字的 Tensor 字段，不使用 `enum -> map<Tensor>`。`prepare` 创建一套逐层复用的中间 Tensor、紧凑 RoPE cache 和连续 K/V Tensor；后续可在数值基线稳定后继续按算子的别名契约压缩存储。
 
 | 存储 | 当前 shape / 生命周期 |
 | --- | --- |
 | hidden、block_output、norm_output | `[2048]`；在 Block 间复用 |
 | query | `[32, 64]`；当前层临时数据 |
-| key、value | 各 `[4, 64]`；当前层临时数据，尚未接入 cache 写入 |
-| attention_output、attention_projected、attention_residual | 各 `[2048]`；当前层临时数据 |
+| key、value | 各 `[4, 64]`；当前层临时数据，RoPE 后写入对应 layer/pos 的 cache 槽位 |
+| attention_output | `[32, 64]`；MHA 输出，进入 Wo 前 reshape 为 `[2048]` |
+| attention_projected、attention_residual | 各 `[2048]`；当前层临时数据 |
 | attention_score | `[32, capacity]`；只处理有效前缀 |
 | ffn_gate、ffn_up、ffn_activated | 各 `[5632]`；当前层临时数据 |
 | ffn_down | `[2048]` |
 | rope_cos、rope_sin | `[2048, 32]` 的半区表；prepare 时生成，跨 token、跨 reset 保留 |
 | KVCache K/V | 各 `[22, capacity, 4, 64]`；跨 token 保留 |
 
-临时 Tensor 只准备一套，计划逐层复用，不为 22 个 Block 各分配一套。当前 `KVCache` 已封装连续 K/V Tensor、容量与 length reset，但还没有槽位写入、历史 view 或成功提交 length 的接口；`allocate`/`prepare` 的错误传播和 Runtime 完整性也尚未形成测试闭环。`attention_score` 当前只构造了 Tensor 元数据而未绑定 allocator，因此不能视为已可执行的 attention buffer。
+临时 Tensor 只准备一套并逐层复用，不为 22 个 Block 各分配一套。`KVCache` 封装连续 K/V Tensor、容量和有效长度，支持 CPU 同步写入、GPU stream 异步写入、成功提交与 reset。MHA 接收完整 cache，并通过 `layer_idx` 和 `pos` 只读取当前层的有效前缀；无需额外构造切片 view。`attention_score` 已由 Runtime allocator 分配。
 
 GQA 中每 8 个 query heads 共用一个 KV head，即 `kv_head = query_head / 8`；不把缓存扩展为 32 个 heads。FP32、capacity=2048 时，K/V 合计 `2 * 22 * 2048 * 4 * 64 * 4 = 88 MiB`。
 
@@ -222,20 +224,22 @@ TinyLlama reset 只需把有效长度归零，Attention 必须屏蔽旧内容。
 
 ```bash
 cmake -S . -B build
-cmake --build build -j 4
+cmake --build build --target fire fire_tests -j 4
 ctest --test-dir build --output-on-failure
 ```
 
-`test_model.cpp` 在真实 `.fire` 可用时覆盖结构化 Loader，并覆盖已绑定 Block 在 vector 扩容后的 Linear 数值、两处 Norm 的 TinyLlama epsilon 及抽象/移动属性。Embedding、RoPE、Softmax 和 SwiGLU 测试已分别覆盖 CPU 数值、错误边界以及可用时的 CUDA 非默认 stream；无 CUDA 或真实模型文件时对应集成测试会跳过。这些测试仍不代表完整 Model forward 已完成。
+`llama_chat` demo 尚在接入，因此这里先构建已经验证的 core/test 目标。
 
-后续依次实现并验收：
+`test_model.cpp` 覆盖已绑定 Block 在 vector 扩容后的 Linear 数值、两处 Norm 的 TinyLlama epsilon 及抽象/移动属性。Embedding、RoPE、Softmax、SwiGLU 和 MHA 测试覆盖 CPU 数值、错误边界以及可用时的 CUDA 非默认 stream。`test_tinyllama_loader.cpp` 提供显式开启的真实 `.fire` 双 token CPU/GPU forward 测试，验证有限 logits、位置推进、非默认 GPU stream 以及 CPU/GPU logits 最大绝对误差 `< 1e-2`；无 CUDA 或真实模型文件时对应集成测试会跳过。
+
+v0.1 发布前继续完成：
 
 1. **Loader 验收**：补齐缺项、额外项、错误 dtype/shape、目录顺序变化和失败不污染输出的独立 fixture 测试，并完成真实导出数值回读。
-2. **KVCache/Runtime**：修正分配状态与错误传播，用小容量验证跨层跨位置读写、越界拒绝、长度提交和 reset 隔离。
-3. **Softmax/MHA/Block/Model**：为 Softmax 明确公共封装边界，先验证 GQA 与有效历史范围，再核对一个真实 Block 的中间结果，最后接通 embedding、final norm 和 head。
-4. **数值与生成**：给定相同 token 序列逐位置比较 FP32 logits，再验证 CUDA 与 CPU，最后接 greedy sampler 和生成循环。
+2. **状态与错误测试**：现有 KVCache 小尺寸测试已覆盖 K/V 独立写入、提交、reset、错误 shape 与错误位置；继续补齐 `create/prepare/forward/reset` 的失败保持和更多设备错误场景。
+3. **参考数值**：对固定 token 序列逐位置比较 Hugging Face FP32 logits；现有 CPU/GPU 一致性测试不能替代独立参考实现。
+4. **生成入口**：接通 tokenizer、sampler、停止条件与 `llama_chat`，形成完整自回归生成示例。
 
-真实 checkpoint 的全量导入验收仍按导出文档执行。单个权重的 RMSNorm 测试、结构骨架或文件存在都不能替代 Export Compatibility；Model Support 还要求完整端到端生成与参考校验。
+真实 checkpoint 的全量导入验收仍按导出文档执行。当前真实模型 forward 和 CPU/GPU 一致性已经证明核心执行路径可运行，但正式声明 v0.1 Model Support 仍要求完整生成入口与独立参考校验。
 
 ## 9. KuiperLlama 参考与取舍
 

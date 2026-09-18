@@ -30,6 +30,11 @@ find_package(CUDAToolkit REQUIRED)
 
 add_subdirectory(src)
 
+# ==============================
+# demo
+# ==============================
+
+add_subdirectory(demo)
 
 # ==============================
 # Tests
