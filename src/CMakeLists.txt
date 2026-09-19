@@ -37,6 +37,7 @@ target_link_libraries(fire
         CUDA::cudart
         glog::glog
         ${ARMADILLO_LIBRARIES}
+        ${SENTENCEPIECE_TARGET}
 )
 
 set_target_properties(fire PROPERTIES

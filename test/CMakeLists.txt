@@ -26,6 +26,9 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(FIRE_V1_FIXTURE_PATH "${CMAKE_CURRENT_BINARY_DIR}/fixtures/fire_v1_contract.fire")
 set(FIRE_TINYLLAMA_PATH "${CMAKE_SOURCE_DIR}/tmp/llama.fire")
+set(FIRE_TINYLLAMA_TOKENIZER_PATH
+    "${CMAKE_SOURCE_DIR}/models/TinyLlama-1.1B-Chat-v1.0/tokenizer.model"
+)
 
 add_custom_command(
     OUTPUT ${FIRE_V1_FIXTURE_PATH}
@@ -46,6 +49,7 @@ target_compile_definitions(
     fire_tests
     PRIVATE FIRE_V1_FIXTURE_PATH="${FIRE_V1_FIXTURE_PATH}"
     PRIVATE FIRE_TINYLLAMA_PATH="${FIRE_TINYLLAMA_PATH}"
+    PRIVATE FIRE_TINYLLAMA_TOKENIZER_PATH="${FIRE_TINYLLAMA_TOKENIZER_PATH}"
 )
 
 add_test(

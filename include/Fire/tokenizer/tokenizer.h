@@ -1,3 +1,4 @@
+#pragma once
 #include <Fire/base/base.h>
 #include <vector>
 namespace token {
