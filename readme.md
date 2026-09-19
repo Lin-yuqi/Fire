@@ -32,7 +32,7 @@ TinyLlama FP32 推理基线，不是生产级推理服务，也不试图替代 l
 - 在 CPU 或 CUDA 上执行完整 TinyLlama forward：Embedding、22 层
   Attention/FFN、RoPE、GQA、KV Cache、final RMSNorm 和 LM Head。
 - 使用 SentencePiece 完成文本编解码，使用 ArgmaxSampler 做 greedy decoding。
-- 运行一个简单的多轮聊天 CLI；接近 2048 token 上下文上限时自动删除最早的完整轮次。
+- 运行一个简单的多轮聊天 CLI；跨轮复用 KV Cache，达到 2048 token 上限后结束会话。
 - 通过 GoogleTest 和 Python contract tests 验证 Buffer、Tensor、Operator、Reader、
   exporter、tokenizer、sampler 和模型运行路径。
 
@@ -213,20 +213,19 @@ stat -c '%n %s bytes' tmp/llama.fire
 
 ### 6. 启动聊天 demo
 
-CMake 会把上述默认路径编译进 demo。从仓库根目录启动 CPU 模式：
+CMake 会把上述默认路径编译进 demo，默认使用 GPU：
 
 ```bash
 ./build/demo/llama_chat
 ```
 
-CPU 可以运行，但 1.1B FP32 模型会很慢。GPU 模式需要显式传入模型路径、tokenizer
-路径和设备：
+也可以显式传入模型路径、tokenizer 路径和设备。CPU 可以运行，但 1.1B FP32 模型会很慢：
 
 ```bash
 ./build/demo/llama_chat \
   tmp/llama.fire \
   models/TinyLlama-1.1B-Chat-v1.0/tokenizer.model \
-  gpu
+  cpu
 ```
 
 查看参数：
@@ -248,9 +247,9 @@ CLI 内支持：
 - 使用 TinyLlama chat template，并显式插入 BOS/EOS token；
 - 使用 greedy argmax，不支持 temperature、top-k 或 top-p；
 - 每轮最多生成 128 token；
-- 模型上下文上限为 2048 token，为回复预留 128 token；
-- prompt 超过预算时按完整轮次删除最早历史；
-- 每轮重新编码保留的历史并重建 KV Cache，实现简单但不是高吞吐方案；
+- 模型上下文上限为 2048 token；空间不足时会缩短本轮回复上限并预留 assistant EOS；
+- system prompt 只在首轮写入，后续只追加新 user/assistant token，并持续复用同一 KV Cache；
+- 不裁剪或重放历史；上下文写满后会提示并结束当前会话，`/reset` 可在写满前手动开始新会话；
 - 输入是单行文本。
 
 真实 GPU forward 测试要求至少约 5 GiB 空闲显存；demo 的实际需求还会受到 CUDA
@@ -369,7 +368,7 @@ TinyLlama 的名称、shape 和配置约束由 `TinyllamaLoader` 与固定 Model
 
 - v0.1 只支持 `TinyLlama/TinyLlama-1.1B-Chat-v1.0` 这一固定 profile。
 - 模型执行是单序列、单 token、FP32；没有 batching 和量化执行路径。
-- `llama_chat` 只有 greedy sampling，每轮重放保留的 prompt，没有增量复用跨轮 KV Cache。
+- `llama_chat` 只有 greedy sampling，KV Cache 只追加、不支持滑动窗口或历史压缩。
 - CPU 推理仅适合作为正确性基线，速度很慢。
 - 项目配置阶段即要求 CUDA Toolkit；尚未提供纯 CPU-only build。
 - 部分底层约束仍通过 glog `CHECK/LOG(FATAL)` 处理，不适合作为不可信输入服务边界。

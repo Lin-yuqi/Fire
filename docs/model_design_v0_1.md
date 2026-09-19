@@ -23,7 +23,7 @@ v0.1 只面向 `TinyLlama/TinyLlama-1.1B-Chat-v1.0` 的单序列、单 token、F
 | `TinyLlamaModel`、Runtime、KVCache | 已实现参数绑定、Runtime 分配、紧凑 RoPE cache、K/V 写入与提交、完整 forward 和 reset | 本文第 6、7 节 |
 | `LlamaTokenizer` | 已通过 SentencePiece 完成模型加载、BOS/EOS、encode/decode，并覆盖真实 TinyLlama tokenizer 测试 | [llama_tokenizer.cpp](../src/tokenizer/llama_tokenizer.cpp) |
 | `ArgmaxSampler` | 已提供 CPU `max_element` 与 CUDA block reduction greedy sampling；相同最大值取首次位置 | [argmax_sampler.cpp](../src/sampler/argmax_sampler.cpp) |
-| `llama_chat` | 已实现模型/tokenizer 加载、chat template、greedy 生成、有限历史、`/reset` 与 CPU/GPU CLI | [llama_chat.cpp](../demo/llama_chat.cpp) |
+| `llama_chat` | 已实现模型/tokenizer 加载、chat template、greedy 生成、跨轮 KV Cache 复用、固定 2048 token 会话、`/reset` 与 CPU/GPU CLI | [llama_chat.cpp](../demo/llama_chat.cpp) |
 
 文件格式、canonical tensor 名称和导出流程以 [模型导出设计](model_export_v0_1.md) 为准，本文不另定义 wire format。仓库现状见 [仓库地图](repo_map.md)。
 
@@ -232,7 +232,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 `llama_chat` 会加载默认的 `tmp/llama.fire` 和
-`models/TinyLlama-1.1B-Chat-v1.0/tokenizer.model`。它按 TinyLlama chat template 显式插入 BOS/EOS，使用 ArgmaxSampler 生成，每轮最多 128 token；prompt 超过 1920 token 时从最早完整轮次开始裁剪。每一轮会重新编码保留的历史并重建 KV Cache，这是 v0.1 为保持实现简单而接受的性能边界。
+`models/TinyLlama-1.1B-Chat-v1.0/tokenizer.model`。它按 TinyLlama chat template 显式插入 BOS/EOS，使用 ArgmaxSampler 生成，每轮最多 128 token。system prompt 只在首轮写入，后续轮次只将新增 user/assistant token 追加到同一个 KV Cache；剩余空间不足 128 token 时缩短回复上限并为 assistant EOS 保留一个位置。它不裁剪历史或滑动 KV Cache，达到 2048 token 后结束当前会话。
 
 `test_model.cpp` 覆盖已绑定 Block 在 vector 扩容后的 Linear 数值、两处 Norm 的 TinyLlama epsilon 及抽象/移动属性。Embedding、RoPE、Softmax、SwiGLU 和 MHA 测试覆盖 CPU 数值、错误边界以及可用时的 CUDA 非默认 stream。`test_tinyllama_loader.cpp` 提供显式开启的真实 `.fire` 双 token CPU/GPU forward 测试，验证有限 logits、位置推进、非默认 GPU stream 以及 CPU/GPU logits 最大绝对误差 `< 1e-2`；无 CUDA 或真实模型文件时对应集成测试会跳过。
 

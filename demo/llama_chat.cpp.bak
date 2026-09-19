@@ -8,9 +8,9 @@
 
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -22,6 +22,11 @@ namespace {
 
 constexpr size_t MaxNewTokens = 128;
 constexpr std::string_view SystemPrompt = "You are a helpful assistant.";
+
+struct ChatTurn {
+    std::string user;
+    std::string assistant;
+};
 
 class StreamCompletionGuard {
   public:
@@ -81,21 +86,35 @@ base::Status append_encoded(const token::LlamaTokenizer& tokenizer, const std::s
     return base::error::Success();
 }
 
-base::Status encode_user_turn(const token::LlamaTokenizer& tokenizer,
-                              const std::string& user_input, bool first_turn,
-                              std::vector<int32_t>& output) {
+base::Status encode_prompt(const token::LlamaTokenizer& tokenizer,
+                           const std::deque<ChatTurn>& history,
+                           const std::string& current_user,
+                           std::vector<int32_t>& output) {
     output.clear();
 
-    if (first_turn) {
-        auto status = append_encoded(
-            tokenizer, "<|system|>\n" + std::string(SystemPrompt), true, output);
+    auto status = append_encoded(
+        tokenizer, "<|system|>\n" + std::string(SystemPrompt), true, output);
+    if (!status.ok()) {
+        return status;
+    }
+    output.push_back(tokenizer.eos_id());
+
+    for (const auto& turn : history) {
+        status = append_encoded(tokenizer, "\n<|user|>\n" + turn.user, false, output);
+        if (!status.ok()) {
+            return status;
+        }
+        output.push_back(tokenizer.eos_id());
+
+        status =
+            append_encoded(tokenizer, "\n<|assistant|>\n" + turn.assistant, false, output);
         if (!status.ok()) {
             return status;
         }
         output.push_back(tokenizer.eos_id());
     }
 
-    auto status = append_encoded(tokenizer, "\n<|user|>\n" + user_input, false, output);
+    status = append_encoded(tokenizer, "\n<|user|>\n" + current_user, false, output);
     if (!status.ok()) {
         return status;
     }
@@ -103,44 +122,45 @@ base::Status encode_user_turn(const token::LlamaTokenizer& tokenizer,
     return append_encoded(tokenizer, "\n<|assistant|>\n", false, output);
 }
 
-base::Status forward_tokens(model::TinyLlamaModel& model,
-                            const std::vector<int32_t>& token_ids, tensor::Tensor& logits,
-                            const op::OpContext& context, int32_t& position) {
-    for (const int32_t token_id : token_ids) {
-        auto status = model.forward(token_id, position, logits, context);
+base::Status generate_response(model::TinyLlamaModel& model,
+                               const token::LlamaTokenizer& tokenizer,
+                               sampler::ArgmaxSampler& sampler,
+                               const std::vector<int32_t>& prompt_ids,
+                               tensor::Tensor& logits, const op::OpContext& context,
+                               std::string& response) {
+    auto status = model.reset(context);
+    if (!status.ok()) {
+        return status;
+    }
+
+    int32_t position = 0;
+    for (const int32_t token_id : prompt_ids) {
+        status = model.forward(token_id, position, logits, context);
         if (!status.ok()) {
             return status;
         }
         ++position;
     }
-    return base::error::Success();
-}
 
-base::Status generate_response(model::TinyLlamaModel& model,
-                               const token::LlamaTokenizer& tokenizer,
-                               sampler::ArgmaxSampler& sampler, size_t max_new_tokens,
-                               tensor::Tensor& logits, const op::OpContext& context,
-                               int32_t& position) {
     std::vector<int32_t> generated_ids;
-    generated_ids.reserve(max_new_tokens);
+    generated_ids.reserve(MaxNewTokens);
     std::string printed_response;
-    bool sampled_eos = false;
 
-    for (size_t step = 0; step < max_new_tokens; ++step) {
+    for (size_t step = 0; step < MaxNewTokens && position < model.config().max_seq_len;
+         ++step) {
         const size_t sampled_id =
             sampler.sample(logits.ptr<float>(), logits.size(), context._stream);
         if (sampled_id >= static_cast<size_t>(model.config().vocab_size)) {
             return base::error::InternalError("sampler returned an invalid token id");
         }
         if (sampled_id == static_cast<size_t>(tokenizer.eos_id())) {
-            sampled_eos = true;
             break;
         }
 
         generated_ids.push_back(static_cast<int32_t>(sampled_id));
 
         std::string decoded;
-        auto status = tokenizer.decode(generated_ids, decoded);
+        status = tokenizer.decode(generated_ids, decoded);
         if (!status.ok()) {
             return status;
         }
@@ -156,28 +176,17 @@ base::Status generate_response(model::TinyLlamaModel& model,
         ++position;
     }
 
-    if (!generated_ids.empty()) {
-        std::string response;
-        auto status = tokenizer.decode(generated_ids, response);
-        if (!status.ok()) {
-            return status;
-        }
-        if (response.compare(0, printed_response.size(), printed_response) == 0) {
-            std::cout << response.substr(printed_response.size()) << std::flush;
-        }
+    if (generated_ids.empty()) {
+        response.clear();
+        return base::error::Success();
     }
 
-    // Keep the cached token sequence equivalent to the chat template. If the
-    // generation limit was reached, terminate the assistant turn explicitly.
-    const int32_t eos_id = tokenizer.eos_id();
-    auto status = model.forward(eos_id, position, logits, context);
+    status = tokenizer.decode(generated_ids, response);
     if (!status.ok()) {
         return status;
     }
-    ++position;
-
-    if (!sampled_eos) {
-        std::cout << "\n[response stopped after " << max_new_tokens << " tokens]";
+    if (response.compare(0, printed_response.size(), printed_response) == 0) {
+        std::cout << response.substr(printed_response.size()) << std::flush;
     }
     return base::error::Success();
 }
@@ -211,12 +220,12 @@ int run_chat(const std::string& model_path, const std::string& tokenizer_path,
     }
 
     sampler::ArgmaxSampler sampler(context._device_type);
-    int32_t position = 0;
-    bool first_turn = true;
-    const size_t context_limit = static_cast<size_t>(model->config().max_seq_len);
+    std::deque<ChatTurn> history;
+    const size_t prompt_budget =
+        static_cast<size_t>(model->config().max_seq_len) - MaxNewTokens;
 
     std::cout << "Fire TinyLlama chat (greedy, max " << MaxNewTokens
-              << " new tokens, " << context_limit << " token context)\n"
+              << " new tokens)\n"
               << "Commands: /reset, /exit, /help\n";
 
     while (true) {
@@ -233,60 +242,55 @@ int run_chat(const std::string& model_path, const std::string& tokenizer_path,
             break;
         }
         if (user_input == "/help") {
-            std::cout << "/reset starts a new conversation; /exit quits.\n";
+            std::cout << "/reset clears conversation history; /exit quits.\n";
             continue;
         }
         if (user_input == "/reset") {
+            history.clear();
             status = model->reset(context);
             if (!status.ok()) {
                 return report_error("resetting model", status);
             }
-            position = 0;
-            first_turn = true;
             std::cout << "Conversation cleared.\n";
             continue;
         }
 
-        std::vector<int32_t> turn_ids;
-        status = encode_user_turn(tokenizer, user_input, first_turn, turn_ids);
-        if (!status.ok()) {
-            return report_error("encoding prompt", status);
+        std::vector<int32_t> prompt_ids;
+        size_t dropped_turns = 0;
+        while (true) {
+            status = encode_prompt(tokenizer, history, user_input, prompt_ids);
+            if (!status.ok()) {
+                return report_error("encoding prompt", status);
+            }
+            if (prompt_ids.size() <= prompt_budget) {
+                break;
+            }
+            if (history.empty()) {
+                prompt_ids.clear();
+                break;
+            }
+            history.pop_front();
+            ++dropped_turns;
         }
 
-        const size_t used_tokens = static_cast<size_t>(position);
-        const size_t remaining_tokens = context_limit - used_tokens;
-        // Keep one slot for a generated token and one for the assistant EOS.
-        if (turn_ids.size() + 2 > remaining_tokens) {
-            std::cout << "Context window has only " << remaining_tokens
-                      << " token(s) left; this message needs " << turn_ids.size() + 2
-                      << ". Enter a shorter message, /reset, or /exit.\n";
+        if (prompt_ids.empty()) {
+            std::cerr << "Input is too long for the TinyLlama context window.\n";
             continue;
         }
-
-        status = forward_tokens(*model, turn_ids, logits, context, position);
-        if (!status.ok()) {
-            return report_error("prefilling user turn", status);
+        if (dropped_turns != 0) {
+            std::cout << "[context: dropped " << dropped_turns << " oldest turn(s)]\n";
         }
-        first_turn = false;
-
-        const size_t response_budget =
-            std::min(MaxNewTokens, context_limit - static_cast<size_t>(position) - 1);
 
         std::cout << "Assistant> " << std::flush;
-        status = generate_response(*model, tokenizer, sampler, response_budget, logits,
-                                   context, position);
+        std::string response;
+        status = generate_response(*model, tokenizer, sampler, prompt_ids, logits, context,
+                                   response);
         std::cout << '\n';
         if (!status.ok()) {
             return report_error("generating response", status);
         }
 
-        const size_t tokens_left = context_limit - static_cast<size_t>(position);
-        if (tokens_left == 0) {
-            std::cout << "Context window reached " << context_limit
-                      << " tokens. Ending this chat session.\n";
-            break;
-        }
-        std::cout << "[context: " << position << '/' << context_limit << " tokens used]\n";
+        history.push_back({std::move(user_input), std::move(response)});
     }
 
     return 0;

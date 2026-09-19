@@ -23,7 +23,7 @@ Fire 是一个以学习和实验为目标、从零构建的轻量级 CUDA 推理
 - `TinyllamaLoader` 已支持按名字读取单个 CPU mmap Tensor view；`load_weights()` 会校验 201 项 canonical tensor 的数量、名称、FP32 dtype 和 shape，在全部成功后发布结构化权重。
 - `Model` 纯接口、固定 profile、结构化权重和 Block 参数结构已建立。`TinyLlamaModel` 已实现参数绑定、Runtime/KVCache 分配、RoPE cache、完整单 token forward、K/V 写入与长度提交，以及 reset。真实模型 CPU/GPU 双 token 测试会检查有限 logits、位置推进、非默认 CUDA stream 和 CPU/GPU 一致性。
 - `tokenizer` 已接入 SentencePiece `LlamaTokenizer`，支持真实 `tokenizer.model` 的加载、BOS/EOS 和文本编解码；`sampler` 已接入 CPU/CUDA `ArgmaxSampler` 并验证相同最大值取首次位置。
-- `llama_chat` 已实现 TinyLlama chat template、greedy 自回归生成、128 token 回复上限、按完整轮次裁剪历史、CPU/GPU 选择以及 `/reset`、`/help`、`/exit`。
+- `llama_chat` 已实现 TinyLlama chat template、greedy 自回归生成、128 token 回复上限、跨轮 KV Cache 复用、固定 2048 token 会话、CPU/GPU 选择以及 `/reset`、`/help`、`/exit`。
 
 因此，当前 Base、Tensor、Operator、Model、Tokenizer、Sampler、已实现的 CPU/CUDA kernel、FireReader 和 Loader 均已编入 `Fire::fire`；Python exporter/writer 作为独立工具运行，`llama_chat` 链接 `Fire::fire`。RMSNorm 和 Linear 的量化配置已能表示，但当前算子会拒绝量化权重。
 
@@ -199,7 +199,7 @@ cmake --build build --target fire fire_tests llama_chat -j
 ctest --test-dir build --output-on-failure
 ```
 
-CTest 注册 C++ GTest 与 Python Writer/exporter 合同测试；具体通过与跳过数量以当前运行结果为准。真实 TinyLlama `.fire` 已按 201 项、`data_offset = 19,328`、文件长度 `4,400,212,864` bytes 完成加载和 CPU/GPU forward。`llama_chat` 已完成模型/tokenizer 加载、上下文裁剪与 greedy 生成；从 source checkpoint 抽样做 bit-exact 数值回读仍未形成独立验收记录。详细的依赖安装、模型下载、导出与 demo 命令以根目录 [readme](../readme.md) 为准。
+CTest 注册 C++ GTest 与 Python Writer/exporter 合同测试；具体通过与跳过数量以当前运行结果为准。真实 TinyLlama `.fire` 已按 201 项、`data_offset = 19,328`、文件长度 `4,400,212,864` bytes 完成加载和 CPU/GPU forward。`llama_chat` 已完成模型/tokenizer 加载、跨轮 KV Cache 复用与 greedy 生成；从 source checkpoint 抽样做 bit-exact 数值回读仍未形成独立验收记录。详细的依赖安装、模型下载、导出与 demo 命令以根目录 [readme](../readme.md) 为准。
 
 ## 4. 模块关系
 
@@ -307,7 +307,7 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 `sampler::ArgmaxSampler` 在 CPU 上使用 `std::max_element`，在 GPU 上使用单 block CUB reduction；两条路径都以首次出现的最大值为结果。现有 Sampler 接口直接返回 host `size_t`，因此 CUDA 路径在返回前必须同步 stream。
 
-`llama_chat` 负责组装 system/user/assistant 消息、逐 token 调用 `TinyLlamaModel::forward`、采样和解码。它为回复预留 128 token，prompt 超出 1920 token 时删除最早完整轮次，并在每轮开始时 reset 后重放保留的上下文。该策略便于理解和验证，但会重复计算历史，不是高吞吐 serving runtime。
+`llama_chat` 负责组装 system/user/assistant 消息、逐 token 调用 `TinyLlamaModel::forward`、采样和解码。system prompt 只在首轮写入，后续轮次只追加新增 token 并复用已有 KV Cache。每轮最多生成 128 token，剩余空间不足时动态缩短回复并保留 assistant EOS；它不删除历史或滑动 KV Cache，达到 2048 token 后结束当前会话。
 
 ### `tools`: exporter/writer
 
@@ -364,7 +364,7 @@ RMSNorm 的当前调用路径是：
 5. `TinyLlamaModel::create/prepare` 绑定参数并准备 Runtime；`forward` 依次执行 Embedding、22 层 Attention/FFN、final RMSNorm 和 LM Head，得到 `[32000]` logits。
 6. 每层 K/V 写入 `[layer, pos, ...]`，MHA 读取 `[0, pos]` 的有效历史；整个 token 成功后 `KVCache::commit(pos)` 才推进长度。
 7. `LlamaTokenizer` 将 chat template 各消息编码为 token IDs，并由 demo 显式插入 BOS/EOS；`ArgmaxSampler` 从 logits 选出 next token。
-8. `llama_chat` 重复 forward、sample、decode，遇到 EOS 或 128 token 上限后结束当前回复，并保留受 2048 token 窗口约束的多轮历史。
+8. `llama_chat` 重复 forward、sample、decode，遇到 EOS 或本轮 token 上限后结束回复；后续轮次从当前 KV Cache 长度继续追加，达到 2048 token 后结束会话。
 
 外部内存路径则由 `Buffer(ptr, capacity, device_type)` 包装；`owns_memory()` 为 false，调用方仍负责外部指针的生命周期。
 
@@ -376,7 +376,7 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 
 1. **部分 CUDA 返回值未检查**：部分 memcpy/memset 路径忽略 CUDA API 返回的 `cudaError_t`，失败时可能缺少及时、准确的错误信息；按当前约定可继续使用 `CHECK/LOG(FATAL)` 报错，无需引入额外错误类型。
 2. **RMSNorm 支持范围有限**：当前只有 FP32 实现，CPU 仅支持一维输入，GPU 多行路径已验证二维 `{rows, width}`；更高维输入的所有前导维度尚未完整接入 block 调度。量化 weight 会返回 `InvalidArgument`。
-3. **聊天入口以简单性优先**：Tokenizer、ArgmaxSampler、EOS 停止条件和 `llama_chat` 已接通，但当前只有 greedy sampling；每轮会 reset 并重放保留历史，没有跨轮 KV Cache 复用。Hugging Face 参考 logits/token 对齐仍未形成独立验收记录。
+3. **聊天入口以简单性优先**：Tokenizer、ArgmaxSampler、EOS 停止条件和 `llama_chat` 已接通，但当前只有 greedy sampling；KV Cache 跨轮复用但只增不减，没有滑动窗口或历史压缩。Hugging Face 参考 logits/token 对齐仍未形成独立验收记录。
 4. **Matmul 验证与量化仍待补齐**：已有 FP32 CPU/CUDA 实现、CPU 单算子数值测试和真实模型 GPU 路径；更系统的 CUDA shape/误差矩阵、性能优化和量化路径属于后续工作。
 5. **Softmax 尚未形成独立 Operator**：CPU/CUDA kernel 和直接测试已完成，MHA 已在内部封装 softmax 计算；其他调用方目前仍需要直接使用 kernel 接口。
 6. **状态错误矩阵仍不完整**：KVCache 小尺寸测试已覆盖 K/V 写入、提交、reset、错误 shape 与错误位置，真实模型 forward 也会拒绝重复位置；更多 create/prepare/reset 失败保持场景仍需补齐。
