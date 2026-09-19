@@ -2,7 +2,7 @@
 
 > 状态：Accepted。Q1-Q15 的格式、职责、失败语义和验收边界已经确认。
 
-> 实现进度（2026-09-17）：FireWriter、TinyLlama-specific exporter、FireReader 与 core wire/profile 合同测试已完成并接入 CTest。`TinyllamaLoader` 已支持单个 CPU mmap Tensor view，并实现 201 项 canonical tensor 的数量、名称、FP32 dtype、shape 校验与结构化组装；对应失败矩阵测试仍待补齐。真实 checkpoint 的 metadata 已确认为 201 项、`data_offset = 19,328`、计划文件长度 `4,400,212,864` bytes；完整 payload 导出、FireReader 全量解析与选定真实权重数值回读尚无完整验收记录，因此 Export Compatibility 和 Model Support 均仍未宣称完成。模型接口与后续执行设计见 [模型层设计](model_design_v0_1.md)。
+> 实现进度（2026-09-19）：Fire v0.1 已发布。FireWriter、TinyLlama-specific exporter、FireReader、`TinyllamaLoader` 与 core wire/profile 合同测试均已完成并接入 CTest。真实 checkpoint 已完成全量 payload 导出，结果包含 201 项、`data_offset = 19,328`，文件长度为 `4,400,212,864` bytes；该文件已通过 FireReader/Loader 并用于 CPU/CUDA forward。独立的 source checkpoint 抽样 bit-exact 回读和 Hugging Face 逐位置参考对齐仍未形成完整记录，因此本文仍不把严格的 Export Compatibility/Model Support 参考验收描述为全部完成。模型接口与执行设计见 [模型层设计](model_design_v0_1.md)。
 
 ## 1. 目标
 
@@ -15,7 +15,7 @@ Hugging Face checkpoint
         -> C++ FireReader (mmap)
         -> TinyLlama ModelLoader
         -> TinyLlamaWeights
-        -> TinyLlamaModel / Operator（部分组装已实现，完整执行待完成）
+        -> TinyLlamaModel / Operator（完整 FP32 forward 已实现）
 ```
 
 `.fire` 是可 mmap 的 Fire Tensor Container，而不是通用或自描述的模型 checkpoint。它通过 tensor directory 消除 exporter 与 loader 对隐式 tensor 排列顺序的依赖。
@@ -280,6 +280,6 @@ Python writer 测试还应验证：preflight 失败时不创建目标；目标�
 
 ### 本地里程碑验收
 
-完整 TinyLlama 导出不进入 core test。发布 v0.1 前必须在本地执行真实导出，确认 FireReader 解析 201 项、TinyLlama ModelLoader 接受完整 profile，并对 embedding、首尾层、final norm 和 output 的选定元素做 bit-exact FP32 回读。
+完整 TinyLlama 导出不进入 core test。本地 release 验收需要执行真实导出，确认 FireReader 解析 201 项、TinyLlama ModelLoader 接受完整 profile，并对 embedding、首尾层、final norm 和 output 的选定元素做 bit-exact FP32 回读。
 
-当前有真实 source metadata 的只读核对记录；全量 payload 写出、上述 FireReader 回读和完整 ModelLoader profile 校验尚无完整验收记录。已有单个 Norm 权重读取与 CUDA RMSNorm 集成测试，不能替代这些验收。
+当前全量 payload 已写出为 `tmp/llama.fire`，其长度为 `4,400,212,864` bytes；FireReader 全量解析、完整 ModelLoader profile 校验以及真实 CPU/GPU forward 均已执行。选定 tensor 与 source checkpoint 的独立 bit-exact 抽样回读仍缺少完整记录；已有 Loader、Norm 与 forward 集成测试不能替代这一项来源对照。

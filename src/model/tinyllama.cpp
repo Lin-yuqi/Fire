@@ -36,7 +36,7 @@ base::Status TinyLlamaModel::create(const TinyLlamaWeights& weights, op::OpConte
     return base::error::Success();
 }
 
-TinyLlamaModel::~TinyLlamaModel() {}
+TinyLlamaModel::~TinyLlamaModel() = default;
 
 const ModelConfig& TinyLlamaModel::config() const noexcept { return TinyLlamaProfile::model; }
 

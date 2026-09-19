@@ -1,78 +1,328 @@
 # 🔥 Fire
 
-> A lightweight CUDA inference framework built from scratch for learning, experimentation, and high-performance LLM inference.
+> 一个从零实现、面向学习和实验的轻量级 CUDA LLM 推理框架。
 
-**Fire** 是一个从零实现的轻量级 CUDA 推理框架，用于学习和验证大语言模型推理、CUDA Kernel、显存管理与推理系统架构。
+**Fire v0.1 已发布。** 当前版本围绕固定的
+[`TinyLlama/TinyLlama-1.1B-Chat-v1.0`](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0)
+Model Profile，打通了以下端到端路径：
 
-> 🚀 **Fire v0.1 即将上线。** 当前版本已经完成 TinyLlama-1.1B 的 FP32 单 token CPU/CUDA forward 主链路，正在补齐聊天入口、参考结果对齐与发布前收尾。
+```text
+Hugging Face checkpoint
+        ↓
+TinyLlama exporter → FP32 .fire v1
+        ↓
+FireReader / TinyllamaLoader
+        ↓
+TinyLlamaModel CPU/CUDA forward + KV Cache
+        ↓
+SentencePiece tokenizer + Argmax sampler
+        ↓
+llama_chat CLI
+```
 
-Fire 仍是个人学习项目。v0.1 的目标是交付一条结构清晰、可测试、可在 CPU 与 CUDA 上运行的 TinyLlama 推理基线，而不是提供可替代成熟推理框架的生产级服务。
+Fire 是个人学习项目。v0.1 的目标是提供一条结构清晰、可以阅读和测试的
+TinyLlama FP32 推理基线，不是生产级推理服务，也不试图替代 llama.cpp、vLLM
+或 Transformers。
 
----
+## v0.1 能做什么
 
-## 🚀 v0.1 发布候选
+- 读取固定 TinyLlama profile 的 BF16 Hugging Face safetensors，并导出为 FP32
+  `.fire` v1 Tensor Container。
+- 通过 mmap 读取 `.fire`，校验并绑定 201 个 canonical tensor。
+- 在 CPU 或 CUDA 上执行完整 TinyLlama forward：Embedding、22 层
+  Attention/FFN、RoPE、GQA、KV Cache、final RMSNorm 和 LM Head。
+- 使用 SentencePiece 完成文本编解码，使用 ArgmaxSampler 做 greedy decoding。
+- 运行一个简单的多轮聊天 CLI；接近 2048 token 上下文上限时自动删除最早的完整轮次。
+- 通过 GoogleTest 和 Python contract tests 验证 Buffer、Tensor、Operator、Reader、
+  exporter、tokenizer、sampler 和模型运行路径。
 
-### 已完成
+当前明确不支持 batching、量化、随机采样、PagedAttention、通用模型自动识别或
+生产服务。完整限制见[已知限制](#已知限制)。
 
-- `.fire` v1 Writer、TinyLlama exporter、mmap Reader，以及 201 项 canonical tensor 的完整 Loader 校验。
-- FP32 Tensor、内存管理、执行上下文与 CPU/CUDA kernel 分派。
-- Add、RMSNorm、Matmul、Linear、Embedding、RoPE、SwiGLU、Softmax kernel 与 MHA。
-- TinyLlama 22 层完整 forward：Embedding → Attention → 残差 → FFN → 残差 → final RMSNorm → LM Head。
-- 连续 K/V Cache 的分配、逐层写入、有效长度提交与会话 reset。
-- 真实约 4.1 GiB `.fire` 模型的双 token CPU/GPU forward 集成测试；GPU 测试覆盖非默认 CUDA stream，并检查 CPU/GPU logits 最大绝对误差小于 `1e-2`。
+## 快速开始
 
-### 发布前收尾
+下面的命令假设使用 64-bit little-endian Linux，并在仓库根目录执行。Ubuntu/Debian
+可以直接参考；其他发行版请安装对应的开发包。
 
-- 接通 tokenizer、sampling 与 `llama_chat` 命令行生成循环。
-- 增加与 Hugging Face 参考实现的 logits/token 对齐记录。
-- 整理 release 配置、运行示例与已知限制。
+### 1. 安装 C++ 构建依赖
 
-### 当前边界
+最低要求：
 
-- 仅支持固定 profile：`TinyLlama/TinyLlama-1.1B-Chat-v1.0`。
-- 模型执行目前为单序列、单 token、FP32；尚无 batching、量化或 PagedAttention。
-- 独立 `SoftmaxOp` 尚未公开；MHA 已在 CPU/CUDA 实现中内置稳定 softmax。
-- `demo/llama_chat.cpp` 正在接入，暂不属于已验证的 v0.1 core 路径。
+- CMake 3.17+
+- 支持 C++17 的编译器
+- NVIDIA CUDA Toolkit 和 `nvcc`
+- glog
+- Armadillo
+- SentencePiece development headers/library
+- GoogleTest（只在构建测试时需要）
+- Python 3.9+（导出和 Python tests）
 
----
+Ubuntu/Debian 示例：
 
-## ✨ 项目目标
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential \
+  cmake \
+  ninja-build \
+  libgoogle-glog-dev \
+  libarmadillo-dev \
+  libsentencepiece-dev \
+  libgtest-dev \
+  python3 \
+  python3-pip \
+  python3-venv
+```
 
-- 理解 LLM 推理框架从 Tensor 到模型执行的完整数据流。
-- 使用 CUDA 实现并验证 Transformer 核心算子。
-- 从零实现内存管理、Tensor、Operator、Model 与 Runtime。
-- 通过 GoogleTest 和真实模型集成测试建立可回归的正确性基线。
-- 在正确性稳定后继续进行量化、Kernel Fusion 与性能分析。
+CUDA Toolkit 请按 NVIDIA 对应平台的安装方式安装，并确认：
 
----
+```bash
+nvcc --version
+```
 
-## 🏗️ 项目结构
+当前顶层 CMake 以 `LANGUAGES CXX CUDA` 配置项目，因此即使只准备运行 CPU
+推理，也必须能找到 CUDA compiler 和 CUDAToolkit。源码还使用了
+`/usr/local/cuda/targets/x86_64-linux/include/cccl`；非默认 CUDA 安装需要提供兼容
+路径或调整 CMake 配置。
+
+### 2. 配置并构建
+
+推荐使用 Release 构建。包含测试的完整构建：
+
+```bash
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=ON
+cmake --build build --parallel
+```
+
+主要产物：
+
+```text
+build/src/libfire.a       # Fire 静态库
+build/test/fire_tests     # C++ GTest
+build/demo/llama_chat     # 聊天 CLI
+```
+
+如果只想构建库和 demo、不安装 GoogleTest：
+
+```bash
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=OFF
+cmake --build build --target fire llama_chat --parallel
+```
+
+重新开启测试时需要重新配置：
+
+```bash
+cmake -S . -B build -DBUILD_TESTING=ON
+```
+
+### 3. 准备 Python 导出环境
+
+建议使用独立虚拟环境：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install numpy safetensors torch huggingface_hub
+```
+
+`torch` 只用于 exporter 在 CPU 上读取 BF16 tensor 并转换为 FP32；聊天 demo
+本身不依赖 Python 或 PyTorch。若需要特定 PyTorch wheel，请使用
+[PyTorch 官方安装选择器](https://pytorch.org/get-started/locally/)。
+
+### 4. 下载 TinyLlama
+
+仓库约定把 Source Checkpoint 放到：
+
+```text
+models/TinyLlama-1.1B-Chat-v1.0/
+```
+
+使用 Hugging Face 当前的 `hf download` CLI：
+
+```bash
+mkdir -p models/TinyLlama-1.1B-Chat-v1.0
+
+hf download TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  config.json \
+  model.safetensors \
+  tokenizer.model \
+  --local-dir models/TinyLlama-1.1B-Chat-v1.0
+```
+
+这三个文件分别用于 profile 校验、权重导出和聊天分词。完成后目录至少应为：
+
+```text
+models/TinyLlama-1.1B-Chat-v1.0/
+├── config.json
+├── model.safetensors
+└── tokenizer.model
+```
+
+`hf download` 和 `--local-dir` 的当前行为见
+[Hugging Face 官方下载文档](https://huggingface.co/docs/huggingface_hub/guides/download)。
+模型为公开仓库，正常情况下无需登录；受限网络环境可能需要配置 Hugging Face
+mirror/proxy。
+
+`models/` 已被 `.gitignore` 忽略，不会误提交数 GB 的权重文件。
+
+### 5. 导出 `tmp/llama.fire`
+
+Fire v0.1 不直接读取 Hugging Face safetensors。先将 checkpoint 导出到仓库约定位置：
+
+```bash
+mkdir -p tmp
+
+python -B tools/export_tinyllama.py \
+  --hf models/TinyLlama-1.1B-Chat-v1.0 \
+  tmp/llama.fire
+```
+
+exporter 会：
+
+1. 校验 `config.json` 是否精确匹配 v0.1 TinyLlama profile；
+2. 校验单个 `model.safetensors` 中 201 个 tensor 的名称、BF16 dtype 和 shape；
+3. 将 tensor 逐个转换为 FP32；
+4. 写出 `.fire` v1 Header、Directory 和连续 payload。
+
+成功结果的固定属性：
+
+```text
+路径:       tmp/llama.fire
+tensor 数:  201
+data_offset: 19,328 bytes
+文件大小:   4,400,212,864 bytes（约 4.10 GiB）
+```
+
+可以核对文件大小：
+
+```bash
+stat -c '%n %s bytes' tmp/llama.fire
+```
+
+输出路径必须尚不存在，exporter 不会覆盖已有文件。需要重新导出时，请先把旧文件移动
+到备份位置，或选择一个新的输出文件名。建议至少准备约 8 GiB 可用磁盘空间以同时保存
+源 checkpoint 与 FP32 `.fire`。
+
+`.fire` 只保存模型 tensor，不包含 tokenizer；启动 demo 时仍需要原始
+`tokenizer.model`。`tmp/` 同样已被 `.gitignore` 忽略。
+
+### 6. 启动聊天 demo
+
+CMake 会把上述默认路径编译进 demo。从仓库根目录启动 CPU 模式：
+
+```bash
+./build/demo/llama_chat
+```
+
+CPU 可以运行，但 1.1B FP32 模型会很慢。GPU 模式需要显式传入模型路径、tokenizer
+路径和设备：
+
+```bash
+./build/demo/llama_chat \
+  tmp/llama.fire \
+  models/TinyLlama-1.1B-Chat-v1.0/tokenizer.model \
+  gpu
+```
+
+查看参数：
+
+```bash
+./build/demo/llama_chat --help
+```
+
+CLI 内支持：
+
+```text
+/help   查看命令
+/reset  清空对话历史
+/exit   退出（/quit 也可以）
+```
+
+当前 demo 的行为边界：
+
+- 使用 TinyLlama chat template，并显式插入 BOS/EOS token；
+- 使用 greedy argmax，不支持 temperature、top-k 或 top-p；
+- 每轮最多生成 128 token；
+- 模型上下文上限为 2048 token，为回复预留 128 token；
+- prompt 超过预算时按完整轮次删除最早历史；
+- 每轮重新编码保留的历史并重建 KV Cache，实现简单但不是高吞吐方案；
+- 输入是单行文本。
+
+真实 GPU forward 测试要求至少约 5 GiB 空闲显存；demo 的实际需求还会受到 CUDA
+runtime、allocator cache 和设备上其他进程影响。
+
+## 测试
+
+完成构建、模型下载和导出后运行全部已注册测试：
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+直接运行 C++ GTest：
+
+```bash
+./build/test/fire_tests
+```
+
+只运行 tokenizer 或 sampler：
+
+```bash
+ctest --test-dir build -R 'LlamaTokenizer|ArgmaxSampler' --output-on-failure
+```
+
+Python Writer/exporter contract tests：
+
+```bash
+python3 -B test/test_model/test_export_tinyllama.py
+```
+
+真实模型的双 token forward 属于重型集成测试，默认不会运行：
+
+```bash
+# CPU
+FIRE_RUN_TINYLLAMA_FORWARD_TEST=1 \
+  ./build/test/fire_tests \
+  --gtest_filter='TinyllamaTest.CpuForwardTwoTokensProducesFiniteLogitsAndAdvancesCache'
+
+# GPU；还会与 CPU logits 比较
+FIRE_RUN_TINYLLAMA_GPU_FORWARD_TEST=1 \
+  ./build/test/fire_tests \
+  --gtest_filter='TinyllamaTest.GpuForwardTwoTokensOnNonDefaultStream'
+```
+
+没有 CUDA device/driver 时，CUDA tests 会跳过。部分真实模型测试还会根据环境变量、
+`tmp/llama.fire` 是否存在和可用显存决定是否跳过。
+
+## 项目结构
 
 ```text
 Fire/
 ├── include/Fire/
-│   ├── base/                 # 设备、状态、Allocator 与 Buffer
-│   ├── tensor/               # Tensor 元数据、存储与设备迁移
+│   ├── base/                 # Status、设备、Allocator、Buffer
+│   ├── tensor/               # Tensor shape、view 与存储
 │   ├── op/                   # Operator 公共接口
-│   └── model/                # Reader、Loader、KVCache 与 TinyLlama
+│   ├── model/                # Reader、Loader、KVCache、TinyLlama
+│   ├── tokenizer/            # Tokenizer 接口与 Llama SentencePiece 实现
+│   └── sampler/              # Sampler 接口与 ArgmaxSampler
 ├── src/
 │   ├── base/
 │   ├── tensor/
-│   ├── op/
-│   │   └── kernels/
-│   │       ├── cpu/
-│   │       └── cuda/
-│   └── model/
-├── test/
-│   ├── test_base/
-│   ├── test_tensor/
-│   ├── test_op/
-│   └── test_model/
+│   ├── op/kernels/{cpu,cuda}/
+│   ├── model/
+│   ├── tokenizer/
+│   └── sampler/
+├── test/                     # C++ GTest 与 Python contract tests
 ├── tools/
 │   ├── fire_writer.py
 │   └── export_tinyllama.py
 ├── demo/
-│   └── llama_chat.cpp        # v0.1 聊天 CLI 接入中
+│   └── llama_chat.cpp
 ├── docs/
 │   ├── model_export_v0_1.md
 │   ├── model_design_v0_1.md
@@ -82,190 +332,73 @@ Fire/
 └── readme.md
 ```
 
-核心 C++ 代码编译为静态库 `libfire.a`，并通过 CMake target `Fire::fire` 提供给测试和上层程序。
+核心 C++ 代码编译为静态库 `libfire.a`，并通过 CMake target `Fire::fire` 提供给
+测试和 demo。
 
----
+## v0.1 技术概览
 
-## 🧱 已实现模块
-
-### Runtime 基础设施
-
-- `CPUAllocator` / `GPUAllocator` 管理主机和设备内存。
-- `Buffer` 表达底层存储、设备位置与所有权。
-- `Tensor` 表达 dtype、shape、stride、offset，并支持 clone 和 CPU/CUDA 迁移。
-- `OpContext` 逐次传入设备、allocator、CUDA stream 与 workspace，不把执行环境固化在算子或模型中。
-
-### Operator 与 Kernel
-
-当前已有 FP32 CPU/CUDA 路径：
-
-- VecAdd
-- RMSNorm
-- Matmul / Linear
-- Embedding
-- RoPE
-- SwiGLU
-- Softmax kernel
-- Multi-Head Attention（含 GQA）
-
-RMSNorm、RoPE、Embedding、SwiGLU 和 MHA 支持调用方提供的 CUDA stream。RoPE 使用与 Hugging Face TinyLlama 权重布局一致的前后半区配对和紧凑 sin/cos cache。
-
-### TinyLlama Model
-
-`TinyLlamaModel` 已实现以下生命周期：
-
-```text
-TinyllamaLoader::load_weights
-        ↓
-TinyLlamaModel::create
-        ↓
-TinyLlamaModel::prepare(capacity)
-        ↓
-forward(token_id, pos, logits)
-        ↓
-reset()
-```
-
-一次 `forward` 的主路径为：
+一次 `TinyLlamaModel::forward` 消费一个 token，并产生下一 token 的
+`logits[32000]`：
 
 ```text
 token_id
    ↓
 Embedding
    ↓
-22 × [RMSNorm → Q/K/V → RoPE → KVCache → MHA → Wo → Residual
+22 × [RMSNorm → Q/K/V → RoPE → KVCache → GQA MHA → Wo → Residual
       → RMSNorm → W1/W3 → SwiGLU → W2 → Residual]
    ↓
 Final RMSNorm → LM Head → logits[32000]
 ```
 
-Runtime 中间 Tensor 会跨层复用；K/V Cache 的形状为
-`[num_layers, capacity, num_kv_heads, head_dim]`。只有整次 forward 成功后才提交新的有效序列长度。
+Runtime Tensor 跨层复用。K/V Cache 使用连续布局
+`[num_layers, capacity, num_kv_heads, head_dim]`，只有整个 token forward 成功后才
+提交新的有效长度。
 
-更完整的 shape、生命周期和错误语义见
-[`docs/model_design_v0_1.md`](docs/model_design_v0_1.md)。
+`.fire` 是 model-agnostic 的 Tensor Container，不是自描述的通用模型格式。
+TinyLlama 的名称、shape 和配置约束由 `TinyllamaLoader` 与固定 Model Profile 负责。
 
-### `.fire` 模型格式
+进一步阅读：
 
-- `FireWriter` 写入 model-agnostic `.fire` v1 容器。
-- TinyLlama exporter 对本地 BF16 safetensors 进行两遍校验和逐 Tensor FP32 转换，避免加载完整 `state_dict`。
-- `FireReader` 使用 mmap 解析并校验 Header、Directory、payload 范围与布局。
-- `TinyllamaLoader` 校验固定 profile 的 201 个 tensor，并建立共享 mmap Tensor views。
+- [模型层设计](docs/model_design_v0_1.md)
+- [TinyLlama 导出与 `.fire` v1 格式](docs/model_export_v0_1.md)
+- [仓库地图](docs/repo_map.md)
+- [领域术语](CONTEXT.md)
 
-格式和 canonical tensor mapping 见
-[`docs/model_export_v0_1.md`](docs/model_export_v0_1.md)。
+## 已知限制
 
----
+- v0.1 只支持 `TinyLlama/TinyLlama-1.1B-Chat-v1.0` 这一固定 profile。
+- 模型执行是单序列、单 token、FP32；没有 batching 和量化执行路径。
+- `llama_chat` 只有 greedy sampling，每轮重放保留的 prompt，没有增量复用跨轮 KV Cache。
+- CPU 推理仅适合作为正确性基线，速度很慢。
+- 项目配置阶段即要求 CUDA Toolkit；尚未提供纯 CPU-only build。
+- 部分底层约束仍通过 glog `CHECK/LOG(FATAL)` 处理，不适合作为不可信输入服务边界。
+- 尚未形成与 Hugging Face 参考实现逐位置 logits/token 的独立对齐记录；已有验证主要是
+  CPU/GPU 自一致性、算子数值测试和端到端生成路径。
+- Softmax 已有 CPU/CUDA kernel 并用于 MHA，但尚无独立公开 `SoftmaxOp`。
 
-## 🔨 构建
+## Roadmap
 
-主要依赖：
-
-- 支持 C++17 的编译器
-- CMake
-- CUDA Toolkit
-- glog
-- Armadillo
-- GoogleTest（测试构建）
-- Python 3、NumPy、safetensors（导出与合同测试）
-- PyTorch（导出真实 TinyLlama payload）
-
-当前 `llama_chat` demo 正在接入。构建已验证的 core 与测试目标：
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build --target fire fire_tests -j
-```
-
----
-
-## 🧪 测试
-
-运行常规测试：
-
-```bash
-ctest --test-dir build --output-on-failure
-```
-
-或直接运行 C++ 测试：
-
-```bash
-./build/test/fire_tests
-```
-
-Writer/exporter 合同测试：
-
-```bash
-python3 -B test/test_model/test_export_tinyllama.py
-```
-
-### 真实 TinyLlama forward
-
-先将真实模型导出到 `tmp/llama.fire`。这两项重型测试默认跳过，需要显式开启：
-
-```bash
-# CPU：连续执行两个 token，并验证 logits 与 KV Cache 位置约束
-FIRE_RUN_TINYLLAMA_FORWARD_TEST=1 \
-  ./build/test/fire_tests \
-  --gtest_filter='TinyllamaTest.CpuForwardTwoTokensProducesFiniteLogitsAndAdvancesCache'
-
-# GPU：需要 CUDA 和至少 5 GiB 空闲显存；同时比较 CPU/GPU logits
-FIRE_RUN_TINYLLAMA_GPU_FORWARD_TEST=1 \
-  ./build/test/fire_tests \
-  --gtest_filter='TinyllamaTest.GpuForwardTwoTokensOnNonDefaultStream'
-```
-
-2026-09-18 的发布候选验证中，常规 CTest 共 64 项、0 failure，其中 13 项因 CUDA/真实模型开关未启用而跳过；显式开启的真实 GPU 测试已在 RTX 4070 Laptop GPU 上通过，两个位置的 CPU/GPU logits 最大绝对误差分别约为 `1.90e-4` 和 `1.92e-4`，低于测试阈值 `1e-2`。
-
----
-
-## 📦 导出 TinyLlama
-
-输入目录需包含与 `TinyLlama/TinyLlama-1.1B-Chat-v1.0` profile 精确匹配的 `config.json` 和单个 `model.safetensors`：
-
-```bash
-mkdir -p tmp
-python3 tools/export_tinyllama.py \
-  --hf /path/to/TinyLlama-1.1B-Chat-v1.0 \
-  tmp/llama.fire
-```
-
-输出路径必须尚不存在。导出结果约为 4.1 GiB；当前 `.fire` v1 只保存 FP32 tensor，不保存 tokenizer 或生成配置。
-
----
-
-## 🛣️ Roadmap
-
-### v0.1：TinyLlama FP32 推理基线（发布收尾中）
+### v0.1：TinyLlama FP32 推理基线
 
 - [x] Memory / Buffer / Tensor
 - [x] CPU/CUDA Operator 与 Kernel
 - [x] `.fire` v1 Writer、Reader、Exporter 与 Loader
 - [x] MHA、KV Cache 与 TinyLlama 完整 forward
+- [x] SentencePiece tokenizer 与 Argmax sampler
+- [x] 简单多轮 `llama_chat` CLI
 - [x] 真实模型 CPU/GPU 双 token 验证
-- [ ] Tokenizer、Sampling 与聊天 CLI
-- [ ] Hugging Face 参考 logits/token 对齐
-- [ ] Release 配置、示例与已知限制整理
 
-### v0.2+
+### v0.1 后续验证与 v0.2+
 
-- Batch 与更灵活的模型 profile
-- Matmul 量化与权重量化格式
-- Kernel Fusion、显存复用与性能优化
-- Nsight Systems / Nsight Compute profiling
+- Hugging Face 参考 logits/token 独立对齐
+- 更完整的 Loader/状态失败矩阵与 CUDA 错误传播
+- temperature、top-k、top-p 等 sampling 策略
+- Batch、量化与更灵活的 Model Profile
+- Kernel Fusion、显存复用和 profiling
 - PagedAttention 与更完整的生成 runtime
 
----
-
-## 🚧 Development Status
-
-Fire v0.1 当前属于 **release candidate / 发布收尾阶段**。核心 TinyLlama FP32 forward 已经在 CPU 和 CUDA 上跑通，模型加载、Runtime shape、算子顺序、RoPE、GQA Attention、KV Cache 推进以及最终 logits 均进入自动化测试。
-
-当前仍不能把 Fire 描述为完整聊天引擎：仓库尚未内置 tokenizer 与 sampler，`llama_chat` demo 也仍在连接这些上层组件；同时还需要补充 Hugging Face 参考对齐和更系统的 CUDA 性能数据。完成这些发布项后将发布 **v0.1**。
-
----
-
-## 🔥 Why Fire?
+## Why Fire?
 
 Fire 希望从一个 CUDA Kernel 开始，逐步构建一条可理解、可验证的推理链路：
 

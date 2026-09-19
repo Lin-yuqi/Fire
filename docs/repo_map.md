@@ -1,12 +1,12 @@
 # Fire 仓库地图
 
-> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后核对日期：2026-09-18。
+> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后核对日期：2026-09-19。
 
 ## 1. 项目定位与当前阶段
 
 Fire 是一个以学习和实验为目标、从零构建的轻量级 CUDA 推理框架，计划沿着“内存与 Buffer → Tensor → Operator → Model → Runtime → LLM 推理”的方向演进。
 
-当前仓库已经完成第一版基础抽象，并打通 `.fire` 模型加载到 TinyLlama logits 的 CPU/CUDA 核心链路，处于 v0.1 发布收尾阶段：
+当前仓库已经发布 v0.1，并打通 Source Checkpoint 到简单聊天 CLI 的 TinyLlama CPU/CUDA 路径：
 
 - `base` 模块已经接入构建，提供 CPU/GPU 分配器、内存拷贝以及 Buffer 生命周期管理。
 - `tensor` 已接入 `Fire::fire`，具备接口和初步实现，并开始覆盖 Buffer 字节偏移与 clone 行为。
@@ -22,10 +22,12 @@ Fire 是一个以学习和实验为目标、从零构建的轻量级 CUDA 推理
 - 独立 260-byte fixture、Reader 异常矩阵、mapping ownership 和 exporter/writer 失败语义均已接入自动化测试。
 - `TinyllamaLoader` 已支持按名字读取单个 CPU mmap Tensor view；`load_weights()` 会校验 201 项 canonical tensor 的数量、名称、FP32 dtype 和 shape，在全部成功后发布结构化权重。
 - `Model` 纯接口、固定 profile、结构化权重和 Block 参数结构已建立。`TinyLlamaModel` 已实现参数绑定、Runtime/KVCache 分配、RoPE cache、完整单 token forward、K/V 写入与长度提交，以及 reset。真实模型 CPU/GPU 双 token 测试会检查有限 logits、位置推进、非默认 CUDA stream 和 CPU/GPU 一致性。
+- `tokenizer` 已接入 SentencePiece `LlamaTokenizer`，支持真实 `tokenizer.model` 的加载、BOS/EOS 和文本编解码；`sampler` 已接入 CPU/CUDA `ArgmaxSampler` 并验证相同最大值取首次位置。
+- `llama_chat` 已实现 TinyLlama chat template、greedy 自回归生成、128 token 回复上限、按完整轮次裁剪历史、CPU/GPU 选择以及 `/reset`、`/help`、`/exit`。
 
-因此，当前 Base、Tensor、Operator、已实现的 CPU/CUDA kernel、FireReader 和 Loader 均已编入 `Fire::fire`；Python exporter/writer 作为独立工具运行。RMSNorm 和 Linear 的量化配置已能表示，但当前算子会拒绝量化权重。
+因此，当前 Base、Tensor、Operator、Model、Tokenizer、Sampler、已实现的 CPU/CUDA kernel、FireReader 和 Loader 均已编入 `Fire::fire`；Python exporter/writer 作为独立工具运行，`llama_chat` 链接 `Fire::fire`。RMSNorm 和 Linear 的量化配置已能表示，但当前算子会拒绝量化权重。
 
-现阶段已经形成 `Source Checkpoint → exporter → FireReader/Loader → TinyLlamaModel → CPU/CUDA logits` 的核心闭环。v0.1 发布前重点是补强 Loader/状态失败矩阵、加入 Hugging Face 参考对齐，并连接 Tokenizer、Sampler 与聊天生成入口。模型层契约与实施边界见 [模型层设计](model_design_v0_1.md)。
+现阶段已经形成 `Source Checkpoint → exporter → FireReader/Loader → TinyLlamaModel → Tokenizer/Sampler → llama_chat` 的 v0.1 闭环。发布后的重点是补强 Loader/状态失败矩阵、加入 Hugging Face 独立参考对齐，并改进 sampling 与生成效率。模型层契约与实施边界见 [模型层设计](model_design_v0_1.md)。
 
 ## 2. 顶层导航
 
@@ -48,16 +50,22 @@ Fire/
 │   │   ├── model_weights.h        # 固定 profile 与结构化权重
 │   │   ├── kv_cache.h             # TinyLlama K/V 连续存储与序列长度状态
 │   │   └── tinyllama.h            # Block、模型接口与 typed Runtime
-│   └── op/
-│       ├── operator.h             # Operator、参数与执行上下文
-│       ├── add.h                  # VecAddOp 接口
-│       ├── embedding.h            # EmbeddingOp 参数绑定与查表接口
-│       ├── rmsnorm.h              # RmsNormOp 接口与 epsilon 配置
-│       ├── matmul.h               # 无绑定参数的 MatmulOp
-│       ├── linear.h               # 绑定 weight/可选 bias 的 LinearOp
-│       ├── rope.h                 # half-split RoPE 原地旋转接口
-│       ├── swiglu.h               # SwiGLU 逐元素算子接口
-│       └── mha.h                  # GQA MHA 校验与调度接口
+│   ├── op/
+│   │   ├── operator.h             # Operator、参数与执行上下文
+│   │   ├── add.h                  # VecAddOp 接口
+│   │   ├── embedding.h            # EmbeddingOp 参数绑定与查表接口
+│   │   ├── rmsnorm.h              # RmsNormOp 接口与 epsilon 配置
+│   │   ├── matmul.h               # 无绑定参数的 MatmulOp
+│   │   ├── linear.h               # 绑定 weight/可选 bias 的 LinearOp
+│   │   ├── rope.h                 # half-split RoPE 原地旋转接口
+│   │   ├── swiglu.h               # SwiGLU 逐元素算子接口
+│   │   └── mha.h                  # GQA MHA 校验与调度接口
+│   ├── tokenizer/
+│   │   ├── tokenizer.h            # 文本/token IDs 抽象接口
+│   │   └── llama_tokenizer.h      # SentencePiece TinyLlama tokenizer
+│   └── sampler/
+│       ├── sampler.h              # logits sampling 抽象接口
+│       └── argmax_sampler.h       # CPU/CUDA greedy sampler
 ├── src/
 │   ├── CMakeLists.txt             # fire 静态库定义；收集模块及 CPU/CUDA kernel
 │   ├── base/
@@ -99,7 +107,12 @@ Fire/
 │   │       ├── cuda/mha_kernel.*  # CUDA FP32 GQA attention
 │   │       ├── cuda/rope_kernel.* # CUDA RoPE 与 cache 生成
 │   │       ├── cuda/softmax_kernel.* # CUDA 稳定 softmax
-│   │       └── cuda/swiglu_kernel.* # CUDA FP32 SwiGLU
+│   │       ├── cuda/swiglu_kernel.* # CUDA FP32 SwiGLU
+│   │       └── cuda/argmax_kernel.* # CUDA block argmax reduction
+│   ├── tokenizer/
+│   │   └── llama_tokenizer.cpp   # SentencePiece 加载与编解码
+│   └── sampler/
+│       └── argmax_sampler.cpp    # CPU/CUDA sampler 分派
 ├── test/
 │   ├── CMakeLists.txt             # 单一 fire_tests 测试可执行文件
 │   ├── test_base/test_buffer.cpp  # Buffer 自有/外部内存测试
@@ -118,6 +131,8 @@ Fire/
 │   ├── test_op/test_rope.cpp      # compact cache、half-split 与 GQA 测试
 │   ├── test_op/test_softmax.cpp   # CPU/CUDA 数值稳定性和宽度边界
 │   ├── test_op/test_swiglu.cpp    # SwiGLU 数值、校验及输入只读性测试
+│   ├── test_tokenizer/test_llama_tokenizer.cpp # 真实 TinyLlama tokenizer 测试
+│   ├── test_sampler/test_argmax_sampler.cpp # CPU/CUDA argmax sampler 测试
 │   └── utils.cu/.cuh              # CUDA 测试辅助函数
 ├── docs/
 │   ├── model_export_v0_1.md       # TinyLlama 导出、.fire v1 与验收设计
@@ -127,8 +142,8 @@ Fire/
 │   ├── fire_writer.py             # model-agnostic .fire v1 writer
 │   └── export_tinyllama.py        # TinyLlama-specific 两遍 exporter/CLI
 ├── demo/
-│   ├── CMakeLists.txt             # llama_chat 目标接入中
-│   └── llama_chat.cpp             # v0.1 聊天 CLI 接入中
+│   ├── CMakeLists.txt             # llama_chat 目标与默认模型路径
+│   └── llama_chat.cpp             # v0.1 多轮 greedy 聊天 CLI
 └── build/                         # 本地生成物，不属于源码
 ```
 
@@ -141,6 +156,7 @@ Fire/
 | CUDA Toolkit | CUDA runtime、GPU 内存分配/拷贝；项目配置阶段即强制需要 |
 | glog | `CHECK`、`LOG` 断言与日志 |
 | Armadillo | CPU Add/Matmul/SwiGLU kernel 的运算后端 |
+| SentencePiece | `LlamaTokenizer` 的 `tokenizer.model` 加载、encode/decode |
 | GoogleTest | 仅在 `BUILD_TESTING=ON` 时查找，用于测试 |
 | Python 3 | `BUILD_TESTING=ON` 时生成独立 fixture 并运行 Writer/exporter 合同测试；也用于 exporter CLI |
 | NumPy、safetensors | Writer/exporter 合同测试与实际导出的 Python 运行时依赖 |
@@ -150,9 +166,9 @@ Fire/
 
 ```text
 Fire (project)
-├── fire / Fire::fire             # 静态库；包含 base、tensor、op、model 与 CPU/CUDA kernel
+├── fire / Fire::fire             # 静态库；包含 base、tensor、op、model、tokenizer、sampler 与 kernel
 ├── fire_v1_fixture               # build-tree 内生成独立 260-byte fixture
-├── llama_chat                    # demo 目标，源码与链接配置仍在接入
+├── llama_chat                    # v0.1 多轮 greedy 聊天 CLI
 └── fire_tests                    # 依赖 fixture，链接 Fire::fire + GTest::gtest_main
     ├── test_base/test_buffer.cpp
     ├── test_tensor/test_tensor.cpp
@@ -167,6 +183,8 @@ Fire (project)
     ├── test_op/test_rope.cpp
     ├── test_op/test_softmax.cpp
     ├── test_op/test_swiglu.cpp
+    ├── test_tokenizer/test_llama_tokenizer.cpp
+    ├── test_sampler/test_argmax_sampler.cpp
     └── utils.cu
 
 CTest registration
@@ -177,11 +195,11 @@ CTest registration
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build --target fire fire_tests -j
+cmake --build build --target fire fire_tests llama_chat -j
 ctest --test-dir build --output-on-failure
 ```
 
-`llama_chat` 尚在接入，因此上面的命令只构建当前已验证的 core/test 目标。CTest 注册 C++ GTest 与 Python Writer/exporter 合同测试；具体通过与跳过数量以当前运行结果为准。真实 TinyLlama `.fire` 已按 201 项、`data_offset = 19,328`、文件长度 `4,400,212,864` bytes 完成加载和 CPU/GPU forward；从 source checkpoint 抽样做 bit-exact 数值回读仍未形成独立验收记录。
+CTest 注册 C++ GTest 与 Python Writer/exporter 合同测试；具体通过与跳过数量以当前运行结果为准。真实 TinyLlama `.fire` 已按 201 项、`data_offset = 19,328`、文件长度 `4,400,212,864` bytes 完成加载和 CPU/GPU forward。`llama_chat` 已完成模型/tokenizer 加载、上下文裁剪与 greedy 生成；从 source checkpoint 抽样做 bit-exact 数值回读仍未形成独立验收记录。详细的依赖安装、模型下载、导出与 demo 命令以根目录 [readme](../readme.md) 为准。
 
 ## 4. 模块关系
 
@@ -283,6 +301,14 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 `model.h` 定义单序列 `Model` 的 `config/prepare/forward/reset` 纯接口；`model_weights.h` 定义唯一的 C++ 固定 profile 与按层组织的 Tensor 字段。`TinyLlamaModel::create` 把结构化权重绑定到 Embedding、Norm 和 Linear 参数算子，并按 context 决定是否迁移到 GPU；`prepare` 分配 typed Runtime、K/V Tensor、attention score 和紧凑 RoPE cache。`forward` 已按 22 层顺序执行 Attention/FFN、写入 K/V、生成 logits，并在全部成功后提交 cache length；`reset` 将有效长度归零并保留已分配存储。
 
+### `tokenizer`、`sampler` 与聊天入口
+
+`token::LlamaTokenizer` 包装 SentencePiece，加载原始 `tokenizer.model`，提供带可选 BOS/EOS 的 encode、decode 和词表/特殊 token ID 查询。TinyLlama chat template 中的 `</s>` 由 demo 显式转换为 EOS ID，而不是作为普通字符串交给 SentencePiece。
+
+`sampler::ArgmaxSampler` 在 CPU 上使用 `std::max_element`，在 GPU 上使用单 block CUB reduction；两条路径都以首次出现的最大值为结果。现有 Sampler 接口直接返回 host `size_t`，因此 CUDA 路径在返回前必须同步 stream。
+
+`llama_chat` 负责组装 system/user/assistant 消息、逐 token 调用 `TinyLlamaModel::forward`、采样和解码。它为回复预留 128 token，prompt 超出 1920 token 时删除最早完整轮次，并在每轮开始时 reset 后重放保留的上下文。该策略便于理解和验证，但会重复计算历史，不是高吞吐 serving runtime。
+
 ### `tools`: exporter/writer
 
 `fire_writer.py` 固定 `.fire` v1 常量、wire dtype 和规范化 `TensorInfo`，在写入前校验 name、rank、shape、byte size 及紧密排列的 absolute offset。`FireWriter` 编码 32-byte Header 和 96-byte Directory entry，再通过 `memoryview(tensor).cast("B")` 写入单个 FP32 C-contiguous NumPy payload。
@@ -337,6 +363,8 @@ RMSNorm 的当前调用路径是：
 4. `TinyllamaLoader::load_weights` 按 canonical name 校验 201 项 dtype/shape，用 `mapped_buffer()` 与 absolute byte offset 组装结构化 CPU Tensor views。
 5. `TinyLlamaModel::create/prepare` 绑定参数并准备 Runtime；`forward` 依次执行 Embedding、22 层 Attention/FFN、final RMSNorm 和 LM Head，得到 `[32000]` logits。
 6. 每层 K/V 写入 `[layer, pos, ...]`，MHA 读取 `[0, pos]` 的有效历史；整个 token 成功后 `KVCache::commit(pos)` 才推进长度。
+7. `LlamaTokenizer` 将 chat template 各消息编码为 token IDs，并由 demo 显式插入 BOS/EOS；`ArgmaxSampler` 从 logits 选出 next token。
+8. `llama_chat` 重复 forward、sample、decode，遇到 EOS 或 128 token 上限后结束当前回复，并保留受 2048 token 窗口约束的多轮历史。
 
 外部内存路径则由 `Buffer(ptr, capacity, device_type)` 包装；`owns_memory()` 为 false，调用方仍负责外部指针的生命周期。
 
@@ -348,7 +376,7 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 
 1. **部分 CUDA 返回值未检查**：部分 memcpy/memset 路径忽略 CUDA API 返回的 `cudaError_t`，失败时可能缺少及时、准确的错误信息；按当前约定可继续使用 `CHECK/LOG(FATAL)` 报错，无需引入额外错误类型。
 2. **RMSNorm 支持范围有限**：当前只有 FP32 实现，CPU 仅支持一维输入，GPU 多行路径已验证二维 `{rows, width}`；更高维输入的所有前导维度尚未完整接入 block 调度。量化 weight 会返回 `InvalidArgument`。
-3. **模型核心闭环已完成，上层生成仍缺失**：真实约 4.1 GiB `.fire` 已通过 201 项 Loader 校验和 CPU/GPU 双 token forward；但尚未接入 tokenizer、sampler、停止条件和可用的聊天 CLI，也尚未完成 Hugging Face 参考 logits 对齐，因此 v0.1 仍处于发布收尾阶段。
+3. **聊天入口以简单性优先**：Tokenizer、ArgmaxSampler、EOS 停止条件和 `llama_chat` 已接通，但当前只有 greedy sampling；每轮会 reset 并重放保留历史，没有跨轮 KV Cache 复用。Hugging Face 参考 logits/token 对齐仍未形成独立验收记录。
 4. **Matmul 验证与量化仍待补齐**：已有 FP32 CPU/CUDA 实现、CPU 单算子数值测试和真实模型 GPU 路径；更系统的 CUDA shape/误差矩阵、性能优化和量化路径属于后续工作。
 5. **Softmax 尚未形成独立 Operator**：CPU/CUDA kernel 和直接测试已完成，MHA 已在内部封装 softmax 计算；其他调用方目前仍需要直接使用 kernel 接口。
 6. **状态错误矩阵仍不完整**：KVCache 小尺寸测试已覆盖 K/V 写入、提交、reset、错误 shape 与错误位置，真实模型 forward 也会拒绝重复位置；更多 create/prepare/reset 失败保持场景仍需补齐。
@@ -365,6 +393,7 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 | 修改 RMSNorm | `include/Fire/op/rmsnorm.h`、`src/op/rmsnorm.cpp` | CPU/CUDA kernel、接口分派、`test/test_op/test_rmsnorm.cpp` |
 | 修改 `.fire` 读写 | `tools/fire_writer.py`、`include/Fire/model/fire_reader.h` | `src/model/fire_reader.cpp`、`test/test_model/`、格式设计文档 |
 | 增加模型或 Runtime | `include/Fire/model/` 与 `src/model/` | CMake 源文件、测试、README/本文 |
+| 修改分词、采样或聊天循环 | `include/Fire/{tokenizer,sampler}/`、`demo/llama_chat.cpp` | 对应 `src/`、测试、README/本文 |
 | 增加测试 | `test/test_<module>/` | `test/CMakeLists.txt` |
 | 增加 Python 导出工具 | `tools/` | 对应 Python test；无需为纯脚本增加 tools CMake |
 | 增加编译型 benchmark 工具 | `tools/` | 顶层 `add_subdirectory(tools)` 与 tools CMake |
@@ -373,13 +402,13 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 
 ## 8. 近期开发计划
 
-当前模型核心链路已形成闭环，v0.1 发布前按以下顺序推进：
+v0.1 已形成完整学习基线，发布后按以下顺序继续推进：
 
 1. 为真实导出补充 source checkpoint 抽样 bit-exact FP32 回读，并完成 Loader 的缺项、额外项和错误 shape 失败矩阵。
 2. 用固定 token 序列与 Hugging Face 参考实现逐位置比较 logits，建立独立于 CPU/GPU 自比较的数值基线。
-3. 接入 Tokenizer、Sampler、停止条件和 `llama_chat`，完成可运行的自回归生成示例。
-4. 整理 v0.1 release 配置、命令、已知限制与性能基线。
-5. v0.1 后继续推进 Matmul 量化、Kernel Fusion、显存复用和 profiling。
+3. 在现有 ArgmaxSampler 之外增加 temperature、top-k、top-p，并评估跨轮 KV Cache 复用。
+4. 补充 CUDA shape/误差矩阵、错误传播和性能基线。
+5. 继续推进 Matmul 量化、Kernel Fusion、显存复用和 profiling。
 
 ## 9. 文档维护约定
 

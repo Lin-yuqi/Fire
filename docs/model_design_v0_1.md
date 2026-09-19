@@ -1,12 +1,12 @@
 # Fire v0.1 模型层设计
 
-> 设计已确认；实现状态最后核对日期：2026-09-18。TinyLlama FP32 单 token forward 已在 CPU/CUDA 上跑通；Tokenizer、Sampler 与完整聊天生成循环仍在接入。
+> 设计已确认；实现状态最后核对日期：2026-09-19。Fire v0.1 已发布，TinyLlama FP32 单 token forward、Tokenizer、ArgmaxSampler 与简单聊天生成循环均已接通。
 
 ## 1. 范围与当前进度
 
 v0.1 只面向 `TinyLlama/TinyLlama-1.1B-Chat-v1.0` 的单序列、单 token、FP32 文本自回归推理。v0.2 接入 Qwen3 时，再根据真实重复代码提取公共实现；Qwen3.5 放在 v0.3。
 
-当前模型核心执行链已经闭合，处于 v0.1 发布前验证阶段：
+当前模型核心执行链和 v0.1 CLI 已经闭合：
 
 | 内容 | 当前状态 | 代码入口 |
 | --- | --- | --- |
@@ -21,12 +21,15 @@ v0.1 只面向 `TinyLlama/TinyLlama-1.1B-Chat-v1.0` 的单序列、单 token、F
 | Softmax | CPU/CUDA kernel 与直接数值测试已完成；尚无公开 Operator 包装 | [kernels_interface.h](../src/op/kernels/kernels_interface.h) |
 | MHA | 已提供公共 Operator、CPU/CUDA GQA kernel、参数校验与数值测试 | [mha.h](../include/Fire/op/mha.h) |
 | `TinyLlamaModel`、Runtime、KVCache | 已实现参数绑定、Runtime 分配、紧凑 RoPE cache、K/V 写入与提交、完整 forward 和 reset | 本文第 6、7 节 |
+| `LlamaTokenizer` | 已通过 SentencePiece 完成模型加载、BOS/EOS、encode/decode，并覆盖真实 TinyLlama tokenizer 测试 | [llama_tokenizer.cpp](../src/tokenizer/llama_tokenizer.cpp) |
+| `ArgmaxSampler` | 已提供 CPU `max_element` 与 CUDA block reduction greedy sampling；相同最大值取首次位置 | [argmax_sampler.cpp](../src/sampler/argmax_sampler.cpp) |
+| `llama_chat` | 已实现模型/tokenizer 加载、chat template、greedy 生成、有限历史、`/reset` 与 CPU/GPU CLI | [llama_chat.cpp](../demo/llama_chat.cpp) |
 
 文件格式、canonical tensor 名称和导出流程以 [模型导出设计](model_export_v0_1.md) 为准，本文不另定义 wire format。仓库现状见 [仓库地图](repo_map.md)。
 
 ## 2. 职责与目标数据流
 
-以下路径中，从 `.fire` 加载到单 token logits 的模型核心链路已经实现；Tokenizer、Sampler 和停止条件仍属于发布前的上层生成工作：
+以下从 `.fire`、文本输入到输出文本的 v0.1 路径均已实现。Tokenizer 和 Sampler 仍保持在 Model 接口之外，由 demo 负责组织生成循环：
 
 ```text
 .fire 文件
@@ -224,22 +227,23 @@ TinyLlama reset 只需把有效长度归零，Attention 必须屏蔽旧内容。
 
 ```bash
 cmake -S . -B build
-cmake --build build --target fire fire_tests -j 4
+cmake --build build --target fire fire_tests llama_chat -j 4
 ctest --test-dir build --output-on-failure
 ```
 
-`llama_chat` demo 尚在接入，因此这里先构建已经验证的 core/test 目标。
+`llama_chat` 会加载默认的 `tmp/llama.fire` 和
+`models/TinyLlama-1.1B-Chat-v1.0/tokenizer.model`。它按 TinyLlama chat template 显式插入 BOS/EOS，使用 ArgmaxSampler 生成，每轮最多 128 token；prompt 超过 1920 token 时从最早完整轮次开始裁剪。每一轮会重新编码保留的历史并重建 KV Cache，这是 v0.1 为保持实现简单而接受的性能边界。
 
 `test_model.cpp` 覆盖已绑定 Block 在 vector 扩容后的 Linear 数值、两处 Norm 的 TinyLlama epsilon 及抽象/移动属性。Embedding、RoPE、Softmax、SwiGLU 和 MHA 测试覆盖 CPU 数值、错误边界以及可用时的 CUDA 非默认 stream。`test_tinyllama_loader.cpp` 提供显式开启的真实 `.fire` 双 token CPU/GPU forward 测试，验证有限 logits、位置推进、非默认 GPU stream 以及 CPU/GPU logits 最大绝对误差 `< 1e-2`；无 CUDA 或真实模型文件时对应集成测试会跳过。
 
-v0.1 发布前继续完成：
+v0.1 发布后仍需继续补强：
 
 1. **Loader 验收**：补齐缺项、额外项、错误 dtype/shape、目录顺序变化和失败不污染输出的独立 fixture 测试，并完成真实导出数值回读。
 2. **状态与错误测试**：现有 KVCache 小尺寸测试已覆盖 K/V 独立写入、提交、reset、错误 shape 与错误位置；继续补齐 `create/prepare/forward/reset` 的失败保持和更多设备错误场景。
 3. **参考数值**：对固定 token 序列逐位置比较 Hugging Face FP32 logits；现有 CPU/GPU 一致性测试不能替代独立参考实现。
-4. **生成入口**：接通 tokenizer、sampler、停止条件与 `llama_chat`，形成完整自回归生成示例。
+4. **生成质量与效率**：在现有 greedy CLI 基础上增加随机采样，并评估跨轮 KV Cache 复用；这些能力不属于当前 v0.1 基线。
 
-真实 checkpoint 的全量导入验收仍按导出文档执行。当前真实模型 forward 和 CPU/GPU 一致性已经证明核心执行路径可运行，但正式声明 v0.1 Model Support 仍要求完整生成入口与独立参考校验。
+真实 checkpoint 的全量导入验收仍按导出文档执行。当前真实模型 forward、CPU/GPU 一致性和聊天生成入口已经证明端到端路径可运行；根据 [CONTEXT](../CONTEXT.md) 的严格术语，完整的 Model Support 参考验收仍缺少与 Hugging Face 的独立逐位置 logits/token 对齐记录。
 
 ## 9. KuiperLlama 参考与取舍
 
