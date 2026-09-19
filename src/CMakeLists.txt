@@ -9,12 +9,14 @@ aux_source_directory(op/kernels/ KERNEL_DIR)
 aux_source_directory(op/kernels/cpu/ CPU_KERNEL_DIR)
 aux_source_directory(op/kernels/cuda/ CUDA_KERNEL_DIR)
 aux_source_directory(model/ MODEL_DIR)
+aux_source_directory(tokenizer TOKEN_DIR)
 
 add_library(fire STATIC
     ${BASE_DIR}
     ${OP_DIR}
     ${TENSOR_DIR}
     ${MODEL_DIR}
+    ${TOKEN_DIR}
 
     ${KERNEL_DIR}
     ${CPU_KERNEL_DIR}

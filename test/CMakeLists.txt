@@ -1,6 +1,7 @@
 
 aux_source_directory(test_op/ OP)
 aux_source_directory(test_model MODEL)
+aux_source_directory(test_tokenizer TOKEN)
 add_executable(fire_tests
     test_base/test_buffer.cpp
     test_model/test_fire_reader.cpp
@@ -8,6 +9,7 @@ add_executable(fire_tests
     utils.cu
     ${OP}
     ${MODEL}
+    ${TOKEN}
 )
 
 target_link_libraries(fire_tests
