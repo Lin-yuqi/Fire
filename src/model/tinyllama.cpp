@@ -1,5 +1,4 @@
 #include "Fire/model/tinyllama.h"
-#include "Fire/base/alloc.h"
 #include "Fire/base/base.h"
 #include "Fire/model/model_weights.h"
 #include "Fire/tensor/tensor.h"
@@ -73,7 +72,7 @@ base::Status TinyLlamaModel::prepare(int32_t capacity, const op::OpContext& cont
     for (const auto& layer : _layers) {
         const op::ParamOperator* layer_ops[] = {
             &layer.attention_norm, &layer.wq, &layer.wk, &layer.wv, &layer.wo,
-            &layer.ffn_norm,      &layer.w1, &layer.w2, &layer.w3,
+            &layer.ffn_norm,       &layer.w1, &layer.w2, &layer.w3,
         };
         for (const auto* layer_op : layer_ops) {
             if (!parameters_match_device(*layer_op)) {
@@ -128,9 +127,9 @@ base::Status TinyLlamaModel::prepare(int32_t capacity, const op::OpContext& cont
     runtime->ffn_down =
         tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::hidden_size}, alloc);
     // 5. 分配 KVCache
-    auto status = runtime->kv_cache.allocate(
-        TinyLlamaProfile::num_layers, capacity, TinyLlamaProfile::num_kv_heads,
-        TinyLlamaProfile::head_dim, alloc);
+    auto status = runtime->kv_cache.allocate(TinyLlamaProfile::num_layers, capacity,
+                                             TinyLlamaProfile::num_kv_heads,
+                                             TinyLlamaProfile::head_dim, alloc);
     if (!status) {
         return status;
     }
