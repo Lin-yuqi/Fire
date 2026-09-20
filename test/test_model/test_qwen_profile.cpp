@@ -2,12 +2,14 @@
 #include "Fire/model/qwen.h"
 #include "Fire/model/qwen_loader.h"
 
+#include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <vector>
 
@@ -112,4 +114,108 @@ TEST(Qwen3ModelTest, CpuForwardTwoTokensProducesFiniteLogitsAndAdvancesCache) {
     EXPECT_TRUE(logits_changed);
     EXPECT_GT(max_abs_logit, 0.0f);
     EXPECT_EQ(qwen3->forward(1, 1, logits, context).code(), base::InvalidArgument);
+}
+
+TEST(Qwen3ModelTest, GpuForwardTwoTokensMatchesCpuOnNonDefaultStream) {
+    if (std::getenv("FIRE_RUN_QWEN3_GPU_FORWARD_TEST") == nullptr) {
+        GTEST_SKIP() << "set FIRE_RUN_QWEN3_GPU_FORWARD_TEST=1 to run the 2.8 GiB model";
+    }
+    if (!std::filesystem::exists(FIRE_QWEN3_0_6B_PATH)) {
+        GTEST_SKIP() << "Qwen3-0.6B .fire file is unavailable: " << FIRE_QWEN3_0_6B_PATH;
+    }
+
+    int32_t device_count = 0;
+    const auto device_status = cudaGetDeviceCount(&device_count);
+    if (device_status == cudaErrorNoDevice || device_status == cudaErrorInsufficientDriver ||
+        (device_status == cudaSuccess && device_count == 0)) {
+        GTEST_SKIP() << "CUDA unavailable";
+    }
+    ASSERT_EQ(device_status, cudaSuccess) << cudaGetErrorString(device_status);
+
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    ASSERT_EQ(cudaMemGetInfo(&free_bytes, &total_bytes), cudaSuccess);
+    constexpr size_t required_free_bytes = 4ULL * 1024 * 1024 * 1024;
+    if (free_bytes < required_free_bytes) {
+        GTEST_SKIP() << "Qwen3-0.6B GPU forward requires at least 4 GiB free VRAM";
+    }
+
+    const auto& profile = model::qwen3_profiles::Qwen3_0_6B;
+    model::Qwen3Loader loader(profile);
+    auto status = loader.open(FIRE_QWEN3_0_6B_PATH);
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    model::Qwen3Weights weights;
+    status = loader.load_weights(weights);
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    op::OpContext gpu_context;
+    gpu_context._device_type = base::DeviceType::GPU;
+    gpu_context._allocator = base::GPUAllocatorFactory::get_instance();
+    gpu_context._stream = stream;
+
+    std::unique_ptr<model::Qwen3Model> gpu_model;
+    status = model::Qwen3Model::create(weights, gpu_context, gpu_model);
+    ASSERT_TRUE(status.ok()) << status.message();
+    status = gpu_model->prepare(2, gpu_context);
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    const std::vector<int32_t> token_ids{151643, 9707};
+    const size_t vocab_size = static_cast<size_t>(profile.model.vocab_size);
+    tensor::Tensor gpu_logits(base::DataType::Fp32, {profile.model.vocab_size},
+                              gpu_context._allocator);
+    std::vector<float> actual(token_ids.size() * vocab_size);
+    for (size_t position = 0; position < token_ids.size(); ++position) {
+        status = gpu_model->forward(token_ids[position], static_cast<int32_t>(position),
+                                    gpu_logits, gpu_context);
+        ASSERT_TRUE(status.ok()) << status.message();
+        ASSERT_EQ(cudaMemcpyAsync(actual.data() + position * vocab_size,
+                                  gpu_logits.ptr<float>(), gpu_logits.byte_size(),
+                                  cudaMemcpyDeviceToHost, stream),
+                  cudaSuccess);
+    }
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    op::OpContext cpu_context;
+    cpu_context._device_type = base::DeviceType::CPU;
+    cpu_context._allocator = base::CPUAllocatorFactory::get_instance();
+    std::unique_ptr<model::Qwen3Model> cpu_model;
+    status = model::Qwen3Model::create(weights, cpu_context, cpu_model);
+    ASSERT_TRUE(status.ok()) << status.message();
+    status = cpu_model->prepare(2, cpu_context);
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    tensor::Tensor cpu_logits(base::DataType::Fp32, {profile.model.vocab_size},
+                              cpu_context._allocator);
+    float max_abs_error = 0.0f;
+    for (size_t position = 0; position < token_ids.size(); ++position) {
+        status = cpu_model->forward(token_ids[position], static_cast<int32_t>(position),
+                                    cpu_logits, cpu_context);
+        ASSERT_TRUE(status.ok()) << status.message();
+
+        size_t cpu_argmax = 0;
+        size_t gpu_argmax = 0;
+        for (size_t index = 0; index < vocab_size; ++index) {
+            const float expected = cpu_logits.ptr<float>()[index];
+            const float observed = actual[position * vocab_size + index];
+            ASSERT_TRUE(std::isfinite(observed))
+                << "position = " << position << ", logit index = " << index;
+            max_abs_error = std::max(max_abs_error, std::abs(expected - observed));
+            if (expected > cpu_logits.ptr<float>()[cpu_argmax]) {
+                cpu_argmax = index;
+            }
+            if (observed > actual[position * vocab_size + gpu_argmax]) {
+                gpu_argmax = index;
+            }
+        }
+        EXPECT_EQ(gpu_argmax, cpu_argmax) << "position = " << position;
+    }
+    EXPECT_LT(max_abs_error, 1e-2f);
+    std::cout << "Qwen3-0.6B CPU/GPU max |logit diff| = " << max_abs_error << '\n';
+
+    gpu_model.reset();
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }

@@ -2,7 +2,7 @@
 
 > 状态：Accepted。Q1-Q15 的格式、职责、失败语义和验收边界已经确认。
 
-> 实现进度（2026-09-20）：Fire v0.1 已发布。FireWriter、TinyLlama exporter、FireReader、`TinyllamaLoader` 与 core wire/profile 合同测试均已完成并接入 CTest。Qwen3 exporter 已支持按 `config.json` 自动识别 0.6B/8B profile，并读取单文件或 HF shard index；0.6B 的 311 项完整 FP32 文件已通过 Loader、两 token CPU forward 和 Hugging Face logits 对齐，8B 的 399 项/5 分片真实 checkpoint metadata preflight 也已通过。Qwen3 GPU forward 和量化 wire 尚不在已完成范围内。模型接口与执行设计见 [模型层设计](model_design_v0_1.md)。
+> 实现进度（2026-09-20）：Fire v0.1 已发布。FireWriter、TinyLlama exporter、FireReader、`TinyllamaLoader` 与 core wire/profile 合同测试均已完成并接入 CTest。Qwen3 exporter 已支持按 `config.json` 自动识别 0.6B/8B profile，并读取单文件或 HF shard index；0.6B 的 311 项完整 FP32 文件已通过 Loader、两 token CPU/GPU forward 和 Hugging Face logits 对齐，8B 的 399 项/5 分片真实 checkpoint metadata preflight 也已通过。Qwen3 量化 wire 尚不在已完成范围内。模型接口与执行设计见 [模型层设计](model_design_v0_1.md)。
 
 ## 1. 目标
 
@@ -238,7 +238,7 @@ python -B tools/export_qwen3.py \
   tmp/qwen3-0.6b.fire
 ```
 
-exporter 会从 `config.json` 自动选择 profile。输出路径必须不存在。当前真实 0.6B checkpoint 已导出约 2.80 GiB FP32 payload，并用于 Loader、CPU forward 和 Hugging Face logits 对齐；完整导出本身不属于自动化测试。8B 也能通过相同 CLI 读取标准分片 checkpoint，但 Fire v1 只会生成约 30.5 GiB 的 FP32 文件，并不提供 INT4/INT8 编码。
+exporter 会从 `config.json` 自动选择 profile。输出路径必须不存在。当前真实 0.6B checkpoint 已导出约 2.80 GiB FP32 payload，并用于 Loader、CPU/GPU forward 和 Hugging Face logits 对齐；完整导出本身不属于自动化测试。8B 也能通过相同 CLI 读取标准分片 checkpoint，但 Fire v1 只会生成约 30.5 GiB 的 FP32 文件，并不提供 INT4/INT8 编码。
 
 ## 9. 内部两遍导出
 
@@ -354,7 +354,7 @@ Python writer 测试还应验证：preflight 失败时不创建目标；目标�
 - metadata pass 与 payload pass 对每个 shard 只打开一次，且分组后的 absolute offset 连续。
 - preflight 失败不创建输出，payload 阶段失败删除本次创建的 partial file。
 
-此外，本地 `models/Qwen3-0.6B` 已确认 311 项、单个 shard、`data_offset = 29,888` 和最终 FP32 文件长度 `3,006,559,424` bytes；该完整文件已通过两 token CPU forward 和 Hugging Face logits 对齐。`models/Qwen3-8B` 完成了 metadata-only preflight，确认 399 项、5 个 shards 和最终预期长度 `32,762,979,776` bytes，尚未写出完整 payload。
+此外，本地 `models/Qwen3-0.6B` 已确认 311 项、单个 shard、`data_offset = 29,888` 和最终 FP32 文件长度 `3,006,559,424` bytes；该完整文件已通过两 token CPU/GPU forward 和 Hugging Face logits 对齐。GPU 使用非默认 CUDA stream，与 CPU 的最大 logits 绝对误差为 `9.31025e-05`。`models/Qwen3-8B` 完成了 metadata-only preflight，确认 399 项、5 个 shards 和最终预期长度 `32,762,979,776` bytes，尚未写出完整 payload。
 
 ### 本地里程碑验收
 

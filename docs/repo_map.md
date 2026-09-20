@@ -21,7 +21,7 @@ Fire 是一个以学习和实验为目标、从零构建的轻量级 CUDA 推理
 - `tools` 已实现 TinyLlama/Qwen3 model-specific exporter 与最小 FireWriter：TinyLlama 验证固定的 201 tensor profile；Qwen3 按 config 选择 0.6B/8B profile，兼容单文件与 HF source shards，并按两遍流程写出 FP32 `.fire`。
 - 独立 260-byte fixture、Reader 异常矩阵、mapping ownership 和 exporter/writer 失败语义均已接入自动化测试。
 - `TinyllamaLoader` 已支持按名字读取单个 CPU mmap Tensor view；`load_weights()` 会校验 201 项 canonical tensor 的数量、名称、FP32 dtype 和 shape，在全部成功后发布结构化权重。
-- Qwen3 已建立 0.6B/8B profile value、结构化权重和共享 `Qwen3Loader/Qwen3Model`；0.6B 的两 token CPU forward 与 Hugging Face logits 对齐已通过，GPU forward 与量化 payload 尚未验收。
+- Qwen3 已建立 0.6B/8B profile value、结构化权重和共享 `Qwen3Loader/Qwen3Model`；0.6B 的两 token CPU/GPU forward 与 Hugging Face logits 对齐已通过，量化 payload 尚未实现。
 - `Model` 纯接口、固定 profile、结构化权重和 Block 参数结构已建立。`TinyLlamaModel` 已实现参数绑定、Runtime/KVCache 分配、RoPE cache、完整单 token forward、K/V 写入与长度提交，以及 reset。真实模型 CPU/GPU 双 token 测试会检查有限 logits、位置推进、非默认 CUDA stream 和 CPU/GPU 一致性。
 - `tokenizer` 已接入 SentencePiece `LlamaTokenizer`，支持真实 `tokenizer.model` 的加载、BOS/EOS 和文本编解码；`sampler` 已接入 CPU/CUDA `ArgmaxSampler` 并验证相同最大值取首次位置。
 - `llama_chat` 已实现 TinyLlama chat template、greedy 自回归生成、128 token 回复上限、跨轮 KV Cache 复用、固定 2048 token 会话、CPU/GPU 选择以及 `/reset`、`/help`、`/exit`。
@@ -213,7 +213,7 @@ cmake --build build --target fire fire_tests llama_chat -j
 ctest --test-dir build --output-on-failure
 ```
 
-CTest 注册 C++ GTest、Python exporter 合同测试和默认跳过的 Hugging Face logits 对齐；具体通过与跳过数量以当前运行结果为准。真实 TinyLlama `.fire` 已完成加载和 CPU/GPU forward。Qwen3-0.6B 完整 FP32 `.fire` 已通过两 token CPU forward 与 Hugging Face 对齐；Qwen3-8B 当前只完成 metadata-only preflight。`llama_chat` 仍是 TinyLlama 入口。详细的依赖安装、模型下载、导出与 demo 命令以根目录 [readme](../readme.md) 为准。
+CTest 注册 C++ GTest、Python exporter 合同测试和默认跳过的 Hugging Face logits 对齐；具体通过与跳过数量以当前运行结果为准。真实 TinyLlama `.fire` 已完成加载和 CPU/GPU forward。Qwen3-0.6B 完整 FP32 `.fire` 已通过两 token CPU/GPU forward 与 Hugging Face 对齐，GPU/CPU 最大 logits 绝对误差为 `9.31025e-05`；Qwen3-8B 当前只完成 metadata-only preflight。`llama_chat` 仍是 TinyLlama 入口。详细的依赖安装、模型下载、导出与 demo 命令以根目录 [readme](../readme.md) 为准。
 
 ## 4. 模块关系
 
@@ -313,7 +313,7 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 `TinyllamaLoader::open()` 复用 Reader 的容器校验；`loader_tensor(name, output)` 根据 metadata 构造共享 mmap 的 CPU Tensor view，不验证 TinyLlama profile。`load_weights(output)` 要求目录数量为 201，按 canonical name 逐项校验 FP32 dtype 和固定 shape，在局部对象中完成全部 view 组装后才移动发布 `TinyLlamaWeights`；任一失败不会发布部分结果。当前真实 `.fire` 集成测试会在文件存在时验证结构和 Loader 销毁后的 mmap ownership，但系统性的缺项、额外项和错误 shape 测试仍待补齐。
 
-`model.h` 定义单序列 `Model` 的 `config/prepare/forward/reset` 纯接口；`model_weights.h` 定义 TinyLlama 固定 profile、Qwen3 0.6B/8B profile value 与各自按层组织的 Tensor 字段。`TinyLlamaModel::create` 把结构化权重绑定到 Embedding、Norm 和 Linear 参数算子，并按 context 决定是否迁移到 GPU；`prepare` 分配 typed Runtime、K/V Tensor、attention score 和紧凑 RoPE cache。Qwen3 复用相同执行骨架，并处理独立 `q_dim` 与 projection 后的逐 head Q/K RMSNorm。两个模型的 `forward` 都按层执行 Attention/FFN、写入 K/V、生成 logits，并在全部成功后提交 cache length；Qwen3-0.6B CPU 路径已通过真实模型和 Hugging Face 参考对齐。
+`model.h` 定义单序列 `Model` 的 `config/prepare/forward/reset` 纯接口；`model_weights.h` 定义 TinyLlama 固定 profile、Qwen3 0.6B/8B profile value 与各自按层组织的 Tensor 字段。`TinyLlamaModel::create` 把结构化权重绑定到 Embedding、Norm 和 Linear 参数算子，并按 context 决定是否迁移到 GPU；`prepare` 分配 typed Runtime、K/V Tensor、attention score 和紧凑 RoPE cache。Qwen3 复用相同执行骨架，并处理独立 `q_dim` 与 projection 后的逐 head Q/K RMSNorm。两个模型的 `forward` 都按层执行 Attention/FFN、写入 K/V、生成 logits，并在全部成功后提交 cache length；Qwen3-0.6B CPU/GPU 路径均已通过真实模型测试，CPU 另与 Hugging Face 参考对齐。
 
 ### `tokenizer`、`sampler` 与聊天入口
 

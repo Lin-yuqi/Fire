@@ -223,10 +223,10 @@ python -B tools/export_qwen3.py \
 ```
 
 0.6B 会校验 311 个 BF16 source tensor，生成预期长度为 `3,006,559,424` bytes
-（约 2.80 GiB）的 FP32 `.fire` v1。当前本地 0.6B 文件已通过 Loader 和两 token CPU
-forward，并与 Hugging Face eager attention 的逐位置 logits 对齐。Qwen3 的 GPU forward、
-tokenizer/chat 入口和量化执行仍未验收。8B 的相同路径会生成约 30.5 GiB 的 FP32 文件；
-Fire v1 目前没有量化 payload 编码，不应把它当作最终 8B 量化方案。
+（约 2.80 GiB）的 FP32 `.fire` v1。当前本地 0.6B 文件已通过 Loader、两 token
+CPU/GPU forward 和 Hugging Face eager attention 的逐位置 logits 对齐；GPU 测试使用非默认
+CUDA stream。Qwen3 的 tokenizer/chat 入口和量化执行仍未验收。8B 的相同路径会生成约
+30.5 GiB 的 FP32 文件；Fire v1 目前没有量化 payload 编码，不应把它当作最终 8B 量化方案。
 
 ### 6. 启动聊天 demo
 
@@ -313,12 +313,16 @@ FIRE_RUN_TINYLLAMA_GPU_FORWARD_TEST=1 \
   --gtest_filter='TinyllamaTest.GpuForwardTwoTokensOnNonDefaultStream'
 ```
 
-Qwen3-0.6B 的 CPU forward smoke test 和 Hugging Face logits 对齐分别为：
+Qwen3-0.6B 的 CPU/GPU forward smoke test 和 Hugging Face logits 对齐分别为：
 
 ```bash
 FIRE_RUN_QWEN3_FORWARD_TEST=1 \
   ./build/test/fire_tests \
   --gtest_filter='Qwen3ModelTest.CpuForwardTwoTokensProducesFiniteLogitsAndAdvancesCache'
+
+FIRE_RUN_QWEN3_GPU_FORWARD_TEST=1 \
+  ./build/test/fire_tests \
+  --gtest_filter='Qwen3ModelTest.GpuForwardTwoTokensMatchesCpuOnNonDefaultStream'
 
 FIRE_RUN_QWEN3_HF_ALIGNMENT_TEST=1 \
   ctest --test-dir build -R '^fire_qwen3_hf_logits_alignment$' --output-on-failure
