@@ -41,4 +41,28 @@ void rmsnorm_kernel_cpu(const tensor::Tensor& input, const tensor::Tensor& weigh
         out[i]=in[i]*wei[i]*rsqrt;
     }
 }
+
+void rmsnorm_kernel_cpu_dim(const tensor::Tensor& input, const tensor::Tensor& weight,
+                            tensor::Tensor& output, const float eps, void*) {
+    const float* in = input.ptr<float>();
+    const float* wei = weight.ptr<float>();
+    float* out = output.ptr<float>();
+    const int32_t width = input.dims().back();
+    const size_t rows = input.size() / static_cast<size_t>(width);
+
+    for (size_t row = 0; row < rows; ++row) {
+        const size_t offset = row * static_cast<size_t>(width);
+        float square_sum = 0.0f;
+        for (int32_t column = 0; column < width; ++column) {
+            const float value = in[offset + static_cast<size_t>(column)];
+            square_sum += value * value;
+        }
+        const float scale =
+            1.0f / std::sqrt(square_sum / static_cast<float>(width) + eps);
+        for (int32_t column = 0; column < width; ++column) {
+            const size_t index = offset + static_cast<size_t>(column);
+            out[index] = in[index] * wei[column] * scale;
+        }
+    }
+}
 } // namespace kernel

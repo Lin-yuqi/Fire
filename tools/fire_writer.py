@@ -68,8 +68,8 @@ class TensorInfo:
 class FireWriter:
     """Writes already-normalized tensor metadata and payloads.
 
-    The TinyLlama exporter owns source validation, exclusive-create cleanup,
-    and the safetensors loop. This class only owns .fire wire encoding.
+    Model-specific exporters own source validation, exclusive-create cleanup,
+    and their safetensors loops. This class only owns .fire wire encoding.
     """
 
     def write_header_and_directory(

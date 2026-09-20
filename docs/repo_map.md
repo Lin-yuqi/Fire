@@ -1,6 +1,6 @@
 # Fire 仓库地图
 
-> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后核对日期：2026-09-19。
+> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后核对日期：2026-09-20。
 
 ## 1. 项目定位与当前阶段
 
@@ -12,15 +12,16 @@ Fire 是一个以学习和实验为目标、从零构建的轻量级 CUDA 推理
 - `tensor` 已接入 `Fire::fire`，具备接口和初步实现，并开始覆盖 Buffer 字节偏移与 clone 行为。
 - `op` 已建立 `Operator`、`ParamOperator` 与执行上下文 `OpContext`，并接通 Add、RMSNorm、Matmul、Linear、Embedding、RoPE、SwiGLU 和 MHA。Softmax 已有 CPU/CUDA kernel 与直接数值测试，但尚无独立公开 Operator 包装；MHA 的 CPU/CUDA 实现内置稳定 softmax。`ParamOperator` 显式允许移动、禁止复制，支持按值组织 Block 中的参数算子。
 - Add 已提供 CPU（Armadillo）与 CUDA FP32 kernel，通过设备类型分派，并覆盖公共 `forward`、参数校验、边界尺寸和非默认 stream 测试。
-- RMSNorm 已提供 CPU 一维及 CUDA 一维/二维 FP32 kernel，支持自定义 epsilon 和 CUDA stream；非 4 整数倍行宽会在未对齐行使用标量路径，避免 `float4` 未对齐访问。
+- RMSNorm 已提供 CPU/CUDA 一维与逐行二维 FP32 kernel，支持自定义 epsilon 和 CUDA stream；非 4 整数倍行宽会在未对齐行使用标量路径，避免 `float4` 未对齐访问。
 - Matmul/Linear 已具备 FP32 CPU/CUDA kernel 路径与 CPU 数值测试；真实 TinyLlama GPU forward 已覆盖模型 shape，专门的 CUDA shape 矩阵和性能基准仍需补齐。
 - Embedding 已提供 CPU/CUDA FP32 查表 kernel、公开参数检查和单/多 token 测试。
 - RoPE 已按 HF/TinyLlama 的前后半区配对实现 CPU/CUDA 旋转及紧凑 `[max_seq_len, head_dim / 2]` sin/cos cache，并覆盖非零位置、GQA head 数和非默认 stream 测试。
 - SwiGLU 已提供 CPU/CUDA FP32 逐元素实现，检查输入/输出 shape，并验证数值、输入只读性及 CUDA block 边界；Softmax kernel 覆盖一维/二维、原地/非原地、长行和数值稳定性。
 - `model` 已实现 `FireReader`：通过 `open + fstat + mmap` 校验 `.fire` v1，建立 name index，并通过共享 `Buffer` 维持 mapping 生命周期。
-- `tools` 已实现 model-specific TinyLlama exporter 与最小 FireWriter：验证固定的 201 tensor profile，并按两遍流程写出 FP32 `.fire`。
+- `tools` 已实现 TinyLlama/Qwen3 model-specific exporter 与最小 FireWriter：TinyLlama 验证固定的 201 tensor profile；Qwen3 按 config 选择 0.6B/8B profile，兼容单文件与 HF source shards，并按两遍流程写出 FP32 `.fire`。
 - 独立 260-byte fixture、Reader 异常矩阵、mapping ownership 和 exporter/writer 失败语义均已接入自动化测试。
 - `TinyllamaLoader` 已支持按名字读取单个 CPU mmap Tensor view；`load_weights()` 会校验 201 项 canonical tensor 的数量、名称、FP32 dtype 和 shape，在全部成功后发布结构化权重。
+- Qwen3 已建立 0.6B/8B profile value、结构化权重和共享 `Qwen3Loader/Qwen3Model`；0.6B 的两 token CPU forward 与 Hugging Face logits 对齐已通过，GPU forward 与量化 payload 尚未验收。
 - `Model` 纯接口、固定 profile、结构化权重和 Block 参数结构已建立。`TinyLlamaModel` 已实现参数绑定、Runtime/KVCache 分配、RoPE cache、完整单 token forward、K/V 写入与长度提交，以及 reset。真实模型 CPU/GPU 双 token 测试会检查有限 logits、位置推进、非默认 CUDA stream 和 CPU/GPU 一致性。
 - `tokenizer` 已接入 SentencePiece `LlamaTokenizer`，支持真实 `tokenizer.model` 的加载、BOS/EOS 和文本编解码；`sampler` 已接入 CPU/CUDA `ArgmaxSampler` 并验证相同最大值取首次位置。
 - `llama_chat` 已实现 TinyLlama chat template、greedy 自回归生成、128 token 回复上限、跨轮 KV Cache 复用、固定 2048 token 会话、CPU/GPU 选择以及 `/reset`、`/help`、`/exit`。
@@ -46,10 +47,12 @@ Fire/
 │   ├── model/
 │   │   ├── fire_reader.h          # .fire Reader、TensorInfo 与目录项数查询
 │   │   ├── tinyllama_loader.h     # 单 Tensor view 与 201 项结构化加载接口
+│   │   ├── qwen_loader.h          # profile 驱动的 Qwen3 结构化加载接口
 │   │   ├── model.h                # ModelConfig 与 Model 纯接口
-│   │   ├── model_weights.h        # 固定 profile 与结构化权重
+│   │   ├── model_weights.h        # TinyLlama/Qwen3 profile 与结构化权重
 │   │   ├── kv_cache.h             # TinyLlama K/V 连续存储与序列长度状态
-│   │   └── tinyllama.h            # Block、模型接口与 typed Runtime
+│   │   ├── tinyllama.h            # TinyLlama Block、模型接口与 typed Runtime
+│   │   └── qwen.h                 # Qwen3 Block、Runtime 与模型接口
 │   ├── op/
 │   │   ├── operator.h             # Operator、参数与执行上下文
 │   │   ├── add.h                  # VecAddOp 接口
@@ -78,8 +81,10 @@ Fire/
 │   ├── model/
 │   │   ├── fire_reader.cpp        # v1 校验、mmap ownership 与 name index
 │   │   ├── tinyllama_loader.cpp   # 201 项 profile 校验与结构化 CPU views
+│   │   ├── qwen_loader.cpp        # Qwen3 profile canonical tensor 校验与 views
 │   │   ├── kv_cache.cpp           # K/V 分配、CPU/GPU 写入、提交与 reset
-│   │   └── tinyllama.cpp          # 参数绑定、Runtime 准备与完整 forward
+│   │   ├── tinyllama.cpp          # 参数绑定、Runtime 准备与完整 forward
+│   │   └── qwen.cpp               # Qwen3 参数绑定、Runtime 与完整单 token forward
 │   ├── op/
 │   │   ├── operator.cpp           # Operator 公共检查与参数管理
 │   │   ├── add.cpp                # VecAddOp 校验与 kernel 调度
@@ -122,6 +127,10 @@ Fire/
 │   │   ├── test_model.cpp         # Block 移动语义与 TinyLlama Norm epsilon
 │   │   ├── test_tinyllama_loader.cpp # 真实权重加载与 CPU/GPU forward 集成测试
 │   │   ├── test_export_tinyllama.py # Writer/exporter Python 合同测试
+│   │   ├── test_export_qwen3.py   # Qwen3 profile/source/payload 导出合同测试
+│   │   ├── test_qwen3_hf_logits_alignment.py # Qwen3/HF logits 集成对齐
+│   │   ├── qwen3_logits_runner.cpp # Qwen3 CPU logits 集成测试 helper
+│   │   ├── test_qwen_profile.cpp  # Qwen3 profile 与 Block epsilon 测试
 │   │   └── generate_fire_v1_fixture.py # 独立 260-byte v1 fixture 生成器
 │   ├── test_op/test_op.cpp        # Operator 与 Add 测试
 │   ├── test_op/test_emb.cpp       # Embedding 校验、CPU/CUDA 数值测试
@@ -135,12 +144,13 @@ Fire/
 │   ├── test_sampler/test_argmax_sampler.cpp # CPU/CUDA argmax sampler 测试
 │   └── utils.cu/.cuh              # CUDA 测试辅助函数
 ├── docs/
-│   ├── model_export_v0_1.md       # TinyLlama 导出、.fire v1 与验收设计
+│   ├── model_export_v0_1.md       # TinyLlama/Qwen3 导出、.fire v1 与验收设计
 │   ├── model_design_v0_1.md       # Model 契约、权重与执行设计及实施边界
 │   └── repo_map.md                # 本文
 ├── tools/
 │   ├── fire_writer.py             # model-agnostic .fire v1 writer
-│   └── export_tinyllama.py        # TinyLlama-specific 两遍 exporter/CLI
+│   ├── export_tinyllama.py        # TinyLlama-specific 两遍 exporter/CLI
+│   └── export_qwen3.py            # 0.6B/8B、单文件/分片 Qwen3 exporter/CLI
 ├── demo/
 │   ├── CMakeLists.txt             # llama_chat 目标与默认模型路径
 │   └── llama_chat.cpp             # v0.1 多轮 greedy 聊天 CLI
@@ -160,7 +170,7 @@ Fire/
 | GoogleTest | 仅在 `BUILD_TESTING=ON` 时查找，用于测试 |
 | Python 3 | `BUILD_TESTING=ON` 时生成独立 fixture 并运行 Writer/exporter 合同测试；也用于 exporter CLI |
 | NumPy、safetensors | Writer/exporter 合同测试与实际导出的 Python 运行时依赖 |
-| PyTorch | 实际 TinyLlama payload pass 的 BF16 读取与 FP32 转换；轻量合同测试不加载真实权重 |
+| PyTorch | 实际 TinyLlama/Qwen3 payload pass 的 BF16 读取与 FP32 转换；轻量合同测试不加载真实权重 |
 
 构建目标：
 
@@ -175,6 +185,7 @@ Fire (project)
     ├── test_model/test_fire_reader.cpp
     ├── test_model/test_model.cpp
     ├── test_model/test_tinyllama_loader.cpp
+    ├── test_model/test_qwen_profile.cpp
     ├── test_op/test_op.cpp
     ├── test_op/test_emb.cpp
     ├── test_op/test_rmsnorm.cpp
@@ -188,7 +199,10 @@ Fire (project)
     └── utils.cu
 
 CTest registration
-└── fire_export_tinyllama_contract # Python Writer/exporter unittest
+├── fire_export_tinyllama_contract    # Python Writer/exporter unittest
+├── fire_export_qwen3_contract        # Python Qwen3 exporter unittest
+├── fire_tinyllama_hf_logits_alignment # TinyLlama/HF 重型对齐
+└── fire_qwen3_hf_logits_alignment    # Qwen3-0.6B/HF 重型对齐
 ```
 
 常用命令：
@@ -199,7 +213,7 @@ cmake --build build --target fire fire_tests llama_chat -j
 ctest --test-dir build --output-on-failure
 ```
 
-CTest 注册 C++ GTest 与 Python Writer/exporter 合同测试；具体通过与跳过数量以当前运行结果为准。真实 TinyLlama `.fire` 已按 201 项、`data_offset = 19,328`、文件长度 `4,400,212,864` bytes 完成加载和 CPU/GPU forward。`llama_chat` 已完成模型/tokenizer 加载、跨轮 KV Cache 复用与 greedy 生成；从 source checkpoint 抽样做 bit-exact 数值回读仍未形成独立验收记录。详细的依赖安装、模型下载、导出与 demo 命令以根目录 [readme](../readme.md) 为准。
+CTest 注册 C++ GTest、Python exporter 合同测试和默认跳过的 Hugging Face logits 对齐；具体通过与跳过数量以当前运行结果为准。真实 TinyLlama `.fire` 已完成加载和 CPU/GPU forward。Qwen3-0.6B 完整 FP32 `.fire` 已通过两 token CPU forward 与 Hugging Face 对齐；Qwen3-8B 当前只完成 metadata-only preflight。`llama_chat` 仍是 TinyLlama 入口。详细的依赖安装、模型下载、导出与 demo 命令以根目录 [readme](../readme.md) 为准。
 
 ## 4. 模块关系
 
@@ -230,7 +244,7 @@ op::RmsNormOp ── 校验输入、输出与 weight
       │
       ▼
 kernel::get_rmsnorm_kernel[_dim](DeviceType)
-      ├── CPU ── 一维 FP32 RMSNorm
+      ├── CPU ── 一维/逐行 FP32 RMSNorm
       └── GPU ── 一维/二维 FP32 RMSNorm（支持可选 stream）
 
 EmbeddingOp / RoPEOp / SwiGLUOp
@@ -299,7 +313,7 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 `TinyllamaLoader::open()` 复用 Reader 的容器校验；`loader_tensor(name, output)` 根据 metadata 构造共享 mmap 的 CPU Tensor view，不验证 TinyLlama profile。`load_weights(output)` 要求目录数量为 201，按 canonical name 逐项校验 FP32 dtype 和固定 shape，在局部对象中完成全部 view 组装后才移动发布 `TinyLlamaWeights`；任一失败不会发布部分结果。当前真实 `.fire` 集成测试会在文件存在时验证结构和 Loader 销毁后的 mmap ownership，但系统性的缺项、额外项和错误 shape 测试仍待补齐。
 
-`model.h` 定义单序列 `Model` 的 `config/prepare/forward/reset` 纯接口；`model_weights.h` 定义唯一的 C++ 固定 profile 与按层组织的 Tensor 字段。`TinyLlamaModel::create` 把结构化权重绑定到 Embedding、Norm 和 Linear 参数算子，并按 context 决定是否迁移到 GPU；`prepare` 分配 typed Runtime、K/V Tensor、attention score 和紧凑 RoPE cache。`forward` 已按 22 层顺序执行 Attention/FFN、写入 K/V、生成 logits，并在全部成功后提交 cache length；`reset` 将有效长度归零并保留已分配存储。
+`model.h` 定义单序列 `Model` 的 `config/prepare/forward/reset` 纯接口；`model_weights.h` 定义 TinyLlama 固定 profile、Qwen3 0.6B/8B profile value 与各自按层组织的 Tensor 字段。`TinyLlamaModel::create` 把结构化权重绑定到 Embedding、Norm 和 Linear 参数算子，并按 context 决定是否迁移到 GPU；`prepare` 分配 typed Runtime、K/V Tensor、attention score 和紧凑 RoPE cache。Qwen3 复用相同执行骨架，并处理独立 `q_dim` 与 projection 后的逐 head Q/K RMSNorm。两个模型的 `forward` 都按层执行 Attention/FFN、写入 K/V、生成 logits，并在全部成功后提交 cache length；Qwen3-0.6B CPU 路径已通过真实模型和 Hugging Face 参考对齐。
 
 ### `tokenizer`、`sampler` 与聊天入口
 
@@ -315,7 +329,9 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 `export_tinyllama.py` 固定 TinyLlama config、BF16 source dtype、canonical name/shape profile、201 个 tensor 和预期文件大小。它先用 NumPy safetensors metadata pass 完成 preflight，再 exclusive-create 目标，通过单个长期 PyTorch `safe_open` context 逐 tensor 转为 FP32 并写出；已创建目标后遇到普通异常或 `KeyboardInterrupt` 会关闭并 best-effort 删除 partial file。
 
-独立 fixture 生成器与 Python 合同测试已接入 CTest；`fire_v1_fixture` 是 `fire_tests` 的构建依赖，而非需要手动运行的非默认前置。本阶段没有引入通用 model adapter、registry、provider、planner 或 streaming framework。
+`export_qwen3.py` 根据 `config.json` 选择 0.6B 或 8B profile，由维度动态构建 11 tensors/layer 的 descriptor。它支持单个 `model.safetensors` 和标准 `model.safetensors.index.json`，严格核对 index、实际 shard keys、dtype、shape 与 source byte size，并按 shard 分组目录项，使 metadata/payload 两遍都只打开每个 shard 一次。0.6B 的真实 metadata preflight 已确认 311 项和预期 `3,006,559,424` bytes FP32 文件长度；自动化测试不生成该大文件。
+
+独立 fixture 生成器与 TinyLlama/Qwen3 Python 合同测试已接入 CTest；`fire_v1_fixture` 是 `fire_tests` 的构建依赖，而非需要手动运行的非默认前置。本阶段没有引入通用 model registry、provider、planner 或 streaming framework。
 
 ### `op`: Operator 与 FP32 算子
 
@@ -323,9 +339,9 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 `VecAddOp::forward` 先检查三个 Tensor 的设备、数据类型与 shape，再根据 `OpContext::_device_type` 选择 CPU 或 CUDA kernel。当前 Add 只实现 FP32：CPU 路径通过 Armadillo `fvec` 相加，CUDA 路径由每个线程处理一个元素并进行边界检查，也可使用调用方传入的 stream。
 
-`RmsNormOp::forward` 从输入最后一维确定归一化宽度，检查 FP32 输入、输出和单个未量化 weight 参数，并按设备和输入维数选择 kernel。CPU 路径当前只接受一维输入；GPU 路径覆盖一维向量和二维 `{rows, width}` 输入。二维 kernel 在行起点满足 16 字节对齐时使用 `float4`，否则回退到标量访问，因此 width 不是 4 的整数倍时不会对后续行进行未对齐的 `float4` 访问。
+`RmsNormOp::forward` 从输入最后一维确定归一化宽度，检查 FP32 输入、输出和单个未量化 weight 参数，并按设备和输入维数选择 kernel。CPU 路径会把连续前导维展平为 rows 后逐行归一化；GPU 路径已验证一维向量和二维 `{rows, width}` 输入。CUDA 二维 kernel 在行起点满足 16 字节对齐时使用 `float4`，否则回退到标量访问，因此 width 不是 4 的整数倍时不会对后续行进行未对齐的 `float4` 访问。
 
-Add 测试已覆盖公共 `VecAddOp::forward` 的 CPU/GPU 路径、参数错误、边界尺寸和非默认 stream。RMSNorm 测试覆盖 CPU 正确性、自定义 epsilon、参数错误、CUDA 打包尾部以及二维非 4 整数倍行宽。
+Add 测试已覆盖公共 `VecAddOp::forward` 的 CPU/GPU 路径、参数错误、边界尺寸和非默认 stream。RMSNorm 测试覆盖 CPU 一维/逐行二维正确性、自定义 epsilon、参数错误、CUDA 打包尾部以及二维非 4 整数倍行宽。
 
 `MatmulOp` 接受一维或二维输入和 `[out_features, in_features]` 权重，计算 `scale * input * weight^T`。CPU 使用 Armadillo，CUDA 使用分块 kernel。`LinearOp` 绑定 weight 和可选 bias，复用 Matmul/Add kernel，并拒绝量化参数。现有 Matmul/Linear 数值测试覆盖 CPU 向量/矩阵及向量 bias；真实 TinyLlama GPU forward 已覆盖模型使用的 CUDA shape，专门的 CUDA 数值矩阵和性能基准仍需补齐。
 
@@ -357,7 +373,7 @@ RMSNorm 的当前调用路径是：
 
 `.fire` 权重的当前路径是：
 
-1. `export_tinyllama.py` 在目标创建前校验 config 和 201 项 source metadata。
+1. model-specific exporter 在目标创建前校验 config 和全部 source metadata；TinyLlama 固定 201 项，Qwen3 由 0.6B/8B profile 定义 311/399 项并可读取 source shards。
 2. `FireWriter` 按规划好的绝对 offset 写入 Header、Directory 和逐项 FP32 payload。
 3. `FireReader::open` mmap 整个文件并验证所有 v1 不变量，`find` 按 canonical name 返回解码后 metadata。
 4. `TinyllamaLoader::load_weights` 按 canonical name 校验 201 项 dtype/shape，用 `mapped_buffer()` 与 absolute byte offset 组装结构化 CPU Tensor views。
@@ -375,7 +391,7 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 以下是阅读和继续开发时最重要的事实，不等同于本次要修复的任务清单：
 
 1. **部分 CUDA 返回值未检查**：部分 memcpy/memset 路径忽略 CUDA API 返回的 `cudaError_t`，失败时可能缺少及时、准确的错误信息；按当前约定可继续使用 `CHECK/LOG(FATAL)` 报错，无需引入额外错误类型。
-2. **RMSNorm 支持范围有限**：当前只有 FP32 实现，CPU 仅支持一维输入，GPU 多行路径已验证二维 `{rows, width}`；更高维输入的所有前导维度尚未完整接入 block 调度。量化 weight 会返回 `InvalidArgument`。
+2. **RMSNorm 支持范围有限**：当前只有 FP32 实现，CPU 会将连续前导维展平后逐行处理，GPU 多行路径只验证了二维 `{rows, width}`；更高维 GPU 输入的所有前导维度尚未完整接入 block 调度。量化 weight 会返回 `InvalidArgument`。
 3. **聊天入口以简单性优先**：Tokenizer、ArgmaxSampler、EOS 停止条件和 `llama_chat` 已接通，但当前只有 greedy sampling；KV Cache 跨轮复用但只增不减，没有滑动窗口或历史压缩。Hugging Face 参考 logits/token 对齐仍未形成独立验收记录。
 4. **Matmul 验证与量化仍待补齐**：已有 FP32 CPU/CUDA 实现、CPU 单算子数值测试和真实模型 GPU 路径；更系统的 CUDA shape/误差矩阵、性能优化和量化路径属于后续工作。
 5. **Softmax 尚未形成独立 Operator**：CPU/CUDA kernel 和直接测试已完成，MHA 已在内部封装 softmax 计算；其他调用方目前仍需要直接使用 kernel 接口。

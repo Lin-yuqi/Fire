@@ -74,6 +74,35 @@ TEST(rmsnorm_test, cpu_fp32_correctness_and_custom_epsilon) {
     }
 }
 
+TEST(rmsnorm_test, cpu_rows_are_normalized_independently) {
+    constexpr int32_t rows = 3;
+    constexpr int32_t width = 5;
+    constexpr float eps = 1e-4f;
+    std::vector<float> input_values(rows * width);
+    std::vector<float> weight_values(width);
+    fill_inputs(input_values, weight_values);
+    const auto expected = rmsnorm_reference(input_values, weight_values, width, eps);
+
+    auto input = cpu_tensor({rows, width});
+    auto weight = cpu_tensor({width});
+    auto output = cpu_tensor({rows, width});
+    std::copy(input_values.begin(), input_values.end(), input.ptr<float>());
+    std::copy(weight_values.begin(), weight_values.end(), weight.ptr<float>());
+
+    op::RmsNormOp rmsnorm(eps);
+    rmsnorm.reset_param_size(1);
+    rmsnorm.get_param(0)._data = weight;
+    op::OpContext context;
+    context._device_type = base::DeviceType::CPU;
+
+    const auto status = rmsnorm.forward(input, output, context);
+    ASSERT_TRUE(status.ok()) << status.message();
+    for (int32_t index = 0; index < rows * width; ++index) {
+        EXPECT_NEAR(output.ptr<float>()[index], expected[index], 1e-5f)
+            << "index = " << index;
+    }
+}
+
 TEST(rmsnorm_test, rejects_invalid_parameters_and_tensors) {
     auto input = cpu_tensor({8});
     auto output = cpu_tensor({8});

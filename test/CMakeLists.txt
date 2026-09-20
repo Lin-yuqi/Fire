@@ -4,8 +4,8 @@ aux_source_directory(test_model MODEL)
 aux_source_directory(test_tokenizer TOKEN)
 aux_source_directory(test_sampler sampler)
 
-# This file has its own main() and is built as an integration-test helper below.
-list(FILTER MODEL EXCLUDE REGEX "tinyllama_logits_runner\\.cpp$")
+# These files have their own main() and are built as integration-test helpers below.
+list(FILTER MODEL EXCLUDE REGEX "(tinyllama|qwen3)_logits_runner\\.cpp$")
 
 add_executable(fire_tests
     test_base/test_buffer.cpp
@@ -32,6 +32,7 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(FIRE_V1_FIXTURE_PATH "${CMAKE_CURRENT_BINARY_DIR}/fixtures/fire_v1_contract.fire")
 set(FIRE_TINYLLAMA_PATH "${CMAKE_SOURCE_DIR}/tmp/llama.fire")
+set(FIRE_QWEN3_0_6B_PATH "${CMAKE_SOURCE_DIR}/tmp/qwen3-0.6b.fire")
 set(FIRE_TINYLLAMA_TOKENIZER_PATH
     "${CMAKE_SOURCE_DIR}/models/TinyLlama-1.1B-Chat-v1.0/tokenizer.model"
 )
@@ -55,6 +56,7 @@ target_compile_definitions(
     fire_tests
     PRIVATE FIRE_V1_FIXTURE_PATH="${FIRE_V1_FIXTURE_PATH}"
     PRIVATE FIRE_TINYLLAMA_PATH="${FIRE_TINYLLAMA_PATH}"
+    PRIVATE FIRE_QWEN3_0_6B_PATH="${FIRE_QWEN3_0_6B_PATH}"
     PRIVATE FIRE_TINYLLAMA_TOKENIZER_PATH="${FIRE_TINYLLAMA_TOKENIZER_PATH}"
 )
 
@@ -66,11 +68,25 @@ add_test(
         ${CMAKE_CURRENT_SOURCE_DIR}/test_model/test_export_tinyllama.py
 )
 
+add_test(
+    NAME fire_export_qwen3_contract
+    COMMAND
+        ${Python3_EXECUTABLE}
+        -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_model/test_export_qwen3.py
+)
+
 add_executable(
     tinyllama_logits_runner
     test_model/tinyllama_logits_runner.cpp
 )
 target_link_libraries(tinyllama_logits_runner PRIVATE Fire::fire)
+
+add_executable(
+    qwen3_logits_runner
+    test_model/qwen3_logits_runner.cpp
+)
+target_link_libraries(qwen3_logits_runner PRIVATE Fire::fire)
 
 add_test(
     NAME fire_tinyllama_hf_logits_alignment
@@ -84,6 +100,25 @@ add_test(
 )
 set_tests_properties(
     fire_tinyllama_hf_logits_alignment
+    PROPERTIES
+        LABELS "integration;model"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 1800
+)
+
+add_test(
+    NAME fire_qwen3_hf_logits_alignment
+    COMMAND
+        ${Python3_EXECUTABLE}
+        -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_model/test_qwen3_hf_logits_alignment.py
+        --runner $<TARGET_FILE:qwen3_logits_runner>
+        --hf-model ${CMAKE_SOURCE_DIR}/models/Qwen3-0.6B
+        --fire-model ${FIRE_QWEN3_0_6B_PATH}
+)
+set_tests_properties(
+    fire_qwen3_hf_logits_alignment
     PROPERTIES
         LABELS "integration;model"
         RUN_SERIAL TRUE

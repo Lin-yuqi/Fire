@@ -4,6 +4,8 @@
 #include "Fire/base/base.h"
 #include "../op/kernels/kernels_interface.h"
 
+#include <cuda_runtime.h>
+
 #include <memory>
 #include <utility>
 
@@ -147,9 +149,154 @@ base::Status Qwen3Model::prepare(int32_t capacity, const op::OpContext& context)
     return base::error::Success();
 }
 
-base::Status Qwen3Model::forward(int32_t, int32_t, tensor::Tensor&,
-                                 const op::OpContext&) {
-    return base::error::FunctionNotImplement("Qwen3 forward is not implemented yet");
+base::Status Qwen3Model::forward(int32_t token_id, int32_t pos, tensor::Tensor& logits,
+                                 const op::OpContext& context) {
+    if (_runtime == nullptr) {
+        return base::error::InternalError("Qwen3Model has not been prepared");
+    }
+    if (token_id < 0 || token_id >= _profile.model.vocab_size) {
+        return base::error::InvalidArgument("Qwen3 token_id is out of vocabulary range");
+    }
+    if (pos != _runtime->kv_cache.length() || pos < 0 ||
+        pos >= _runtime->kv_cache.capacity()) {
+        return base::error::InvalidArgument(
+            "Qwen3 position does not match the current sequence length");
+    }
+    if (context._device_type != base::DeviceType::CPU &&
+        context._device_type != base::DeviceType::GPU) {
+        return base::error::InvalidArgument("Qwen3 forward requires a CPU or GPU device");
+    }
+    if (_runtime->token.device_type() != context._device_type) {
+        return base::error::InvalidArgument(
+            "Qwen3 forward context does not match the prepared runtime device");
+    }
+
+    if (context._device_type == base::DeviceType::CPU) {
+        _runtime->token.ptr<int32_t>()[0] = token_id;
+    } else {
+        const auto cuda_status =
+            cudaMemcpyAsync(_runtime->token.ptr<int32_t>(), &token_id, sizeof(token_id),
+                            cudaMemcpyHostToDevice, context._stream);
+        if (cuda_status != cudaSuccess) {
+            return base::error::InternalError(cudaGetErrorString(cuda_status));
+        }
+    }
+
+    auto status = _embedding.forward(_runtime->token, _runtime->hidden, context);
+    if (!status) {
+        return status;
+    }
+
+    for (int32_t index = 0; index < _profile.num_layers; ++index) {
+        auto& layer = _layers[static_cast<size_t>(index)];
+
+        status = layer.attention_norm.forward(_runtime->hidden, _runtime->norm_output, context);
+        if (!status) {
+            return status;
+        }
+
+        _runtime->query.reshape({_profile.q_dim()});
+        status = layer.wq.forward(_runtime->norm_output, _runtime->query, context);
+        _runtime->query.reshape({_profile.num_attention_heads, _profile.head_dim});
+        if (!status) {
+            return status;
+        }
+
+        _runtime->key.reshape({_profile.kv_dim()});
+        status = layer.wk.forward(_runtime->norm_output, _runtime->key, context);
+        _runtime->key.reshape({_profile.num_kv_heads, _profile.head_dim});
+        if (!status) {
+            return status;
+        }
+
+        _runtime->value.reshape({_profile.kv_dim()});
+        status = layer.wv.forward(_runtime->norm_output, _runtime->value, context);
+        _runtime->value.reshape({_profile.num_kv_heads, _profile.head_dim});
+        if (!status) {
+            return status;
+        }
+
+        status = layer.q_norm.forward(_runtime->query, _runtime->query, context);
+        if (!status) {
+            return status;
+        }
+        status = layer.k_norm.forward(_runtime->key, _runtime->key, context);
+        if (!status) {
+            return status;
+        }
+
+        status = _rope.forward(_runtime->query, _runtime->key, _runtime->rope_cos,
+                               _runtime->rope_sin, pos, context);
+        if (!status) {
+            return status;
+        }
+
+        status = _runtime->kv_cache.write(index, pos, _runtime->key, _runtime->value,
+                                          context._stream);
+        if (!status) {
+            return status;
+        }
+        status = _mha.forward(_runtime->query, _runtime->kv_cache.key(),
+                              _runtime->kv_cache.value(), _runtime->attention_score,
+                              _runtime->attention_output, index, pos, context);
+        if (!status) {
+            return status;
+        }
+
+        _runtime->attention_output.reshape({_profile.q_dim()});
+        status =
+            layer.wo.forward(_runtime->attention_output, _runtime->attention_projected, context);
+        _runtime->attention_output.reshape(
+            {_profile.num_attention_heads, _profile.head_dim});
+        if (!status) {
+            return status;
+        }
+
+        status = _add.forward(_runtime->hidden, _runtime->attention_projected,
+                              _runtime->attention_residual, context);
+        if (!status) {
+            return status;
+        }
+
+        status =
+            layer.ffn_norm.forward(_runtime->attention_residual, _runtime->norm_output, context);
+        if (!status) {
+            return status;
+        }
+        status = layer.w1.forward(_runtime->norm_output, _runtime->ffn_gate, context);
+        if (!status) {
+            return status;
+        }
+        status = layer.w3.forward(_runtime->norm_output, _runtime->ffn_up, context);
+        if (!status) {
+            return status;
+        }
+        status =
+            _swiglu.forward(_runtime->ffn_gate, _runtime->ffn_up, _runtime->ffn_activated, context);
+        if (!status) {
+            return status;
+        }
+        status = layer.w2.forward(_runtime->ffn_activated, _runtime->ffn_down, context);
+        if (!status) {
+            return status;
+        }
+        status = _add.forward(_runtime->attention_residual, _runtime->ffn_down,
+                              _runtime->block_output, context);
+        if (!status) {
+            return status;
+        }
+        std::swap(_runtime->hidden, _runtime->block_output);
+    }
+
+    status = _norm.forward(_runtime->hidden, _runtime->norm_output, context);
+    if (!status) {
+        return status;
+    }
+    status = _output.forward(_runtime->norm_output, logits, context);
+    if (!status) {
+        return status;
+    }
+    return _runtime->kv_cache.commit(pos);
 }
 
 base::Status Qwen3Model::reset(const op::OpContext&) {

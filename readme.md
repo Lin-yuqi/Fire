@@ -211,6 +211,23 @@ stat -c '%n %s bytes' tmp/llama.fire
 `.fire` 只保存模型 tensor，不包含 tokenizer；启动 demo 时仍需要原始
 `tokenizer.model`。`tmp/` 同样已被 `.gitignore` 忽略。
 
+#### Qwen3 exporter（v0.2 开发中）
+
+同一个 exporter 会从 `config.json` 自动识别 Qwen3-0.6B 或 Qwen3-8B，并支持单个
+`model.safetensors` 或标准 HF shard index：
+
+```bash
+python -B tools/export_qwen3.py \
+  --hf models/Qwen3-0.6B \
+  tmp/qwen3-0.6b.fire
+```
+
+0.6B 会校验 311 个 BF16 source tensor，生成预期长度为 `3,006,559,424` bytes
+（约 2.80 GiB）的 FP32 `.fire` v1。当前本地 0.6B 文件已通过 Loader 和两 token CPU
+forward，并与 Hugging Face eager attention 的逐位置 logits 对齐。Qwen3 的 GPU forward、
+tokenizer/chat 入口和量化执行仍未验收。8B 的相同路径会生成约 30.5 GiB 的 FP32 文件；
+Fire v1 目前没有量化 payload 编码，不应把它当作最终 8B 量化方案。
+
 ### 6. 启动聊天 demo
 
 CMake 会把上述默认路径编译进 demo，默认使用 GPU：
@@ -279,6 +296,7 @@ Python Writer/exporter contract tests：
 
 ```bash
 python3 -B test/test_model/test_export_tinyllama.py
+python3 -B test/test_model/test_export_qwen3.py
 ```
 
 真实模型的双 token forward 属于重型集成测试，默认不会运行：
@@ -295,6 +313,17 @@ FIRE_RUN_TINYLLAMA_GPU_FORWARD_TEST=1 \
   --gtest_filter='TinyllamaTest.GpuForwardTwoTokensOnNonDefaultStream'
 ```
 
+Qwen3-0.6B 的 CPU forward smoke test 和 Hugging Face logits 对齐分别为：
+
+```bash
+FIRE_RUN_QWEN3_FORWARD_TEST=1 \
+  ./build/test/fire_tests \
+  --gtest_filter='Qwen3ModelTest.CpuForwardTwoTokensProducesFiniteLogitsAndAdvancesCache'
+
+FIRE_RUN_QWEN3_HF_ALIGNMENT_TEST=1 \
+  ctest --test-dir build -R '^fire_qwen3_hf_logits_alignment$' --output-on-failure
+```
+
 没有 CUDA device/driver 时，CUDA tests 会跳过。部分真实模型测试还会根据环境变量、
 `tmp/llama.fire` 是否存在和可用显存决定是否跳过。
 
@@ -306,7 +335,7 @@ Fire/
 │   ├── base/                 # Status、设备、Allocator、Buffer
 │   ├── tensor/               # Tensor shape、view 与存储
 │   ├── op/                   # Operator 公共接口
-│   ├── model/                # Reader、Loader、KVCache、TinyLlama
+│   ├── model/                # Reader、Loader、KVCache、TinyLlama、Qwen3 框架
 │   ├── tokenizer/            # Tokenizer 接口与 Llama SentencePiece 实现
 │   └── sampler/              # Sampler 接口与 ArgmaxSampler
 ├── src/
@@ -319,7 +348,8 @@ Fire/
 ├── test/                     # C++ GTest 与 Python contract tests
 ├── tools/
 │   ├── fire_writer.py
-│   └── export_tinyllama.py
+│   ├── export_tinyllama.py
+│   └── export_qwen3.py
 ├── demo/
 │   └── llama_chat.cpp
 ├── docs/
@@ -360,7 +390,7 @@ TinyLlama 的名称、shape 和配置约束由 `TinyllamaLoader` 与固定 Model
 进一步阅读：
 
 - [模型层设计](docs/model_design_v0_1.md)
-- [TinyLlama 导出与 `.fire` v1 格式](docs/model_export_v0_1.md)
+- [模型导出与 `.fire` v1 格式](docs/model_export_v0_1.md)
 - [仓库地图](docs/repo_map.md)
 - [领域术语](CONTEXT.md)
 

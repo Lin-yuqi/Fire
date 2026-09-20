@@ -43,7 +43,9 @@ RMSNormKernel get_rmsnorm_kernel(base::DeviceType dtype) {
 }
 
 RMSNormKernelDim get_rmsnorm_kernel_dim(base::DeviceType dtype) {
-    if (dtype == base::DeviceType::GPU) {
+    if (dtype == base::DeviceType::CPU) {
+        return rmsnorm_kernel_cpu_dim;
+    } else if (dtype == base::DeviceType::GPU) {
         return rmsnorm_kernel_cu_dim;
     } else {
         LOG(FATAL) << "Unknown device type for get a rmsnorm kernel.";

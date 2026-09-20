@@ -42,10 +42,6 @@ base::Status RmsNormOp::_check(const tensor::Tensor& input, tensor::Tensor& outp
     if (_params[0].is_quantized()) {
         return base::error::InvalidArgument("rmsnorm does not support quantized weights");
     }
-    if (device_type == base::DeviceType::CPU && input.dims().size() != 1) {
-        return base::error::InvalidArgument("CPU rmsnorm only supports one-dimensional input");
-    }
-
     auto status = _check_tensor(input, device_type, base::DataType::Fp32);
     if (!status) {
         return status;

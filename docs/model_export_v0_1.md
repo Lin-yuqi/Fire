@@ -1,8 +1,8 @@
-# Fire v0.1 模型导出与 `.fire` 格式
+# Fire 模型导出与 `.fire` v1 格式
 
 > 状态：Accepted。Q1-Q15 的格式、职责、失败语义和验收边界已经确认。
 
-> 实现进度（2026-09-19）：Fire v0.1 已发布。FireWriter、TinyLlama-specific exporter、FireReader、`TinyllamaLoader` 与 core wire/profile 合同测试均已完成并接入 CTest。真实 checkpoint 已完成全量 payload 导出，结果包含 201 项、`data_offset = 19,328`，文件长度为 `4,400,212,864` bytes；该文件已通过 FireReader/Loader 并用于 CPU/CUDA forward。独立的 source checkpoint 抽样 bit-exact 回读和 Hugging Face 逐位置参考对齐仍未形成完整记录，因此本文仍不把严格的 Export Compatibility/Model Support 参考验收描述为全部完成。模型接口与执行设计见 [模型层设计](model_design_v0_1.md)。
+> 实现进度（2026-09-20）：Fire v0.1 已发布。FireWriter、TinyLlama exporter、FireReader、`TinyllamaLoader` 与 core wire/profile 合同测试均已完成并接入 CTest。Qwen3 exporter 已支持按 `config.json` 自动识别 0.6B/8B profile，并读取单文件或 HF shard index；0.6B 的 311 项完整 FP32 文件已通过 Loader、两 token CPU forward 和 Hugging Face logits 对齐，8B 的 399 项/5 分片真实 checkpoint metadata preflight 也已通过。Qwen3 GPU forward 和量化 wire 尚不在已完成范围内。模型接口与执行设计见 [模型层设计](model_design_v0_1.md)。
 
 ## 1. 目标
 
@@ -20,16 +20,25 @@ Hugging Face checkpoint
 
 `.fire` 是可 mmap 的 Fire Tensor Container，而不是通用或自描述的模型 checkpoint。它通过 tensor directory 消除 exporter 与 loader 对隐式 tensor 排列顺序的依赖。
 
+当前开发分支还建立了 Qwen3 的导出路径：
+
+```text
+Qwen3-0.6B / Qwen3-8B local checkpoint
+        -> profile-selected Qwen3 exporter
+        -> FP32 .fire v1
+        -> FireReader / Qwen3Loader / Qwen3Model（0.6B CPU 已验证）
+```
+
 ## 2. 能力与版本边界
 
 - Fire v0.1 绑定 `TinyLlama/TinyLlama-1.1B-Chat-v1.0`。
-- Fire v0.2 绑定 `Qwen/Qwen3-0.6B`，届时才根据真实重复代码提取 model adapter。
+- Fire v0.2 首先绑定 `Qwen/Qwen3-0.6B`；0.6B/8B 共用一个由 profile value 驱动的 exporter 和 Loader，不复制两套模型类。
 - Qwen3.5 独立放到 Fire v0.3，不反向扩大 v0.1/v0.2 的抽象。
 - `.fire` Format Version 独立于 Fire Project Version；本文定义的首版 wire value 为 `1`。
-- `.fire` v1 wire/payload 只支持 64-bit little-endian host 上的 FP32、rank 1/2 tensor；TinyLlama 的 BF16 source tensor 由 exporter 转成 FP32，不输出 BF16、FP16 或量化 payload。
+- `.fire` v1 wire/payload 只支持 64-bit little-endian host 上的 FP32、rank 1/2 tensor；TinyLlama/Qwen3 的 BF16 source tensor 由 exporter 转成 FP32，不输出 BF16、FP16 或量化 payload。
 - Export Compatibility 的验收是 C++ 解析全部 tensor，并对选定 tensor 做数值回读；Model Support 仍要求端到端生成和参考实现校验。
 
-v0.1 的输入边界是本地、精确匹配该 Model Profile 的 `config.json` 和单个 `model.safetensors`。exporter 使用 Python stdlib、safetensors、PyTorch 和 NumPy；不从 Hugging Face Hub 下载文件，不读取 shard index，不执行 remote code，也不实例化 Transformers model 或完整 `state_dict`。
+TinyLlama exporter 的输入边界仍是本地、精确匹配该 Model Profile 的 `config.json` 和单个 `model.safetensors`。Qwen3 exporter 额外支持标准 `model.safetensors.index.json` 和其引用的本地分片。两个 exporter 都不从 Hugging Face Hub 下载文件，不执行 remote code，也不实例化 Transformers model 或完整 `state_dict`。
 
 ## 3. 职责
 
@@ -41,11 +50,19 @@ v0.1 的输入边界是本地、精确匹配该 Model Profile 的 `config.json` 
 - 将 BF16 转为 FP32，并保证 tensor 为 C-contiguous。
 - 用内部两遍算法协调 directory 规划与逐 tensor payload 写出。
 
+### Qwen3 exporter
+
+- 根据 model-semantic config 字段自动选择 0.6B 或 8B profile，不要求调用方重复指定型号。
+- 从 profile 动态推导 canonical descriptor；0.6B 的 `q_dim = 2048`，独立于 `hidden_size = 1024`。
+- 同时支持单个 `model.safetensors` 和 HF shard index，并严格核对 index、实际 shard keys、BF16 dtype、shape 与总字节数。
+- 将同一 shard 的目录项排在一起，使 metadata/payload 两遍中每个 shard 都只打开一次；Loader 仍只按 canonical name 查找，不依赖目录顺序。
+- 与 TinyLlama 相同，在创建输出前完成 metadata preflight，并逐 tensor 转换、写出 FP32 payload。
+
 ### FireWriter
 
 - 只认识已经规范化的 Fire tensor 名、dtype、shape、byte size 和 payload。
 - 编码 Header、Tensor Directory 与 raw data。
-- 不理解 Hugging Face、safetensors、TinyLlama 或模型配置。
+- 不理解 Hugging Face、safetensors、TinyLlama、Qwen3 或模型配置。
 - 不暴露 public planner、provider、streaming policy 或 WriteReport。
 
 ### FireReader
@@ -78,7 +95,7 @@ Header 固定为 32 bytes：
 | ---: | --- | --- | --- |
 | 0 | `char[8]` | magic | `FIRECKPT` |
 | 8 | `uint32` | format_version | `1` |
-| 12 | `uint32` | tensor_count | TinyLlama 为 `201` |
+| 12 | `uint32` | tensor_count | TinyLlama 为 `201`；Qwen3-0.6B/8B 为 `311`/`399` |
 | 16 | `uint64` | tensor_directory_offset | v1 为 `32` |
 | 24 | `uint64` | data_offset | directory 结束后的绝对 byte offset |
 
@@ -108,6 +125,8 @@ wire dtype 编号不复用 C++ `base::DataType` 的枚举序号；FireReader 负
 - 目录顺序不携带模型语义；ModelLoader 只按 canonical name 查找。
 - TinyLlama 的 directory 占 `201 * 96 = 19,296` bytes，因此 `data_offset = 19,328`。
 - TinyLlama FP32 payload 为 `4,400,193,536` bytes，完整文件预期为 `4,400,212,864` bytes。
+- Qwen3-0.6B 的 directory 占 `311 * 96 = 29,856` bytes，因此 `data_offset = 29,888`；FP32 payload 为 `3,006,529,536` bytes，完整文件预期为 `3,006,559,424` bytes。
+- Qwen3-8B 的 directory 占 `399 * 96 = 38,304` bytes，因此 `data_offset = 38,336`；FP32 payload 为 `32,762,941,440` bytes，完整文件预期为 `32,762,979,776` bytes。该 FP32 文件约 30.5 GiB，只用于当前格式兼容，不是最终 8B 量化交付形态。
 
 ## 5. Reader 必须验证的不变量
 
@@ -174,16 +193,63 @@ wire dtype 编号不复用 C++ `base::DataType` 的枚举序号；FireReader 负
 
 `{i}` 取 `0..21`。所有二维 tensor 保持 C-contiguous `[out_features, in_features]`，不 transpose、fuse、permute 或 kernel-pack。源 checkpoint 的 embedding 与 output 未绑定，两者都必须导出。
 
+### 8.1 Qwen3 profile 与 canonical mapping
+
+Qwen3 exporter 目前识别两个 dense profile：
+
+| Field | Qwen3-0.6B | Qwen3-8B |
+| --- | ---: | ---: |
+| hidden size | 1024 | 4096 |
+| intermediate size | 3072 | 12288 |
+| layers | 28 | 36 |
+| attention heads | 16 | 32 |
+| KV heads | 8 | 8 |
+| head dim | 128 | 128 |
+| q dim | 2048 | 4096 |
+| KV dim | 1024 | 1024 |
+| vocabulary size | 151936 | 151936 |
+| tied embeddings config | true | false |
+| canonical tensors | 311 | 399 |
+
+两个 profile 共用以下映射，`{i}` 的范围由 profile 的 layer count 决定：
+
+| HF source pattern | Fire canonical pattern | Shape |
+| --- | --- | --- |
+| `model.embed_tokens.weight` | `tok_embeddings.weight` | `[vocab_size, hidden_size]` |
+| `model.layers.{i}.input_layernorm.weight` | `layers.{i}.attention_norm.weight` | `[hidden_size]` |
+| `model.layers.{i}.self_attn.q_proj.weight` | `layers.{i}.attention.wq.weight` | `[q_dim, hidden_size]` |
+| `model.layers.{i}.self_attn.k_proj.weight` | `layers.{i}.attention.wk.weight` | `[kv_dim, hidden_size]` |
+| `model.layers.{i}.self_attn.v_proj.weight` | `layers.{i}.attention.wv.weight` | `[kv_dim, hidden_size]` |
+| `model.layers.{i}.self_attn.o_proj.weight` | `layers.{i}.attention.wo.weight` | `[hidden_size, q_dim]` |
+| `model.layers.{i}.self_attn.q_norm.weight` | `layers.{i}.attention.q_norm.weight` | `[head_dim]` |
+| `model.layers.{i}.self_attn.k_norm.weight` | `layers.{i}.attention.k_norm.weight` | `[head_dim]` |
+| `model.layers.{i}.post_attention_layernorm.weight` | `layers.{i}.ffn_norm.weight` | `[hidden_size]` |
+| `model.layers.{i}.mlp.gate_proj.weight` | `layers.{i}.feed_forward.w1.weight` | `[intermediate_size, hidden_size]` |
+| `model.layers.{i}.mlp.down_proj.weight` | `layers.{i}.feed_forward.w2.weight` | `[hidden_size, intermediate_size]` |
+| `model.layers.{i}.mlp.up_proj.weight` | `layers.{i}.feed_forward.w3.weight` | `[intermediate_size, hidden_size]` |
+| `model.norm.weight` | `norm.weight` | `[hidden_size]` |
+| `lm_head.weight` | `output.weight` | `[vocab_size, hidden_size]` |
+
+0.6B 的 source checkpoint 即使配置为 tied embeddings，也实际包含 `lm_head.weight`；当前 `.fire` profile 因而显式保存 embedding 与 output 两项。导出命令为：
+
+```bash
+python -B tools/export_qwen3.py \
+  --hf models/Qwen3-0.6B \
+  tmp/qwen3-0.6b.fire
+```
+
+exporter 会从 `config.json` 自动选择 profile。输出路径必须不存在。当前真实 0.6B checkpoint 已导出约 2.80 GiB FP32 payload，并用于 Loader、CPU forward 和 Hugging Face logits 对齐；完整导出本身不属于自动化测试。8B 也能通过相同 CLI 读取标准分片 checkpoint，但 Fire v1 只会生成约 30.5 GiB 的 FP32 文件，并不提供 INT4/INT8 编码。
+
 ## 9. 内部两遍导出
 
 导出前先完成 config、source key、dtype、shape、canonical name 长度和唯一性检查。随后：
 
-1. Metadata pass：在一个 `safe_open(source_path, framework="numpy")` context 中通过 slice metadata 读取 name、dtype 和 shape，不构造 payload tensor；建立私有的 source-to-canonical 描述列表，并 checked 计算全部 absolute byte offset。完整 preflight 成功后 exclusive-create 目标文件，再写出 Header 与 Tensor Directory。
-2. Payload pass：只打开一个 `safe_open(source_path, framework="pt", device="cpu")` context，在循环中按目录顺序逐项 `get_tensor()`，转换成 FP32 C-contiguous tensor，通过共享内存的 NumPy view 写入 payload，然后立即释放当前临时 tensor。
+1. Metadata pass：通过 `safe_open(source_path, framework="numpy")` 的 slice metadata 读取 name、dtype 和 shape，不构造 payload tensor；建立私有的 source-to-canonical 描述列表，并 checked 计算全部 absolute byte offset。完整 preflight 成功后 exclusive-create 目标文件，再写出 Header 与 Tensor Directory。单文件 checkpoint 只打开一次；Qwen3 分片 checkpoint 每个 shard 打开一次。
+2. Payload pass：通过 `safe_open(source_path, framework="pt", device="cpu")` 按目录顺序逐项 `get_tensor()`，转换成 FP32 C-contiguous tensor，通过共享内存的 NumPy view 写入 payload，然后立即释放当前临时 tensor。单文件 checkpoint 使用一个长期 context；Qwen3 会把同 shard 项分组，因此每个 shard 也只打开一次。
 
 该列表和两遍算法是 exporter/writer 的 implementation detail，不成为 public TensorSource、provider 或 planning interface。
 
-最小 internal seam 是：TinyLlama adapter 持有私有 `ExportEntry(source_name, TensorInfo)` 列表并驱动 safetensors 循环；FireWriter 只接收 Fire `TensorInfo[]`、写出 Header/Directory，并按相同顺序接收单个规范化 tensor。FireWriter 不接触 source name、safetensors handle 或 HF config。
+最小 internal seam 是：model-specific adapter 持有私有 `ExportEntry(source_name, shard_path, TensorInfo)` 列表并驱动 safetensors 循环；FireWriter 只接收 Fire `TensorInfo[]`、写出 Header/Directory，并按相同顺序接收单个规范化 tensor。FireWriter 不接触 source name、shard、safetensors handle 或 HF config。
 
 Python 实现应避免两个不必要的内存放大点：
 
@@ -196,14 +262,14 @@ Python 实现应避免两个不必要的内存放大点：
 
 ## 10. 明确不做
 
-- checksum、compression、sharding。
+- checksum、compression、`.fire` 输出分片。Qwen3 只支持读取 HF source shards，输出仍是一个连续 `.fire` 文件。
 - streaming writer policy/framework。
 - atomic commit、replace/version migration。
 - WriteReport、public planning interface、lazy-loading policy framework。
 - schema/model registry、自动 ModelLoader 选择。
 - FireReader 复用或重新 `open` 另一文件的状态语义；v0.1 每个文件使用新的 Reader。
 - universal quantization、LoRA merge、GGUF 或 PyTorch pickle。
-- 通用 Hugging Face 架构支持、Qwen/MoE/视觉/MTP 预抽象。
+- 通用 Hugging Face 架构支持、MoE/视觉/MTP 预抽象；Qwen3 仅支持显式列出的 0.6B/8B dense profile。
 - tokenizer/chat template 打包。
 - transpose、QKV fusion 或设备专用 packing。
 
@@ -244,7 +310,7 @@ std::shared_ptr<base::Buffer> FireReader::mapped_buffer() const;
 
 ## 12. 最小验收测试
 
-截至 2026-09-11，本节的 core 合同已自动化：CMake 在构建 `fire_tests` 前生成独立 fixture，6 个 FireReader GTest 用例覆盖有效文件、坏文件矩阵、显式 `uint64` 溢出、Status 分类和 mapping lifetime；CTest 项 `fire_export_tinyllama_contract` 运行 13 个 Writer/exporter unittest。这些测试验证 wire 和 profile 合同，不代替本节末尾的真实权重里程碑。
+截至 2026-09-20，本节的 core 合同已自动化：CMake 在构建 `fire_tests` 前生成独立 fixture，FireReader GTest 覆盖有效文件、坏文件矩阵、显式 `uint64` 溢出、Status 分类和 mapping lifetime；CTest 项 `fire_export_tinyllama_contract` 运行 13 个 Writer/exporter unittest，`fire_export_qwen3_contract` 运行 9 个 Qwen3 exporter unittest。这些测试验证 wire 和 profile 合同，不代替本节末尾的真实权重里程碑。
 
 ### Wire contract fixture
 
@@ -277,6 +343,18 @@ Python writer 测试还应验证：preflight 失败时不创建目标；目标�
 - 全部 canonical mapping、FP32 目标 dtype 和预期 shape。
 - FP32 payload 合计 `4,400,193,536` bytes，最终文件为 `4,400,212,864` bytes。
 - source 缺项、额外项、错误 BF16 dtype、错误 shape 和关键 config 不匹配均会失败。
+
+### Qwen3 profile test
+
+轻量 Python test 不生成真实大文件，验证：
+
+- `28 * 11 + 3 = 311` 与 `36 * 11 + 3 = 399` 两个 descriptor。
+- 0.6B 的 Q/K/V/O、Q/K norm 和 FFN canonical name/shape，尤其是 `q_dim != hidden_size`。
+- 单文件与 shard index 的完整 tensor set、路径、总字节数和每 shard 实际 key 校验。
+- metadata pass 与 payload pass 对每个 shard 只打开一次，且分组后的 absolute offset 连续。
+- preflight 失败不创建输出，payload 阶段失败删除本次创建的 partial file。
+
+此外，本地 `models/Qwen3-0.6B` 已确认 311 项、单个 shard、`data_offset = 29,888` 和最终 FP32 文件长度 `3,006,559,424` bytes；该完整文件已通过两 token CPU forward 和 Hugging Face logits 对齐。`models/Qwen3-8B` 完成了 metadata-only preflight，确认 399 项、5 个 shards 和最终预期长度 `32,762,979,776` bytes，尚未写出完整 payload。
 
 ### 本地里程碑验收
 
