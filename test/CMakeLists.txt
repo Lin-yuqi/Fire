@@ -4,6 +4,9 @@ aux_source_directory(test_model MODEL)
 aux_source_directory(test_tokenizer TOKEN)
 aux_source_directory(test_sampler sampler)
 
+# This file has its own main() and is built as an integration-test helper below.
+list(FILTER MODEL EXCLUDE REGEX "tinyllama_logits_runner\\.cpp$")
+
 add_executable(fire_tests
     test_base/test_buffer.cpp
     test_model/test_fire_reader.cpp
@@ -61,4 +64,29 @@ add_test(
         ${Python3_EXECUTABLE}
         -B
         ${CMAKE_CURRENT_SOURCE_DIR}/test_model/test_export_tinyllama.py
+)
+
+add_executable(
+    tinyllama_logits_runner
+    test_model/tinyllama_logits_runner.cpp
+)
+target_link_libraries(tinyllama_logits_runner PRIVATE Fire::fire)
+
+add_test(
+    NAME fire_tinyllama_hf_logits_alignment
+    COMMAND
+        ${Python3_EXECUTABLE}
+        -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_model/test_hf_logits_alignment.py
+        --runner $<TARGET_FILE:tinyllama_logits_runner>
+        --hf-model ${CMAKE_SOURCE_DIR}/models/TinyLlama-1.1B-Chat-v1.0
+        --fire-model ${FIRE_TINYLLAMA_PATH}
+)
+set_tests_properties(
+    fire_tinyllama_hf_logits_alignment
+    PROPERTIES
+        LABELS "integration;model"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 1800
 )

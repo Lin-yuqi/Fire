@@ -9,10 +9,13 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -22,6 +25,13 @@ namespace {
 
 constexpr size_t MaxNewTokens = 128;
 constexpr std::string_view SystemPrompt = "You are a helpful assistant.";
+using PerformanceClock = std::chrono::steady_clock;
+
+struct GenerationMetrics {
+    PerformanceClock::duration time_to_first_token{};
+    PerformanceClock::duration decode_time{};
+    size_t sampled_tokens = 0;
+};
 
 class StreamCompletionGuard {
   public:
@@ -51,6 +61,26 @@ void print_usage(const char* program) {
 int report_error(std::string_view operation, const base::Status& status) {
     std::cerr << operation << " failed: " << status.message() << '\n';
     return 1;
+}
+
+void print_generation_metrics(const GenerationMetrics& metrics) {
+    const double ttft_ms =
+        std::chrono::duration<double, std::milli>(metrics.time_to_first_token).count();
+
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(2) << "[performance] TTFT: " << ttft_ms
+           << " ms, TPOT: ";
+
+    const size_t decode_tokens = metrics.sampled_tokens > 0 ? metrics.sampled_tokens - 1 : 0;
+    const double decode_seconds = std::chrono::duration<double>(metrics.decode_time).count();
+    if (decode_tokens == 0 || decode_seconds <= 0.0) {
+        output << "n/a, Decode throughput: n/a";
+    } else {
+        const double tpot_ms = decode_seconds * 1000.0 / static_cast<double>(decode_tokens);
+        const double throughput = static_cast<double>(decode_tokens) / decode_seconds;
+        output << tpot_ms << " ms/token, Decode throughput: " << throughput << " tokens/s";
+    }
+    std::cout << output.str() << '\n';
 }
 
 base::Status load_model(const std::string& model_path, const op::OpContext& context,
@@ -120,18 +150,30 @@ base::Status generate_response(model::TinyLlamaModel& model,
                                const token::LlamaTokenizer& tokenizer,
                                sampler::ArgmaxSampler& sampler, size_t max_new_tokens,
                                tensor::Tensor& logits, const op::OpContext& context,
-                               int32_t& position) {
+                               int32_t& position, PerformanceClock::time_point turn_started_at,
+                               GenerationMetrics& metrics) {
     std::vector<int32_t> generated_ids;
     generated_ids.reserve(max_new_tokens);
     std::string printed_response;
     bool sampled_eos = false;
+    bool decode_step_pending = false;
+    PerformanceClock::time_point decode_step_started_at;
 
     for (size_t step = 0; step < max_new_tokens; ++step) {
         const size_t sampled_id =
             sampler.sample(logits.ptr<float>(), logits.size(), context._stream);
+        const auto sample_completed_at = PerformanceClock::now();
         if (sampled_id >= static_cast<size_t>(model.config().vocab_size)) {
             return base::error::InternalError("sampler returned an invalid token id");
         }
+
+        if (metrics.sampled_tokens == 0) {
+            metrics.time_to_first_token = sample_completed_at - turn_started_at;
+        } else if (decode_step_pending) {
+            metrics.decode_time += sample_completed_at - decode_step_started_at;
+        }
+        ++metrics.sampled_tokens;
+
         if (sampled_id == static_cast<size_t>(tokenizer.eos_id())) {
             sampled_eos = true;
             break;
@@ -149,6 +191,8 @@ base::Status generate_response(model::TinyLlamaModel& model,
             printed_response = std::move(decoded);
         }
 
+        decode_step_started_at = PerformanceClock::now();
+        decode_step_pending = true;
         status = model.forward(static_cast<int32_t>(sampled_id), position, logits, context);
         if (!status.ok()) {
             return status;
@@ -175,6 +219,13 @@ base::Status generate_response(model::TinyLlamaModel& model,
         return status;
     }
     ++position;
+
+    if (context._device_type == base::DeviceType::GPU) {
+        const cudaError_t error = cudaStreamSynchronize(context._stream);
+        if (error != cudaSuccess) {
+            return base::error::InternalError(cudaGetErrorString(error));
+        }
+    }
 
     if (!sampled_eos) {
         std::cout << "\n[response stopped after " << max_new_tokens << " tokens]";
@@ -248,6 +299,7 @@ int run_chat(const std::string& model_path, const std::string& tokenizer_path,
         }
 
         std::vector<int32_t> turn_ids;
+        const auto turn_started_at = PerformanceClock::now();
         status = encode_user_turn(tokenizer, user_input, first_turn, turn_ids);
         if (!status.ok()) {
             return report_error("encoding prompt", status);
@@ -273,12 +325,14 @@ int run_chat(const std::string& model_path, const std::string& tokenizer_path,
             std::min(MaxNewTokens, context_limit - static_cast<size_t>(position) - 1);
 
         std::cout << "Assistant> " << std::flush;
+        GenerationMetrics metrics;
         status = generate_response(*model, tokenizer, sampler, response_budget, logits,
-                                   context, position);
+                                   context, position, turn_started_at, metrics);
         std::cout << '\n';
         if (!status.ok()) {
             return report_error("generating response", status);
         }
+        print_generation_metrics(metrics);
 
         const size_t tokens_left = context_limit - static_cast<size_t>(position);
         if (tokens_left == 0) {
