@@ -67,6 +67,38 @@ std::vector<uint8_t> ReadFixture() {
                                 std::istreambuf_iterator<char>());
 }
 
+std::vector<uint8_t> V2Fixture() {
+    // Independent of FireWriter: three physical tensors, with a three-byte
+    // zero-filled alignment gap between packed qweight and FP32 scales.
+    std::vector<uint8_t> bytes(329, 0);
+    std::memcpy(bytes.data(), "FIRECKPT", 8);
+    WriteU32Le(bytes, 8, 2);
+    WriteU32Le(bytes, 12, 3);
+    WriteU64Le(bytes, 16, 32);
+    WriteU64Le(bytes, 24, 320);
+
+    const auto record = [&](size_t index, const char* name, uint64_t offset,
+                            uint64_t size, uint8_t dtype) {
+        const size_t base = 32 + index * 96;
+        std::memcpy(bytes.data() + base, name, std::strlen(name));
+        WriteU64Le(bytes, base + 64, offset);
+        WriteU64Le(bytes, base + 72, size);
+        WriteU32Le(bytes, base + 80, 1);
+        WriteU32Le(bytes, base + 84, 1);
+        bytes[base + 88] = dtype;
+        bytes[base + 89] = 2;
+    };
+    record(0, "linear.qweight", 320, 1, 2);
+    record(1, "linear.scales", 324, 4, 1);
+    record(2, "linear.zero_points", 328, 1, 2);
+    bytes[32 + 90] = 1;  // INT4 group-wise
+    WriteU32Le(bytes, 32 + 91, 2);
+    bytes[320] = 0x21;
+    WriteU32Le(bytes, 324, 0x3f000000U);  // 0.5f
+    bytes[328] = 1;
+    return bytes;
+}
+
 class TemporaryFireFile final {
   public:
     explicit TemporaryFireFile(const std::vector<uint8_t>& bytes) {
@@ -188,11 +220,53 @@ TEST(FireReaderTest, OpensTheIndependentWireContractFixture) {
     }
 }
 
+TEST(FireReaderTest, OpensV2PackedInt4AndExposesGroupSize) {
+    TemporaryFireFile file(V2Fixture());
+    model::FireReader reader;
+    const base::Status status = reader.open(file.path());
+    ASSERT_TRUE(status.ok()) << status.message();
+    EXPECT_EQ(reader.tensor_count(), 3U);
+
+    const model::TensorInfo* qweight = reader.find("linear.qweight");
+    ASSERT_NE(qweight, nullptr);
+    EXPECT_EQ(qweight->dtype, base::DataType::UInt8);
+    EXPECT_EQ(qweight->quantization_kind, model::QuantizationKind::Int4GroupWise);
+    EXPECT_EQ(qweight->group_size, 2U);
+    EXPECT_EQ(qweight->byte_offset, 320U);
+
+    const model::TensorInfo* scales = reader.find("linear.scales");
+    ASSERT_NE(scales, nullptr);
+    EXPECT_EQ(scales->dtype, base::DataType::Fp32);
+    EXPECT_EQ(scales->quantization_kind, model::QuantizationKind::None);
+    EXPECT_EQ(scales->byte_offset, 324U);
+}
+
+TEST(FireReaderTest, RejectsMalformedV2MetadataAndPadding) {
+    using Mutation = std::function<void(std::vector<uint8_t>&)>;
+    const std::vector<std::pair<std::string, Mutation>> cases = {
+        {"unknown quantization kind", [](auto& bytes) { bytes[122] = 2; }},
+        {"odd group size", [](auto& bytes) { WriteU32Le(bytes, 123, 3); }},
+        {"group larger than K", [](auto& bytes) { WriteU32Le(bytes, 123, 4); }},
+        {"nonzero metadata reserve", [](auto& bytes) { bytes[127] = 1; }},
+        {"nonzero alignment gap", [](auto& bytes) { bytes[321] = 1; }},
+        {"quantization on FP32", [](auto& bytes) { bytes[32 + 96 + 90] = 1; }},
+    };
+    for (const auto& [label, mutate] : cases) {
+        SCOPED_TRACE(label);
+        auto bytes = V2Fixture();
+        mutate(bytes);
+        TemporaryFireFile file(bytes);
+        model::FireReader reader;
+        const base::Status status = reader.open(file.path());
+        EXPECT_EQ(status.code(), base::StatusCode::ModelParseError) << status.message();
+    }
+}
+
 TEST(FireReaderTest, RejectsMalformedHeaderDirectoryAndPayload) {
     using Mutation = std::function<void(std::vector<uint8_t>&)>;
     const std::vector<std::pair<std::string, Mutation>> cases = {
         {"bad magic", [](auto& bytes) { bytes[0] ^= 0xffU; }},
-        {"bad version", [](auto& bytes) { WriteU32Le(bytes, 8, 2); }},
+        {"bad version", [](auto& bytes) { WriteU32Le(bytes, 8, 3); }},
         {"wrong directory offset", [](auto& bytes) { WriteU64Le(bytes, 16, 31); }},
         {"wrong data offset", [](auto& bytes) { WriteU64Le(bytes, 24, 225); }},
         {"truncated header", [](auto& bytes) { bytes.resize(kHeaderSize - 1); }},

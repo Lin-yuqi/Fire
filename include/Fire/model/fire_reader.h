@@ -13,6 +13,11 @@
 
 namespace model {
 
+enum class QuantizationKind : uint8_t {
+    None = 0,
+    Int4GroupWise = 1,
+};
+
 // Decoded tensor metadata. These fields describe Fire tensor semantics rather
 // than the packed 96-byte wire record.
 struct TensorInfo {
@@ -21,9 +26,11 @@ struct TensorInfo {
     std::vector<int32_t> dims;
     uint64_t byte_offset = 0;
     uint64_t byte_size = 0;
+    QuantizationKind quantization_kind = QuantizationKind::None;
+    uint32_t group_size = 0;
 };
 
-// Owns and indexes one read-only mmap of a .fire v1 tensor container.
+// Owns and indexes one read-only mmap of a .fire v1/v2 tensor container.
 //
 // FireReader only understands the container format. Model-specific tensor
 // requirements belong to ModelLoader.

@@ -76,6 +76,22 @@ add_test(
         ${CMAKE_CURRENT_SOURCE_DIR}/test_model/test_export_qwen3.py
 )
 
+add_test(
+    NAME fire_quant_contract
+    COMMAND
+        ${Python3_EXECUTABLE}
+        -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_model/test_quant.py
+)
+
+add_test(
+    NAME fire_writer_v2_contract
+    COMMAND
+        ${Python3_EXECUTABLE}
+        -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_model/test_fire_writer_v2.py
+)
+
 add_executable(
     tinyllama_logits_runner
     test_model/tinyllama_logits_runner.cpp

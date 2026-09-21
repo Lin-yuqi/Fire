@@ -1,8 +1,8 @@
-"""Minimal wire-only writer surface for a Fire v1 tensor container.
+"""Wire-only writer for Fire v1 and v2 tensor containers.
 
 This module deliberately knows nothing about Hugging Face, safetensors, or a
-model architecture. The encoding and payload-writing bodies are left for the
-next implementation step.
+model architecture. Quantization math and model-specific tensor associations
+belong to exporters and loaders.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from numpy.typing import NDArray
 
 MAGIC = b"FIRECKPT"
 FORMAT_VERSION = 1
+FORMAT_VERSION_V2 = 2
 HEADER_SIZE = 32
 TENSOR_INFO_SIZE = 96
 _UINT32_MAX = (1 << 32) - 1
@@ -33,6 +34,14 @@ class WireDType(IntEnum):
     """Dtype values written to the .fire wire format."""
 
     FP32 = 1
+    UINT8 = 2
+
+
+@dataclass(frozen=True)
+class QuantizationInfo:
+    """V2 INT4 group-wise metadata carried by the packed qweight record."""
+
+    group_size: int
 
 
 def _encode_name(name: str) -> bytes:
@@ -55,7 +64,7 @@ class TensorInfo:
     """One normalized tensor directory entry.
 
     ``byte_offset`` and ``byte_size`` are absolute byte quantities. ``shape``
-    has one or two dimensions in format v1.
+    has one or two dimensions in both supported format versions.
     """
 
     name: str
@@ -63,6 +72,7 @@ class TensorInfo:
     shape: tuple[int, ...]
     byte_offset: int
     byte_size: int
+    quantization: QuantizationInfo | None = None
 
 
 class FireWriter:
@@ -71,6 +81,11 @@ class FireWriter:
     Model-specific exporters own source validation, exclusive-create cleanup,
     and their safetensors loops. This class only owns .fire wire encoding.
     """
+
+    def __init__(self, *, version: int = FORMAT_VERSION) -> None:
+        if version not in (FORMAT_VERSION, FORMAT_VERSION_V2):
+            raise ValueError(f"unsupported Fire format version: {version}")
+        self.version = version
 
     def write_header_and_directory(
         self,
@@ -84,7 +99,7 @@ class FireWriter:
 
         tensor_count = len(tensors)
         if tensor_count > _UINT32_MAX:
-            raise ValueError(f"too many tensors for Fire v1: {tensor_count}")
+            raise ValueError(f"too many tensors for Fire v{self.version}: {tensor_count}")
 
         data_offset = HEADER_SIZE + tensor_count * TENSOR_INFO_SIZE
         if data_offset > _UINT64_MAX:
@@ -103,10 +118,21 @@ class FireWriter:
             seen_names.add(info.name)
             encoded_names.append(_encode_name(info.name))
 
-            if info.dtype != WireDType.FP32:
+            if info.dtype not in (
+                (WireDType.FP32,) if self.version == FORMAT_VERSION
+                else (WireDType.FP32, WireDType.UINT8)
+            ):
                 raise ValueError(
                     f"unsupported wire dtype for {info.name}: {info.dtype}"
                 )
+
+            if info.quantization is not None:
+                if self.version != FORMAT_VERSION_V2 or info.dtype != WireDType.UINT8:
+                    raise ValueError(f"invalid quantization metadata for {info.name}")
+                group_size = info.quantization.group_size
+                if (type(group_size) is not int or group_size <= 0
+                        or group_size > _UINT32_MAX or group_size % 2 != 0):
+                    raise ValueError(f"invalid group_size for {info.name}: {group_size}")
 
             if len(info.shape) not in (1, 2):
                 raise ValueError(
@@ -117,8 +143,13 @@ class FireWriter:
                 raise ValueError(
                     f"invalid shape for {info.name}: {info.shape}"
                 )
+            if info.quantization is not None and (
+                len(info.shape) != 2
+                or (2 * info.shape[1]) % info.quantization.group_size != 0
+            ):
+                raise ValueError(f"group_size does not divide logical K for {info.name}")
 
-            expected_size = math.prod(info.shape) * 4
+            expected_size = math.prod(info.shape) * (4 if info.dtype == WireDType.FP32 else 1)
             if expected_size > _UINT64_MAX:
                 raise ValueError(
                     f"tensor byte_size exceeds uint64 range for {info.name}: "
@@ -131,22 +162,26 @@ class FireWriter:
                     f"expected {expected_size}, got {info.byte_size}"
                 )
 
-            if info.byte_offset != next_offset:
+            expected_offset = (
+                next_offset if self.version == FORMAT_VERSION
+                else (next_offset + 3) & ~3
+            )
+            if info.byte_offset != expected_offset:
                 raise ValueError(
                     f"byte_offset mismatch for {info.name}: "
-                    f"expected {next_offset}, got {info.byte_offset}"
+                    f"expected {expected_offset}, got {info.byte_offset}"
                 )
 
-            if next_offset > _UINT64_MAX - info.byte_size:
+            if expected_offset > _UINT64_MAX - info.byte_size:
                 raise ValueError(
                     f"tensor payload range exceeds uint64 for {info.name}"
                 )
-            next_offset += info.byte_size
+            next_offset = expected_offset + info.byte_size
 
         # 2. 写 Header
         header = _HEADER_STRUCT.pack(
             MAGIC,
-            FORMAT_VERSION,
+            self.version,
             tensor_count,
             HEADER_SIZE,
             data_offset,
@@ -163,6 +198,10 @@ class FireWriter:
             shape0 = info.shape[0]
             shape1 = info.shape[1] if ndim == 2 else 0
 
+            metadata = (
+                struct.pack("<BIB", 1, info.quantization.group_size, 0)
+                if info.quantization is not None else bytes(6)
+            )
             encoded = _TENSOR_INFO_STRUCT.pack(
                 encoded_name,
                 info.byte_offset,
@@ -171,7 +210,7 @@ class FireWriter:
                 shape1,
                 int(info.dtype),
                 ndim,
-                b"\0" * 6,
+                metadata,
             )
 
             written = destination.write(encoded)
@@ -191,19 +230,21 @@ class FireWriter:
         self,
         destination: BinaryIO,
         info: TensorInfo,
-        tensor: NDArray[np.float32],
+        tensor: NDArray[np.float32] | NDArray[np.uint8],
     ) -> None:
-    # 1. Fire v1 当前只支持 FP32
-        if info.dtype != WireDType.FP32:
+        if info.dtype not in (
+            (WireDType.FP32,) if self.version == FORMAT_VERSION
+            else (WireDType.FP32, WireDType.UINT8)
+        ):
             raise ValueError(
                 f"unsupported wire dtype for {info.name}: {info.dtype}"
             )
 
-        # 2. 检查实际 tensor dtype
-        if tensor.dtype != np.dtype(np.float32):
+        expected_dtype = np.float32 if info.dtype == WireDType.FP32 else np.uint8
+        if tensor.dtype != np.dtype(expected_dtype):
             raise ValueError(
                 f"dtype mismatch for {info.name}: "
-                f"expected float32, got {tensor.dtype}"
+                f"expected {np.dtype(expected_dtype)}, got {tensor.dtype}"
             )
 
         # 3. 检查 shape
@@ -226,14 +267,16 @@ class FireWriter:
                 f"expected {info.byte_size}, got {tensor.nbytes}"
             )
 
-        # 6. 当前文件位置必须正好等于这个 tensor 的 offset
+        # V2 pads byte-sized payloads so every record starts at a 4-byte boundary.
         current_offset = destination.tell()
-
-        if current_offset != info.byte_offset:
+        padding = info.byte_offset - current_offset
+        if padding < 0 or padding > (3 if self.version == FORMAT_VERSION_V2 else 0):
             raise ValueError(
                 f"write offset mismatch for {info.name}: "
                 f"expected {info.byte_offset}, got {current_offset}"
             )
+        if padding and destination.write(bytes(padding)) != padding:
+            raise OSError(f"failed to write alignment padding for {info.name}")
 
         # 7. 直接把 NumPy 的原始内存当作 bytes 写入
         payload = memoryview(tensor).cast("B")

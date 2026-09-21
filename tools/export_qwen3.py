@@ -24,12 +24,24 @@ from fire_writer import (
     HEADER_SIZE,
     TENSOR_INFO_SIZE,
     FireWriter,
+    QuantizationInfo,
     TensorInfo,
     WireDType,
 )
+from quant import pack_uint4, quantize_int4_groupwise
 
 
 EXPECTED_SOURCE_DTYPE = "BF16"
+INT4_GROUP_SIZE = 128
+_LINEAR_SUFFIXES = (
+    ".attention.wq.weight",
+    ".attention.wk.weight",
+    ".attention.wv.weight",
+    ".attention.wo.weight",
+    ".feed_forward.w1.weight",
+    ".feed_forward.w2.weight",
+    ".feed_forward.w3.weight",
+)
 
 
 class ExportError(RuntimeError):
@@ -179,6 +191,14 @@ class _ExportEntry:
     source_name: str
     shard_path: Path
     tensor_info: TensorInfo
+
+
+@dataclass(frozen=True)
+class _V2ExportEntry:
+    source_name: str
+    shard_path: Path
+    source_shape: tuple[int, ...]
+    tensor_infos: tuple[TensorInfo, ...]
 
 
 def _select_profile(config: Mapping[str, object]) -> _Qwen3Profile:
@@ -544,10 +564,160 @@ def _write_payload(
                 del tensor
 
 
-def export_qwen3(source_dir: Path, output_path: Path) -> None:
+def _build_int4_entries(
+    source_index: _SourceIndex,
+    descriptor: Sequence[_TensorPattern],
+    profile: _Qwen3Profile,
+) -> tuple[list[_V2ExportEntry], int]:
+    # Reuse the source-checkpoint preflight, but compute v2 directory size and
+    # payload offsets from the expanded set of physical tensors.
+    source_entries = _build_export_entries(source_index, descriptor, profile)
+    patterns = {pattern.source_name: pattern for pattern in descriptor}
+    quantized_count = sum(
+        pattern.fire_name == "output.weight"
+        or pattern.fire_name.endswith(_LINEAR_SUFFIXES)
+        for pattern in descriptor
+    )
+    output_count = len(descriptor) + 2 * quantized_count
+    next_offset = HEADER_SIZE + output_count * TENSOR_INFO_SIZE
+    result: list[_V2ExportEntry] = []
+
+    for source in source_entries:
+        pattern = patterns[source.source_name]
+        shape = pattern.shape
+        is_linear = pattern.fire_name == "output.weight" or pattern.fire_name.endswith(
+            _LINEAR_SUFFIXES
+        )
+        definitions: tuple[tuple[str, WireDType, tuple[int, ...], QuantizationInfo | None], ...]
+        if is_linear:
+            out_features, in_features = shape
+            if in_features % INT4_GROUP_SIZE != 0:
+                raise ExportError(
+                    f"INT4 group_size {INT4_GROUP_SIZE} does not divide K for "
+                    f"{pattern.source_name}: {in_features}"
+                )
+            base = pattern.fire_name.removesuffix(".weight")
+            group_shape = (out_features, in_features // INT4_GROUP_SIZE)
+            definitions = (
+                (base + ".qweight", WireDType.UINT8,
+                 (out_features, in_features // 2), QuantizationInfo(INT4_GROUP_SIZE)),
+                (base + ".scales", WireDType.FP32, group_shape, None),
+                (base + ".zero_points", WireDType.UINT8, group_shape, None),
+            )
+        else:
+            definitions = ((pattern.fire_name, WireDType.FP32, shape, None),)
+
+        outputs = []
+        for name, dtype, output_shape, quantization in definitions:
+            next_offset = (next_offset + 3) & ~3
+            byte_size = math.prod(output_shape) * (4 if dtype == WireDType.FP32 else 1)
+            outputs.append(
+                TensorInfo(name, dtype, output_shape, next_offset, byte_size, quantization)
+            )
+            next_offset += byte_size
+        result.append(
+            _V2ExportEntry(source.source_name, source.shard_path, shape, tuple(outputs))
+        )
+
+    return result, next_offset
+
+
+def _write_int4_payload(
+    destination: BinaryIO,
+    entries: Sequence[_V2ExportEntry],
+    writer: FireWriter,
+) -> None:
+    entries_by_shard: dict[Path, list[_V2ExportEntry]] = defaultdict(list)
+    for entry in entries:
+        entries_by_shard[entry.shard_path].append(entry)
+
+    for shard_path, shard_entries in entries_by_shard.items():
+        with safe_open(shard_path, framework="pt", device="cpu") as handle:
+            for entry in shard_entries:
+                tensor = handle.get_tensor(entry.source_name)
+                if str(tensor.dtype) not in ("torch.bfloat16", "bfloat16"):
+                    raise ExportError(f"payload dtype mismatch for {entry.source_name}")
+                if tuple(tensor.shape) != entry.source_shape:
+                    raise ExportError(f"payload shape mismatch for {entry.source_name}")
+                expected_source_bytes = math.prod(entry.source_shape) * 2
+                if tensor.numel() * tensor.element_size() != expected_source_bytes:
+                    raise ExportError(f"payload byte size mismatch for {entry.source_name}")
+                fp32_tensor = tensor.float().contiguous()
+                fp32 = fp32_tensor.numpy()
+                if len(entry.tensor_infos) == 3:
+                    try:
+                        unpacked, scales, zero_points = quantize_int4_groupwise(
+                            fp32, group_size=INT4_GROUP_SIZE
+                        )
+                    except (TypeError, ValueError) as error:
+                        raise ExportError(
+                            f"cannot quantize {entry.source_name}: {error}"
+                        ) from error
+                    packed = pack_uint4(unpacked)
+                    payloads = (packed, scales, zero_points)
+                else:
+                    payloads = (fp32,)
+                for info, payload in zip(entry.tensor_infos, payloads):
+                    writer.write_tensor(destination, info, payload)
+                    if destination.tell() != info.byte_offset + info.byte_size:
+                        raise ExportError(f"payload position mismatch for {info.name}")
+                del payloads
+                if len(entry.tensor_infos) == 3:
+                    del unpacked, packed, scales, zero_points
+                del fp32
+                del fp32_tensor
+                del tensor
+
+
+def _export_qwen3_int4(source_dir: Path, output_path: Path) -> None:
+    config = _load_config(source_dir)
+    profile = _select_profile(config)
+    descriptor = _build_descriptor(profile)
+    source_index = _build_source_index(source_dir, descriptor)
+    entries, expected_file_size = _build_int4_entries(source_index, descriptor, profile)
+    tensor_infos = [info for entry in entries for info in entry.tensor_infos]
+    writer = FireWriter(version=2)
+    writer.write_header_and_directory(BytesIO(), tensor_infos)
+    print(
+        f"validated {len(entries)} source tensors and {len(tensor_infos)} Fire v2 "
+        f"tensors for {profile.model_id} across {len(source_index.shard_paths)} shard(s)"
+    )
+
+    created = False
+    completed = False
+    try:
+        with output_path.open("xb", buffering=0) as destination:
+            created = True
+            writer.write_header_and_directory(destination, tensor_infos)
+            _write_int4_payload(destination, entries, writer)
+            if destination.tell() != expected_file_size:
+                raise ExportError(
+                    f"final file size mismatch for {output_path}: "
+                    f"expected {expected_file_size}, got {destination.tell()}"
+                )
+        completed = True
+    finally:
+        if created and not completed:
+            try:
+                output_path.unlink()
+            except OSError as cleanup_error:
+                print(
+                    f"warning: failed to remove partial output {output_path}: "
+                    f"{cleanup_error}", file=sys.stderr,
+                )
+
+
+def export_qwen3(
+    source_dir: Path, output_path: Path, *, quantization: str = "none"
+) -> None:
     """Validate and export one supported local Qwen3 checkpoint."""
     if sys.byteorder != "little":
-        raise ExportError("Fire v1 export requires a little-endian host")
+        raise ExportError("Fire export requires a little-endian host")
+    if quantization == "int4":
+        _export_qwen3_int4(source_dir, output_path)
+        return
+    if quantization != "none":
+        raise ExportError(f"unsupported quantization mode: {quantization}")
 
     config = _load_config(source_dir)
     profile = _select_profile(config)
@@ -590,7 +760,7 @@ def export_qwen3(source_dir: Path, output_path: Path) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Export a supported dense Qwen3 checkpoint to Fire v1",
+        description="Export a supported Qwen3 checkpoint to Fire v1 or INT4 Fire v2",
     )
     parser.add_argument("output", type=Path, help="new .fire output path")
     parser.add_argument(
@@ -599,13 +769,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="local Qwen3 checkpoint directory",
     )
+    parser.add_argument(
+        "--quantization", choices=("none", "int4"), default="none",
+        help="none writes FP32 Fire v1; int4 writes group-wise INT4 Fire v2",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        export_qwen3(args.hf, args.output)
+        export_qwen3(args.hf, args.output, quantization=args.quantization)
     except ExportError as error:
         print(f"export failed: {error}", file=sys.stderr)
         return 1

@@ -1,6 +1,6 @@
 # Qwen3 量化路线
 
-状态：设计已确认，尚未实现。当前 `.fire` v1、Qwen3 Loader 和 Linear 仍只执行 FP32，不应把下述目标写成现有能力。
+状态：量化数学、`.fire` v2 Writer/Reader 和 Qwen3 INT4 Exporter 已有合同测试及小型合成导出验证；Qwen3 Loader、量化 Linear、实际 0.6B/8B 模型验收尚未完成。当前不能把“可导出、可读取”写成量化模型可运行。
 
 ## 路线决策
 
@@ -13,10 +13,12 @@
 - 输入分为未量化的 Qwen3 Source Checkpoint 与已量化的官方 AWQ Source Checkpoint。前者由 Fire 离线量化；后者只做格式导入，绝不重新量化已量化投影。两条路径产出相同的 Fire 量化布局。
 - 首版是无需校准语料的 RTN、非对称 UInt4 group-wise weight-only；每个输出行沿输入维 K 分组，`group_size = 128`，反量化为 `scale[o,g] × (q[o,k] - zero[o,g])`，其中 `g = floor(k / 128)`。激活和 KV Cache 保持 FP32；不声称 Fire 自己实现了 AWQ 搜索算法。
 - 所有 Qwen3 Linear 权重（Q/K/V/O、gate/up/down、`lm_head`）量化；Embedding 和 Norm 保持 FP32。量化 Embedding 是第三阶段之后的独立优化；届时再比较 INT4 与较低浮点精度方案，不预先选定算法。
-- 统一物理布局：每个 UInt8 打包两个 UInt4 qweight；每组一个 FP32 scale、一个未打包的 UInt8 zero-point。通用 `Tensor` 只看到字节可寻址的物理 tensor，不引入 0.5 字节元素的 dtype。具体 nibble 顺序、rounding/zero-clamp 边界和 v2 字节编码在实现前由格式合同测试锁定。
+- 统一物理布局：每个 UInt8 打包两个 UInt4 qweight；每组一个 FP32 scale、一个未打包的 UInt8 zero-point。通用 `Tensor` 只看到字节可寻址的物理 tensor，不引入 0.5 字节元素的 dtype。已锁定偶数列位于低 nibble、奇数列位于高 nibble，量化舍入使用 NumPy `rint` 的 ties-to-even；全零组编码为 `q=0, scale=1, zero=0`。
 - `.fire` v2 必须明确保存量化参数关联和 `group_size`；v1 仍只表示 FP32。Qwen3 当前只接受 128，且拒绝 `K % 128 != 0`；Exporter 预检，Loader 防御性复核。模型专用的名称映射、tensor 选择和 profile 校验留在 Qwen3 exporter/loader；量化数学、packing 和 Linear 执行为通用原语。
 - `Qwen3Weights` 中可供 Linear 使用的权重统一用 `op::Parameter` 表示：FP32 路径为 `quant_type=None`，INT4 路径携带 qweight、scales、zero-points 和显式 `group_size`。Embedding/Norm 保持普通 Tensor。同一个 `Qwen3Model`、`Qwen3Block`、`LinearOp` 服务两条路径；`Parameter` 的设备迁移、设备校验必须覆盖所有三个量化数据 tensor。
 - Exporter 从源 safetensors 分片直接流式写出 v2 量化文件，不先生成约 30.5 GiB 的 FP32 8B `.fire`。初期 CPU 路径重在可读的数值基准；CUDA 路径须避免常驻完整 FP32 反量化权重，并记录速度与峰值显存。
+
+`.fire` v2 保留 32 字节 header 和 96 字节目录项，版本号为 2；wire dtype `1=FP32`、`2=UInt8`。目录项最后 6 字节在 v1 全零，在 v2 编码 `quant_kind:u8, group_size:u32 little-endian, reserved:u8`；普通 tensor 六字节全零，INT4 qweight 使用 `quant_kind=1`、`group_size=128`。量化 Linear 以同一前缀的 `.qweight`、`.scales`、`.zero_points` 三条目录项关联；每条 payload 起点四字节对齐，间隙必须填零。v2 Reader 解析通用元数据，Qwen3 Loader 后续还需复核三件套的名称、shape 和 `group_size=128`。
 
 ## 阶段与完成条件
 

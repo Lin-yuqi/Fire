@@ -20,8 +20,10 @@ namespace {
 constexpr size_t _HeaderSize = 32;
 constexpr size_t _TensorInfoSize = 96;
 
-constexpr uint32_t _FormatVersion = 1;
+constexpr uint32_t _FormatVersionV1 = 1;
+constexpr uint32_t _FormatVersionV2 = 2;
 constexpr uint8_t _WireDTypeFp32 = 1;
+constexpr uint8_t _WireDTypeUInt8 = 2;
 
 constexpr char _Magic[] = "FIRECKPT";
 constexpr size_t _HeaderMagicOffset = 0;
@@ -105,7 +107,7 @@ base::Status FireReader::open(const std::string& path) {
 
     if (!is_supported_host()) {
         return base::error::InternalError(
-            "FireReader: Fire v1 requires a 64-bit little-endian host");
+            "FireReader: Fire requires a 64-bit little-endian host");
     }
 
     struct stat file_stat{};
@@ -113,7 +115,7 @@ base::Status FireReader::open(const std::string& path) {
         return base::error::InternalError("FireReader: fstat failed");
 
     if (file_stat.st_size < static_cast<off_t>(_HeaderSize))
-        return base::error::ModelParseError("FireReader: file is smaller than Fire v1 header");
+        return base::error::ModelParseError("FireReader: file is smaller than Fire header");
 
     const size_t file_sz = static_cast<size_t>(file_stat.st_size);
 
@@ -131,7 +133,7 @@ base::Status FireReader::open(const std::string& path) {
 
     const uint32_t format_version = read_u32_le(data + _HeaderVersionOffset);
 
-    if (format_version != _FormatVersion) {
+    if (format_version != _FormatVersionV1 && format_version != _FormatVersionV2) {
         return base::error::ModelParseError("FireReader: unsupported format version");
     }
 
@@ -222,20 +224,32 @@ base::Status FireReader::open(const std::string& path) {
 
         const uint8_t ndim = *(entry + _TensorNDimOffset);
 
-        // ---------------- padding ----------------
-        for (size_t j = 0; j < 6; ++j) {
-            if (*(entry + _TensorPaddingOffset + j) != 0) {
-                return base::error::ModelParseError("FireReader: tensor info padding must be zero");
-            }
-        }
-
         // ---------------- dtype validation ----------------
         base::DataType dtype = base::DataType::Unknown;
 
         if (wire_dtype == _WireDTypeFp32) {
             dtype = base::DataType::Fp32;
+        } else if (format_version == _FormatVersionV2 && wire_dtype == _WireDTypeUInt8) {
+            dtype = base::DataType::UInt8;
         } else {
             return base::error::ModelParseError("FireReader: unsupported tensor dtype");
+        }
+
+        // V1 reserves all six bytes. V2 uses kind:u8, group_size:u32 LE,
+        // reserved:u8; only the packed qweight carries quantization metadata.
+        const uint8_t wire_quant_kind = *(entry + _TensorPaddingOffset);
+        const uint32_t group_size = read_u32_le(entry + _TensorPaddingOffset + 1);
+        const uint8_t reserved = *(entry + _TensorPaddingOffset + 5);
+        QuantizationKind quantization_kind = QuantizationKind::None;
+        if (format_version == _FormatVersionV1 || wire_quant_kind == 0) {
+            if (wire_quant_kind != 0 || group_size != 0 || reserved != 0) {
+                return base::error::ModelParseError("FireReader: tensor info padding must be zero");
+            }
+        } else if (wire_quant_kind == 1 && dtype == base::DataType::UInt8 &&
+                   group_size != 0 && group_size % 2 == 0 && reserved == 0) {
+            quantization_kind = QuantizationKind::Int4GroupWise;
+        } else {
+            return base::error::ModelParseError("FireReader: invalid quantization metadata");
         }
 
         // ---------------- ndim / shape validation ----------------
@@ -282,12 +296,19 @@ base::Status FireReader::open(const std::string& path) {
             dims.push_back(static_cast<int32_t>(shape1));
         }
 
+        if (quantization_kind == QuantizationKind::Int4GroupWise &&
+            (ndim != 2 || (static_cast<uint64_t>(shape1) * 2) % group_size != 0)) {
+            return base::error::ModelParseError(
+                "FireReader: quantization group_size does not divide logical K");
+        }
+
         // ---------------- byte_size validation ----------------
-        if (element_count > std::numeric_limits<uint64_t>::max() / 4) {
+        const uint64_t element_size = dtype == base::DataType::Fp32 ? 4 : 1;
+        if (element_count > std::numeric_limits<uint64_t>::max() / element_size) {
             return base::error::ModelParseError("FireReader: tensor byte size overflow");
         }
 
-        const uint64_t expected_byte_size = element_count * 4;
+        const uint64_t expected_byte_size = element_count * element_size;
 
         if (byte_size != expected_byte_size) {
             return base::error::ModelParseError(
@@ -305,9 +326,21 @@ base::Status FireReader::open(const std::string& path) {
             return base::error::ModelParseError("FireReader: tensor payload is not 4-byte aligned");
         }
 
-        // ---------------- payload continuity ----------------
-        if (byte_offset != expected_payload_offset) {
-            return base::error::ModelParseError("FireReader: tensor payload is not tightly packed");
+        // V2 allows only the minimal zero-filled gap needed for 4-byte alignment.
+        uint64_t aligned_offset = expected_payload_offset;
+        if (format_version == _FormatVersionV2) {
+            if (aligned_offset > std::numeric_limits<uint64_t>::max() - 3) {
+                return base::error::ModelParseError("FireReader: payload alignment overflow");
+            }
+            aligned_offset = (aligned_offset + 3) & ~uint64_t{3};
+        }
+        if (byte_offset != aligned_offset) {
+            return base::error::ModelParseError("FireReader: tensor payload offset mismatch");
+        }
+        for (uint64_t offset = expected_payload_offset; offset < aligned_offset; ++offset) {
+            if (offset >= file_sz || data[offset] != 0) {
+                return base::error::ModelParseError("FireReader: nonzero payload padding");
+            }
         }
 
         const uint64_t payload_end = byte_offset + byte_size;
@@ -325,6 +358,8 @@ base::Status FireReader::open(const std::string& path) {
         info.dims = std::move(dims);
         info.byte_offset = byte_offset;
         info.byte_size = byte_size;
+        info.quantization_kind = quantization_kind;
+        info.group_size = quantization_kind == QuantizationKind::None ? 0 : group_size;
 
         const size_t index = local_tensors.size();
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from io import BytesIO
 import json
 from pathlib import Path
+import struct
 import sys
 import tempfile
 from typing import Mapping
@@ -466,6 +467,76 @@ class Qwen3PayloadContractTest(unittest.TestCase):
                     export_qwen3.export_qwen3(source_dir, output_path)
 
             self.assertFalse(output_path.exists())
+
+
+class Qwen3V2ExportTest(unittest.TestCase):
+    def test_int4_export_writes_quantized_linears_and_fp32_embedding(self) -> None:
+        profile = export_qwen3._Qwen3Profile(
+            model_id="test/Qwen3-tiny",
+            expected_config={"model_type": "qwen3", "hidden_size": 128},
+            vocab_size=8,
+            hidden_size=128,
+            intermediate_size=128,
+            num_layers=1,
+            num_attention_heads=1,
+            num_kv_heads=1,
+            head_dim=128,
+        )
+        descriptor = export_qwen3._build_descriptor(profile)
+        metadata = _metadata_for(descriptor)
+        tensors = {
+            pattern.source_name: np.zeros(pattern.shape, dtype=np.float32)
+            for pattern in descriptor
+        }
+        q_proj = tensors["model.layers.0.self_attn.q_proj.weight"]
+        q_proj[0, 0] = -2.0
+        q_proj[0, 1] = 1.0
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "source"
+            _write_config(source_dir, profile)
+            source_path = source_dir / "model.safetensors"
+            source_path.touch()
+            output_path = root / "tiny-int4.fire"
+
+            def fake_safe_open(path: Path, *, framework: str, **kwargs: object):
+                self.assertEqual(path, source_path)
+                if framework == "numpy":
+                    return _MetadataHandle(metadata)
+                self.assertEqual((framework, kwargs), ("pt", {"device": "cpu"}))
+                return _PayloadHandle(tensors)
+
+            with mock.patch.object(export_qwen3, "SUPPORTED_PROFILES", (profile,)), mock.patch.object(
+                export_qwen3, "safe_open", side_effect=fake_safe_open
+            ):
+                export_qwen3.export_qwen3(source_dir, output_path, quantization="int4")
+
+            wire = output_path.read_bytes()
+
+        magic, version, count, directory_offset, data_offset = struct.unpack_from(
+            "<8sIIQQ", wire
+        )
+        self.assertEqual((magic, version, count, directory_offset, data_offset),
+                         (b"FIRECKPT", 2, 30, 32, 2912))
+
+        records = {}
+        for index in range(count):
+            offset = 32 + index * 96
+            name = wire[offset:offset + 64].split(b"\0", 1)[0].decode("ascii")
+            records[name] = struct.unpack_from("<QQIIBB6s", wire, offset + 64)
+
+        self.assertEqual(records["tok_embeddings.weight"][4], 1)
+        self.assertNotIn("layers.0.attention.wq.weight", records)
+        qweight = records["layers.0.attention.wq.qweight"]
+        scales = records["layers.0.attention.wq.scales"]
+        zeros = records["layers.0.attention.wq.zero_points"]
+        self.assertEqual(qweight[2:6], (128, 64, 2, 2))
+        self.assertEqual(qweight[6], b"\x01\x80\x00\x00\x00\x00")
+        self.assertEqual(scales[2:6], (128, 1, 1, 2))
+        self.assertEqual(zeros[2:6], (128, 1, 2, 2))
+        self.assertEqual(wire[qweight[0]], 0xF0)
+        self.assertAlmostEqual(struct.unpack_from("<f", wire, scales[0])[0], 3 / 15)
 
 
 if __name__ == "__main__":
