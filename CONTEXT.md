@@ -35,3 +35,19 @@ _Avoid_: ModelLoader、模型解析器
 **ModelLoader**:
 认识具体 Model Profile、取得所需具名 tensor 并将其绑定到 Fire 模型结构的加载模块。
 _Avoid_: FireReader、格式解析器
+
+**Fire Quantization**:
+将未量化的 Source Checkpoint 离线转换为 Fire 量化表示的过程，不包括对已量化 checkpoint 的再量化。
+_Avoid_: AWQ 导入、量化推理
+
+**Weight-only Quantization**:
+仅以低比特表示模型权重，激活值保持原有浮点表示的量化边界。
+_Avoid_: 全量化、激活量化
+
+**Canonical Quantized Layout**:
+Fire 量化执行路径统一使用的权重、scale 和 zero-point 表示；外部量化格式必须先转换到该表示。
+_Avoid_: Source Checkpoint 布局、AWQ 原生布局
+
+**AWQ Compatibility**:
+官方 AWQ Source Checkpoint 能被导入为 Canonical Quantized Layout，并达到 Model Support；不表示 Runtime 直接执行 AWQ 原生布局。
+_Avoid_: Fire Quantization、AWQ 原生执行
