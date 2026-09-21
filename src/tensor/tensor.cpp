@@ -22,9 +22,11 @@ namespace tensor {
         switch(dtype){
             case base::DataType::Fp32:
                 return 4;
-            case base::DataType::int32:
+            case base::DataType::Int32:
                 return 4;
-            case base::DataType::int8:
+            case base::DataType::Int8:
+                return 1;
+            case base::DataType::UInt8:
                 return 1;
             default:
                 LOG(FATAL) << "Unsupported data type: " << static_cast<int>(dtype);

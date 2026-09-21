@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Fire/model/model.h"
+#include "Fire/op/operator.h"
 #include "Fire/tensor/tensor.h"
 
 #include <cstddef>
@@ -126,20 +127,25 @@ static_assert(Qwen3_8B.q_dim() == Qwen3_8B.hidden_size);
 
 } // namespace qwen3_profiles
 
-// Current .fire v1 Qwen3 assembly tensors are FP32 in exported row-major
-// layout. q_dim is explicit because 0.6B has q_dim=2048 and hidden_size=1024.
+// Linear Parameter fields carry either FP32 weights or future packed weights;
+// the dimensions below are logical [out_features, in_features] shapes. The
+// current .fire v1 loader fills FP32 data in exported row-major layout.
+// q_dim is explicit because 0.6B has q_dim=2048 and hidden_size=1024.
 struct Qwen3LayerWeights {
     tensor::Tensor attention_norm; // [hidden_size]
-    tensor::Tensor wq;             // [q_dim, hidden_size]
-    tensor::Tensor wk;             // [kv_dim, hidden_size]
-    tensor::Tensor wv;             // [kv_dim, hidden_size]
-    tensor::Tensor wo;             // [hidden_size, q_dim]
+
+    op::Parameter wq; // [q_dim, hidden_size]
+    op::Parameter wk; // [kv_dim, hidden_size]
+    op::Parameter wv; // [kv_dim, hidden_size]
+    op::Parameter wo; // [hidden_size, q_dim]
+
     tensor::Tensor q_norm;         // [head_dim]
     tensor::Tensor k_norm;         // [head_dim]
     tensor::Tensor ffn_norm;       // [hidden_size]
-    tensor::Tensor w1;             // gate: [intermediate_size, hidden_size]
-    tensor::Tensor w2;             // down: [hidden_size, intermediate_size]
-    tensor::Tensor w3;             // up: [intermediate_size, hidden_size]
+
+    op::Parameter w1; // gate: [intermediate_size, hidden_size]
+    op::Parameter w2; // down: [hidden_size, intermediate_size]
+    op::Parameter w3; // up: [intermediate_size, hidden_size]
 };
 
 // Loader result and Qwen3Model assembly input. Carrying the selected profile
@@ -148,8 +154,8 @@ struct Qwen3Weights {
     Qwen3Profile profile{};
     tensor::Tensor embedding; // [vocab_size, hidden_size]
     std::vector<Qwen3LayerWeights> layers;
-    tensor::Tensor norm;   // [hidden_size]
-    tensor::Tensor output; // [vocab_size, hidden_size]
+    tensor::Tensor norm;  // [hidden_size]
+    op::Parameter output; // lm_head, logical [vocab_size, hidden_size]
 };
 
 } // namespace model

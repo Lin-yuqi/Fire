@@ -6,9 +6,9 @@
 #include <string>
 #include <Fire/tensor/tensor.h>
 // -----------------op begin--------------------
-namespace op{
+namespace op {
 
-enum class OpType:uint8_t{
+enum class OpType : uint8_t {
     Unknown = 0,
     Linear,
     Encode,
@@ -30,7 +30,6 @@ enum class QuantType : uint8_t {
     Int4GroupWise,
 };
 
-
 struct QuantConfig {
     QuantType _quant_type = QuantType::None;
 
@@ -41,7 +40,6 @@ struct QuantConfig {
     bool _symmetric = true;
 };
 
-
 struct Parameter {
     tensor::Tensor _data;
 
@@ -51,19 +49,24 @@ struct Parameter {
 
     tensor::Tensor _zero_points;
 
-    bool is_quantized() const {
-        return _quant_config._quant_type != QuantType::None;
-    }
+    bool is_quantized() const { return _quant_config._quant_type != QuantType::None; }
 
-    void to_cuda(){
+    void to_cuda() {
         _data.to_cuda();
+        if (!_scales.is_empty())
+            _scales.to_cuda();
+        if (!_zero_points.is_empty())
+            _zero_points.to_cuda();
     }
 
-    void to_cpu(){
+    void to_cpu() {
         _data.to_cpu();
+        if (!_scales.is_empty())
+            _scales.to_cpu();
+        if (!_zero_points.is_empty())
+            _zero_points.to_cpu();
     }
 };
-
 
 /**
  * 一次算子执行所需要的运行时环境。
@@ -81,13 +84,12 @@ struct OpContext {
     size_t _workspace_size = 0;
 };
 
-
 /**
  * 所有 Operator 的基类。
  */
 class Operator {
-public:
-    explicit Operator(OpType type,std::string name = "");
+  public:
+    explicit Operator(OpType type, std::string name = "");
 
     virtual ~Operator() = default;
 
@@ -97,27 +99,25 @@ public:
     Operator(Operator&&) = default;
     Operator& operator=(Operator&&) = default;
 
-public:
+  public:
     OpType type() const;
 
     const std::string& name() const;
 
     void set_name(const std::string& name);
 
-protected:
+  protected:
     base::Status _check_tensor(const tensor::Tensor& tensor, base::DeviceType device_type,
-                            base::DataType data_type) const;
+                               base::DataType data_type) const;
     base::Status _check_tensor_with_dim(const tensor::Tensor& tensor, base::DeviceType device_type,
-                                     base::DataType data_type, std::initializer_list<int32_t>expected_dims) const;
+                                        base::DataType data_type,
+                                        std::initializer_list<int32_t> expected_dims) const;
 
-
-
-protected:
+  protected:
     OpType _type = OpType::Unknown;
 
     std::string _name;
 };
-
 
 /**
  * 带模型参数的 Operator。
@@ -130,7 +130,7 @@ protected:
  *
  */
 class ParamOperator : public Operator {
-public:
+  public:
     using Operator::Operator;
 
     virtual ~ParamOperator() = default;
@@ -140,7 +140,7 @@ public:
     ParamOperator(ParamOperator&&) = default;
     ParamOperator& operator=(ParamOperator&&) = default;
 
-public:
+  public:
     size_t param_size() const;
 
     void reset_param_size(size_t size);
@@ -149,14 +149,15 @@ public:
 
     const Parameter& get_param(size_t idx) const;
 
-    void set_param(size_t idx,const Parameter& param);
+    void set_param(size_t idx, const Parameter& param);
 
-    void set_param(size_t idx,const tensor::Tensor& data);
+    // Replace with a plain tensor, clearing any previous quantization metadata.
+    void set_param(size_t idx, const tensor::Tensor& data);
 
     void to_cuda();
-protected:
+
+  protected:
     std::vector<Parameter> _params;
 };
 
-
-}// ----------------op end----------------------
+} // namespace op

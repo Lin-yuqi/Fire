@@ -72,7 +72,9 @@ void ParamOperator::set_param(size_t idx, const Parameter& param) {
 
 void ParamOperator::set_param(size_t idx, const tensor::Tensor& data) {
     CHECK_LT(idx, _params.size());
-    _params[idx]._data = data;
+    Parameter replacement;
+    replacement._data = data;
+    _params[idx] = std::move(replacement);
 }
 
 void ParamOperator::to_cuda() {

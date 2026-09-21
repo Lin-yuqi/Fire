@@ -15,7 +15,11 @@ namespace {
 bool parameters_match_device(const op::ParamOperator& operation,
                              base::DeviceType device_type) {
     for (size_t index = 0; index < operation.param_size(); ++index) {
-        if (operation.get_param(index)._data.device_type() != device_type) {
+        const auto& parameter = operation.get_param(index);
+        if (parameter._data.device_type() != device_type ||
+            (!parameter._scales.is_empty() && parameter._scales.device_type() != device_type) ||
+            (!parameter._zero_points.is_empty() &&
+             parameter._zero_points.device_type() != device_type)) {
             return false;
         }
     }
@@ -101,7 +105,7 @@ base::Status Qwen3Model::prepare(int32_t capacity, const op::OpContext& context)
 
     auto runtime = std::make_unique<Qwen3Runtime>();
     auto allocator = context._allocator;
-    runtime->token = tensor::Tensor(base::DataType::int32, {1}, allocator);
+    runtime->token = tensor::Tensor(base::DataType::Int32, {1}, allocator);
     runtime->hidden = tensor::Tensor(base::DataType::Fp32, {_profile.hidden_size}, allocator);
     runtime->block_output =
         tensor::Tensor(base::DataType::Fp32, {_profile.hidden_size}, allocator);

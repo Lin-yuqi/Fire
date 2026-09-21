@@ -88,7 +88,7 @@ base::Status TinyLlamaModel::prepare(int32_t capacity, const op::OpContext& cont
     // 4. 给所有 Tensor 分配空间
 
     // token input
-    runtime->token = tensor::Tensor(base::DataType::int32, {1}, alloc);
+    runtime->token = tensor::Tensor(base::DataType::Int32, {1}, alloc);
 
     // hidden states
     runtime->hidden = tensor::Tensor(base::DataType::Fp32, {TinyLlamaProfile::hidden_size}, alloc);

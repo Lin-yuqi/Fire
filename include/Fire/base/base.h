@@ -28,11 +28,13 @@ protected:
     NoCopyable& operator=(const NoCopyable&) = delete;
 };
 
+// In-memory tensor dtypes; .fire wire dtype values are mapped explicitly by FireReader.
 enum class DataType{
     Unknown=0,
     Fp32,
-    int8,
-    int32
+    Int8,
+    Int32,
+    UInt8,
 };
 
 enum StatusCode : uint8_t {

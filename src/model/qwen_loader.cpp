@@ -71,22 +71,22 @@ base::Status Qwen3Loader::load_weights(Qwen3Weights& output_weights) const {
             return status;
         }
         status = load_tensor(prefix + ".attention.wq.weight",
-                             {_profile.q_dim(), _profile.hidden_size}, layer.wq);
+                             {_profile.q_dim(), _profile.hidden_size}, layer.wq._data);
         if (!status) {
             return status;
         }
         status = load_tensor(prefix + ".attention.wk.weight",
-                             {_profile.kv_dim(), _profile.hidden_size}, layer.wk);
+                             {_profile.kv_dim(), _profile.hidden_size}, layer.wk._data);
         if (!status) {
             return status;
         }
         status = load_tensor(prefix + ".attention.wv.weight",
-                             {_profile.kv_dim(), _profile.hidden_size}, layer.wv);
+                             {_profile.kv_dim(), _profile.hidden_size}, layer.wv._data);
         if (!status) {
             return status;
         }
         status = load_tensor(prefix + ".attention.wo.weight",
-                             {_profile.hidden_size, _profile.q_dim()}, layer.wo);
+                             {_profile.hidden_size, _profile.q_dim()}, layer.wo._data);
         if (!status) {
             return status;
         }
@@ -106,17 +106,17 @@ base::Status Qwen3Loader::load_weights(Qwen3Weights& output_weights) const {
             return status;
         }
         status = load_tensor(prefix + ".feed_forward.w1.weight",
-                             {_profile.intermediate_size, _profile.hidden_size}, layer.w1);
+                             {_profile.intermediate_size, _profile.hidden_size}, layer.w1._data);
         if (!status) {
             return status;
         }
         status = load_tensor(prefix + ".feed_forward.w2.weight",
-                             {_profile.hidden_size, _profile.intermediate_size}, layer.w2);
+                             {_profile.hidden_size, _profile.intermediate_size}, layer.w2._data);
         if (!status) {
             return status;
         }
         status = load_tensor(prefix + ".feed_forward.w3.weight",
-                             {_profile.intermediate_size, _profile.hidden_size}, layer.w3);
+                             {_profile.intermediate_size, _profile.hidden_size}, layer.w3._data);
         if (!status) {
             return status;
         }
@@ -127,7 +127,7 @@ base::Status Qwen3Loader::load_weights(Qwen3Weights& output_weights) const {
         return status;
     }
     status = load_tensor("output.weight", {_profile.model.vocab_size, _profile.hidden_size},
-                         weights.output);
+                         weights.output._data);
     if (!status) {
         return status;
     }

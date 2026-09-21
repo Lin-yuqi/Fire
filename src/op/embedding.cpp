@@ -31,7 +31,7 @@ base::Status EmbeddingOp::_check(const tensor::Tensor& tokens, tensor::Tensor& e
         return base::error::InvalidArgument("embedding does not support quantized weights");
     }
 
-    auto status = _check_tensor(tokens, device_type, base::DataType::int32);
+    auto status = _check_tensor(tokens, device_type, base::DataType::Int32);
     if (!status) {
         return status;
     }

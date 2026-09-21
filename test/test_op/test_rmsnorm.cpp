@@ -129,7 +129,7 @@ TEST(rmsnorm_test, rejects_invalid_parameters_and_tensors) {
     auto wrong_shape_output = cpu_tensor({4, 2});
     EXPECT_EQ(rmsnorm.forward(input, wrong_shape_output, context).code(), base::InvalidArgument);
 
-    auto wrong_type_output = cpu_tensor({8}, base::DataType::int32);
+    auto wrong_type_output = cpu_tensor({8}, base::DataType::Int32);
     EXPECT_EQ(rmsnorm.forward(input, wrong_type_output, context).code(), base::InvalidArgument);
 
     context._device_type = base::DeviceType::Unknown;

@@ -118,7 +118,7 @@ TEST(swiglu_test, rejects_invalid_tensor_in_each_position) {
                 invalid = cpu_tensor({3, 2});
                 break;
             case 3:
-                invalid = cpu_tensor({2, 3}, base::DataType::int32);
+                invalid = cpu_tensor({2, 3}, base::DataType::Int32);
                 break;
             }
 

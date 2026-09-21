@@ -78,7 +78,7 @@ TEST(embedding_test, cpu_forward_selects_rows_in_token_order) {
     const auto weight_values = make_weight_values(vocab_size, embedding_dim);
 
     auto tokens = cpu_tensor({static_cast<int32_t>(token_values.size())},
-                             base::DataType::int32);
+                             base::DataType::Int32);
     auto weight = cpu_tensor({vocab_size, embedding_dim});
     auto output = cpu_tensor({static_cast<int32_t>(token_values.size()), embedding_dim});
     std::copy(token_values.begin(), token_values.end(), tokens.ptr<int32_t>());
@@ -103,7 +103,7 @@ TEST(embedding_test, cpu_forward_accepts_one_dimensional_single_token_output) {
     const std::vector<int32_t> token_values = {2};
     const auto weight_values = make_weight_values(vocab_size, embedding_dim);
 
-    auto tokens = cpu_tensor({1}, base::DataType::int32);
+    auto tokens = cpu_tensor({1}, base::DataType::Int32);
     auto weight = cpu_tensor({vocab_size, embedding_dim});
     auto output = cpu_tensor({embedding_dim});
     tokens.ptr<int32_t>()[0] = token_values[0];
@@ -120,7 +120,7 @@ TEST(embedding_test, cpu_forward_accepts_one_dimensional_single_token_output) {
 }
 
 TEST(embedding_test, rejects_invalid_parameters_and_tensors) {
-    auto tokens = cpu_tensor({2}, base::DataType::int32);
+    auto tokens = cpu_tensor({2}, base::DataType::Int32);
     auto weight = cpu_tensor({4, 3});
     auto output = cpu_tensor({2, 3});
     op::EmbeddingOp embedding;
@@ -140,11 +140,11 @@ TEST(embedding_test, rejects_invalid_parameters_and_tensors) {
     EXPECT_EQ(embedding.forward(wrong_token_type, output, cpu_context()).code(),
               base::InvalidArgument);
 
-    auto wrong_output_type = cpu_tensor({2, 3}, base::DataType::int32);
+    auto wrong_output_type = cpu_tensor({2, 3}, base::DataType::Int32);
     EXPECT_EQ(embedding.forward(tokens, wrong_output_type, cpu_context()).code(),
               base::InvalidArgument);
 
-    embedding.set_param(0, cpu_tensor({4, 3}, base::DataType::int32));
+    embedding.set_param(0, cpu_tensor({4, 3}, base::DataType::Int32));
     EXPECT_EQ(embedding.forward(tokens, output, cpu_context()).code(), base::InvalidArgument);
 
     embedding.set_param(0, cpu_tensor({12}));
@@ -195,7 +195,7 @@ TEST_F(EmbeddingCudaTest, forward_handles_unaligned_rows_and_scalar_tail) {
     std::vector<float> output_values(token_values.size() * embedding_dim);
 
     auto allocator = base::GPUAllocatorFactory::get_instance();
-    tensor::Tensor tokens(base::DataType::int32,
+    tensor::Tensor tokens(base::DataType::Int32,
                           {static_cast<int32_t>(token_values.size())}, allocator);
     tensor::Tensor weight(base::DataType::Fp32, {vocab_size, embedding_dim}, allocator);
     tensor::Tensor output(

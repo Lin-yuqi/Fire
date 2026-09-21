@@ -260,7 +260,7 @@ TEST(mha_test, rejects_invalid_tensors_shapes_indices_and_context) {
                                                 cpu_tensor({2, 5, 2, 3}), cpu_tensor({4, 5}),
                                                 cpu_tensor({4, 3})};
         const auto dims = tensors[position].dims();
-        tensors[position] = cpu_tensor(dims, base::DataType::int32);
+        tensors[position] = cpu_tensor(dims, base::DataType::Int32);
         EXPECT_EQ(mha.forward(tensors[0], tensors[1], tensors[2], tensors[3], tensors[4], 0, 0,
                               context)
                       .code(),

@@ -67,7 +67,7 @@ TEST(op_test, metadata_and_validation) {
               base::InvalidArgument);
     EXPECT_EQ(operation._check_tensor(tensor, base::DeviceType::GPU, base::DataType::Fp32).code(),
               base::InvalidArgument);
-    EXPECT_EQ(operation._check_tensor(tensor, base::DeviceType::CPU, base::DataType::int32).code(),
+    EXPECT_EQ(operation._check_tensor(tensor, base::DeviceType::CPU, base::DataType::Int32).code(),
               base::InvalidArgument);
     EXPECT_TRUE(
         operation
@@ -106,6 +106,65 @@ TEST(op_test, parameter_storage_and_resize) {
     EXPECT_FLOAT_EQ(read_only.get_param(0)._data.ptr<float>()[0], 7.f);
     operation.reset_param_size(0);
     EXPECT_EQ(operation.param_size(), 0u);
+}
+
+TEST(op_test, setting_plain_tensor_replaces_quantized_parameter) {
+    op::ParamOperator operation(op::OpType::Linear);
+    operation.reset_param_size(1);
+
+    op::Parameter quantized;
+    quantized._data = cpu_tensor({2}, base::DataType::UInt8);
+    quantized._scales = cpu_tensor({1});
+    quantized._zero_points = cpu_tensor({1}, base::DataType::UInt8);
+    quantized._quant_config._quant_type = op::QuantType::Int4GroupWise;
+    quantized._quant_config._group_size = 128;
+    quantized._quant_config._symmetric = false;
+    operation.set_param(0, quantized);
+    ASSERT_TRUE(operation.get_param(0).is_quantized());
+
+    auto plain = cpu_tensor({2});
+    operation.set_param(0, plain);
+    const auto& replacement = operation.get_param(0);
+    EXPECT_FALSE(replacement.is_quantized());
+    EXPECT_EQ(replacement._quant_config._group_size, 0);
+    EXPECT_TRUE(replacement._quant_config._symmetric);
+    EXPECT_TRUE(replacement._scales.is_empty());
+    EXPECT_TRUE(replacement._zero_points.is_empty());
+    EXPECT_EQ(replacement._data.ptr<float>(), plain.ptr<float>());
+}
+
+TEST(op_test, parameter_transfer_moves_quantized_auxiliary_tensors) {
+    int count = 0;
+    const auto error = cudaGetDeviceCount(&count);
+    if (error != cudaSuccess || count == 0) {
+        GTEST_SKIP() << "CUDA unavailable: " << cudaGetErrorString(error);
+    }
+
+    op::ParamOperator operation(op::OpType::Linear);
+    operation.reset_param_size(1);
+    op::Parameter quantized;
+    quantized._data = cpu_tensor({2}, base::DataType::UInt8);
+    quantized._scales = cpu_tensor({1});
+    quantized._zero_points = cpu_tensor({1}, base::DataType::UInt8);
+    quantized._data.ptr<uint8_t>()[0] = 0x21;
+    quantized._data.ptr<uint8_t>()[1] = 0x43;
+    quantized._scales.ptr<float>()[0] = 0.25f;
+    quantized._zero_points.ptr<uint8_t>()[0] = 7;
+    quantized._quant_config._quant_type = op::QuantType::Int4GroupWise;
+    operation.set_param(0, quantized);
+
+    operation.to_cuda();
+    const auto& on_gpu = operation.get_param(0);
+    EXPECT_EQ(on_gpu._data.device_type(), base::DeviceType::GPU);
+    EXPECT_EQ(on_gpu._scales.device_type(), base::DeviceType::GPU);
+    EXPECT_EQ(on_gpu._zero_points.device_type(), base::DeviceType::GPU);
+
+    operation.get_param(0).to_cpu();
+    const auto& on_cpu = operation.get_param(0);
+    EXPECT_EQ(on_cpu._data.ptr<uint8_t>()[0], 0x21);
+    EXPECT_EQ(on_cpu._data.ptr<uint8_t>()[1], 0x43);
+    EXPECT_FLOAT_EQ(on_cpu._scales.ptr<float>()[0], 0.25f);
+    EXPECT_EQ(on_cpu._zero_points.ptr<uint8_t>()[0], 7);
 }
 
 TEST(op_death_test, parameter_index_out_of_range) {
@@ -178,7 +237,7 @@ TEST(add_test, rejects_invalid_tensor_in_each_position) {
                 invalid = cpu_tensor({3, 2});
                 break;
             case 3:
-                invalid = cpu_tensor({2, 3}, base::DataType::int32);
+                invalid = cpu_tensor({2, 3}, base::DataType::Int32);
                 break;
             case 4:
                 invalid.set_device_type(base::DeviceType::GPU);

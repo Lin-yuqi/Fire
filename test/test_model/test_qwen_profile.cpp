@@ -82,6 +82,11 @@ TEST(Qwen3ModelTest, CpuForwardTwoTokensProducesFiniteLogitsAndAdvancesCache) {
     model::Qwen3Weights weights;
     status = loader.load_weights(weights);
     ASSERT_TRUE(status.ok()) << status.message();
+    EXPECT_FALSE(weights.layers.front().wq.is_quantized());
+    EXPECT_EQ(weights.layers.front().wq._data.data_type(), base::DataType::Fp32);
+    EXPECT_TRUE(weights.layers.front().wq._scales.is_empty());
+    EXPECT_TRUE(weights.layers.front().wq._zero_points.is_empty());
+    EXPECT_FALSE(weights.output.is_quantized());
 
     op::OpContext context;
     context._device_type = base::DeviceType::CPU;
