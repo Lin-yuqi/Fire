@@ -6,13 +6,175 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
+#include <unistd.h>
+
+namespace {
+
+model::Qwen3Profile SmallQwenProfile() {
+    return {{"test/Qwen3", 128, 128}, 128, 128, 1, 1, 1, 128, 1e-6f, 10000.0f, false};
+}
+
+void WriteU32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
+    for (size_t index = 0; index < 4; ++index) {
+        bytes[offset + index] = static_cast<uint8_t>(value >> (8 * index));
+    }
+}
+
+void WriteU64(std::vector<uint8_t>& bytes, size_t offset, uint64_t value) {
+    for (size_t index = 0; index < 8; ++index) {
+        bytes[offset + index] = static_cast<uint8_t>(value >> (8 * index));
+    }
+}
+
+std::vector<uint8_t> SmallQwenFixture(bool quantized, bool wrong_group = false) {
+    struct Entry {
+        std::string name;
+        uint8_t dtype;
+        std::vector<int32_t> dims;
+        uint32_t group_size = 0;
+    };
+    std::vector<Entry> entries;
+    const auto add_plain = [&](std::string name, std::vector<int32_t> dims) {
+        entries.push_back({std::move(name), 1, std::move(dims)});
+    };
+    const auto add_linear = [&](std::string name, int32_t rows, int32_t columns) {
+        if (!quantized) {
+            add_plain(std::move(name), {rows, columns});
+            return;
+        }
+        const std::string prefix = name.substr(0, name.size() - 7); // remove .weight
+        entries.push_back({prefix + ".qweight", 2, {rows, columns / 2},
+                           static_cast<uint32_t>(wrong_group ? 64 : 128)});
+        entries.push_back({prefix + ".scales", 1, {rows, columns / 128}});
+        entries.push_back({prefix + ".zero_points", 2, {rows, columns / 128}});
+    };
+
+    add_plain("tok_embeddings.weight", {128, 128});
+    add_plain("layers.0.attention_norm.weight", {128});
+    add_linear("layers.0.attention.wq.weight", 128, 128);
+    add_linear("layers.0.attention.wk.weight", 128, 128);
+    add_linear("layers.0.attention.wv.weight", 128, 128);
+    add_linear("layers.0.attention.wo.weight", 128, 128);
+    add_plain("layers.0.attention.q_norm.weight", {128});
+    add_plain("layers.0.attention.k_norm.weight", {128});
+    add_plain("layers.0.ffn_norm.weight", {128});
+    add_linear("layers.0.feed_forward.w1.weight", 128, 128);
+    add_linear("layers.0.feed_forward.w2.weight", 128, 128);
+    add_linear("layers.0.feed_forward.w3.weight", 128, 128);
+    add_plain("norm.weight", {128});
+    add_linear("output.weight", 128, 128);
+
+    std::vector<uint8_t> bytes(32 + entries.size() * 96, 0);
+    std::memcpy(bytes.data(), "FIRECKPT", 8);
+    WriteU32(bytes, 8, quantized ? 2 : 1);
+    WriteU32(bytes, 12, static_cast<uint32_t>(entries.size()));
+    WriteU64(bytes, 16, 32);
+    WriteU64(bytes, 24, bytes.size());
+    for (size_t index = 0; index < entries.size(); ++index) {
+        const auto& entry = entries[index];
+        bytes.resize((bytes.size() + 3) & ~size_t{3}, 0);
+        const size_t offset = 32 + index * 96;
+        std::memcpy(bytes.data() + offset, entry.name.data(), entry.name.size());
+        const size_t elements = static_cast<size_t>(entry.dims[0]) *
+                                (entry.dims.size() == 2 ? entry.dims[1] : 1);
+        const size_t size = elements * (entry.dtype == 1 ? 4 : 1);
+        WriteU64(bytes, offset + 64, bytes.size());
+        WriteU64(bytes, offset + 72, size);
+        WriteU32(bytes, offset + 80, entry.dims[0]);
+        WriteU32(bytes, offset + 84, entry.dims.size() == 2 ? entry.dims[1] : 0);
+        bytes[offset + 88] = entry.dtype;
+        bytes[offset + 89] = static_cast<uint8_t>(entry.dims.size());
+        if (entry.group_size != 0) {
+            bytes[offset + 90] = 1;
+            WriteU32(bytes, offset + 91, entry.group_size);
+        }
+        bytes.resize(bytes.size() + size, 0);
+    }
+    return bytes;
+}
+
+class TemporaryQwenFile {
+  public:
+    explicit TemporaryQwenFile(const std::vector<uint8_t>& bytes) {
+        std::array<char, 32> pattern{};
+        std::memcpy(pattern.data(), "/tmp/qwen_loader_XXXXXX", 24);
+        const int descriptor = ::mkstemp(pattern.data());
+        if (descriptor < 0) {
+            throw std::runtime_error("mkstemp failed");
+        }
+        ::close(descriptor);
+        _path = pattern.data();
+        std::ofstream output(_path, std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char*>(bytes.data()),
+                     static_cast<std::streamsize>(bytes.size()));
+        if (!output) {
+            throw std::runtime_error("failed to write Qwen3 fixture");
+        }
+    }
+
+    ~TemporaryQwenFile() { std::remove(_path.c_str()); }
+    const std::string& path() const { return _path; }
+
+  private:
+    std::string _path;
+};
+
+} // namespace
+
+TEST(Qwen3LoaderTest, LoadsFp32AndInt4Parameters) {
+    const auto profile = SmallQwenProfile();
+    for (const bool quantized : {false, true}) {
+        TemporaryQwenFile file(SmallQwenFixture(quantized));
+        model::Qwen3Loader loader(profile);
+        auto status = loader.open(file.path());
+        ASSERT_TRUE(status.ok()) << status.message();
+        model::Qwen3Weights weights;
+        status = loader.load_weights(weights);
+        ASSERT_TRUE(status.ok()) << status.message();
+
+        const auto& weight = weights.layers.front().wq;
+        EXPECT_EQ(weight.is_quantized(), quantized);
+        EXPECT_EQ(weight._data.data_type(),
+                  quantized ? base::DataType::UInt8 : base::DataType::Fp32);
+        EXPECT_EQ(weight._data.dims(), (std::vector<int32_t>{128, quantized ? 64 : 128}));
+        EXPECT_EQ(weight._scales.is_empty(), !quantized);
+        EXPECT_EQ(weight._zero_points.is_empty(), !quantized);
+        EXPECT_EQ(weights.output.is_quantized(), quantized);
+        if (quantized) {
+            EXPECT_EQ(weight._scales.dims(), (std::vector<int32_t>{128, 1}));
+            EXPECT_EQ(weight._zero_points.dims(), (std::vector<int32_t>{128, 1}));
+            EXPECT_EQ(weight._quant_config._quant_type, op::QuantType::Int4GroupWise);
+            EXPECT_EQ(weight._quant_config._group_size, 128);
+            EXPECT_FALSE(weight._quant_config._symmetric);
+        }
+    }
+}
+
+TEST(Qwen3LoaderTest, RejectsUnsupportedInt4GroupSize) {
+    TemporaryQwenFile file(SmallQwenFixture(true, true));
+    model::Qwen3Loader loader(SmallQwenProfile());
+    auto status = loader.open(file.path());
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    model::Qwen3Weights weights;
+    status = loader.load_weights(weights);
+    EXPECT_EQ(status.code(), base::StatusCode::ModelParseError);
+    EXPECT_TRUE(weights.layers.empty());
+}
 TEST(Qwen3ProfileTest, PresetsKeepArchitectureDifferencesInData) {
     const auto& small = model::qwen3_profiles::Qwen3_0_6B;
     const auto& large = model::qwen3_profiles::Qwen3_8B;

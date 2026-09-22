@@ -3,6 +3,7 @@
 #include "Fire/base/base.h"
 #include "Fire/model/fire_reader.h"
 #include "Fire/model/model_weights.h"
+#include "Fire/op/operator.h"
 
 #include <string>
 #include <vector>
@@ -22,12 +23,15 @@ class Qwen3Loader {
     // shares ownership of the file mapping.
     base::Status loader_tensor(const std::string& name, tensor::Tensor& output_tensor) const;
 
-    // Validates the complete canonical FP32 profile before publishing output.
+    // Validates the complete canonical FP32 or INT4 profile before publishing output.
     base::Status load_weights(Qwen3Weights& output_weights) const;
 
   private:
     base::Status load_tensor(const std::string& name, const std::vector<int32_t>& expected_dims,
                              tensor::Tensor& output_tensor) const;
+
+    base::Status load_tensor(const std::string& name, const std::vector<int32_t>& expected_dims,
+                             op::Parameter& output_parameter) const;
 
     Qwen3Profile _profile;
     FireReader _reader;
