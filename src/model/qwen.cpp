@@ -1,6 +1,5 @@
 #include "Fire/model/qwen.h"
 
-#include "Fire/base/alloc.h"
 #include "Fire/base/base.h"
 #include "../op/kernels/kernels_interface.h"
 

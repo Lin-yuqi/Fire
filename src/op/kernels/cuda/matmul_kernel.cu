@@ -1,4 +1,5 @@
 #include "matmul_kernel.cuh"
+#include <cstdint>
 namespace kernel {
 /*简单实现，一个线程搬运一个数据*/
 // __global__ void matmul_kernel_cu_fp32(const float* input1, const float* input2, float scale,
@@ -101,7 +102,6 @@ void matmul_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& input2
     const int M = input2.get_dim(0);
     CHECK_EQ(input2.get_dim(1), K);
 
-    ;
     constexpr int thread_size = 16;
     dim3 threads(thread_size, thread_size);
     dim3 blocks((M + thread_size - 1) / thread_size, (N + thread_size - 1) / thread_size);
@@ -113,6 +113,72 @@ void matmul_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& input2
         matmul_kernel_cu_fp32<16><<<blocks, threads>>>(input1.ptr<float>(), input2.ptr<float>(),
                                                        scale, output.ptr<float>(), N, M, K);
     }
+}
+
+// 不就是matmul吗？先实现简单的，一个元素一个线程
+__global__ void matmul_quant_int4_fp32_naive(const float* input, const uint8_t* qweight,
+                                       const float* scales, const uint8_t* zero_points,
+                                       float* output, int N, int M, int K, int group_size) {
+    const int m = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m >= M || n >= N)
+        return;
+
+    const int pack_k = K / 2;
+    const int group_per_row = K / group_size;
+    float sum = 0.0f;
+
+    for (int k = 0; k < K; k++) {
+        const uint8_t packd = qweight[m * pack_k + k / 2];
+        const int q = (k & 1) ? (packd >> 4) : (packd & 0x0f);
+
+        const int group = k / group_size;
+        const int metadata_idx = m * group_per_row + group;
+        const float weight =
+            (q - static_cast<int>(zero_points[metadata_idx])) * scales[metadata_idx];
+
+        sum += input[n * K + k] * weight;
+    }
+
+    output[n * M + m] = sum;
+}
+/*
+input1:
+    1D: [K]
+    2D: [N, K]
+
+input2:
+    2D: [M, K]
+
+output:
+    input1 是 1D -> [M]
+    input1 是 2D -> [N, M]
+*/
+void matmul_quant_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& input2,
+                            tensor::Tensor& output, int32_t group_size, const tensor::Tensor& scale,
+                            const tensor::Tensor& zero_points, void* stream) {
+    CHECK(input1.is_empty() == false && input1.dims_size() <= 2);
+    CHECK(input1.device_type() == base::DeviceType::GPU);
+
+    CHECK(input2.is_empty() == false && input2.dims_size() == 2);
+    CHECK(input2.device_type() == base::DeviceType::GPU);
+
+    const int N = input1.dims_size() == 1 ? 1 : input1.get_dim(0);
+    const int K = input1.get_dim(input1.dims_size() - 1);
+    const int M = input2.get_dim(0);
+    CHECK_EQ(input2.get_dim(1), K / 2);
+    dim3 block(16, 16);
+    dim3 grid((M + block.x - 1) / block.x, (N + block.y - 1) / block.y);
+
+    const float* in1 = input1.ptr<float>();
+    const uint8_t* in2 = input2.ptr<uint8_t>();
+    float* out = output.ptr<float>();
+    const float* sca = scale.ptr<float>();
+    const uint8_t* zero = zero_points.ptr<uint8_t>();
+
+    cudaStream_t _stream = static_cast<cudaStream_t>(stream);
+    matmul_quant_int4_fp32_naive<<<grid, block, 0, _stream>>>(in1, in2, sca, zero, out, N, M, K,
+                                                        group_size);
 }
 
 } // namespace kernel

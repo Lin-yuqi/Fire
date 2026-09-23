@@ -64,6 +64,15 @@ MatmulKernel get_matmul_kernel(base::DeviceType dtype) {
     }
 }
 
+MatmulKernelQuant get_matmul_quant_kernel(base::DeviceType dtype) {
+    if (dtype == base::DeviceType::GPU) {
+        return matmul_quant_kernel_cu;
+    } else {
+        LOG(FATAL) << "Unknown device type for get a matmul quant kernel.";
+        return nullptr;
+    }
+}
+
 EmbeddingKernel get_embedding_kernel(base::DeviceType dtype) {
     if (dtype == base::DeviceType::CPU) {
         return emb_kernel_cpu;

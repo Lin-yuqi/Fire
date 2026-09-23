@@ -2,6 +2,8 @@
 #include "Fire/model/qwen.h"
 #include "Fire/model/qwen_loader.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
@@ -30,13 +32,15 @@ bool parse_token_id(const char* text, int32_t& token_id) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 4) {
-        return fail("usage: qwen3_logits_runner <model.fire> <output.bin> <token-id>...");
+    const bool use_gpu = argc >= 4 && std::string(argv[3]) == "--gpu";
+    const int first_token_argument = use_gpu ? 4 : 3;
+    if (argc <= first_token_argument) {
+        return fail("usage: qwen3_logits_runner <model.fire> <output.bin> [--gpu] <token-id>...");
     }
 
     std::vector<int32_t> token_ids;
-    token_ids.reserve(static_cast<size_t>(argc - 3));
-    for (int argument = 3; argument < argc; ++argument) {
+    token_ids.reserve(static_cast<size_t>(argc - first_token_argument));
+    for (int argument = first_token_argument; argument < argc; ++argument) {
         int32_t token_id = 0;
         if (!parse_token_id(argv[argument], token_id)) {
             return fail("invalid token id: " + std::string(argv[argument]));
@@ -58,8 +62,21 @@ int main(int argc, char** argv) {
     }
 
     op::OpContext context;
-    context._device_type = base::DeviceType::CPU;
-    context._allocator = base::CPUAllocatorFactory::get_instance();
+    if (use_gpu) {
+        int device_count = 0;
+        const auto cuda_status = cudaGetDeviceCount(&device_count);
+        if (cuda_status != cudaSuccess) {
+            return fail("CUDA device check failed: " + std::string(cudaGetErrorString(cuda_status)));
+        }
+        if (device_count == 0) {
+            return fail("no CUDA device is available");
+        }
+        context._device_type = base::DeviceType::GPU;
+        context._allocator = base::GPUAllocatorFactory::get_instance();
+    } else {
+        context._device_type = base::DeviceType::CPU;
+        context._allocator = base::CPUAllocatorFactory::get_instance();
+    }
 
     std::unique_ptr<model::Qwen3Model> qwen3;
     status = model::Qwen3Model::create(weights, context, qwen3);
@@ -83,8 +100,17 @@ int main(int argc, char** argv) {
             return fail("forward failed at position " + std::to_string(position) + ": " +
                         status.message());
         }
-        std::copy_n(logits.ptr<float>(), vocab_size,
-                    all_logits.data() + position * vocab_size);
+        float* destination = all_logits.data() + position * vocab_size;
+        if (use_gpu) {
+            const auto cuda_status = cudaMemcpy(destination, logits.ptr<float>(),
+                                                logits.byte_size(), cudaMemcpyDeviceToHost);
+            if (cuda_status != cudaSuccess) {
+                return fail("cannot copy GPU logits at position " + std::to_string(position) +
+                            ": " + cudaGetErrorString(cuda_status));
+            }
+        } else {
+            std::copy_n(logits.ptr<float>(), vocab_size, destination);
+        }
     }
 
     std::ofstream output(argv[2], std::ios::binary | std::ios::trunc);

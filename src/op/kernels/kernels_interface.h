@@ -18,6 +18,11 @@ typedef void (*RMSNormKernelDim)(const tensor::Tensor& input, const tensor::Tens
 typedef void (*MatmulKernel)(const tensor::Tensor& input1, const tensor::Tensor& input2,
                              float scale, tensor::Tensor& output, void* stream);
 
+typedef void (*MatmulKernelQuant)(const tensor::Tensor& input1, const tensor::Tensor& input2,
+                                  tensor::Tensor& output, int32_t group_size,
+                                  const tensor::Tensor& scale, const tensor::Tensor& zero_points,
+                                  void* stream);
+
 typedef void (*EmbeddingKernel)(const tensor::Tensor& input, const tensor::Tensor& weight,
                                 tensor::Tensor& output, void* stream);
 
@@ -45,6 +50,8 @@ RMSNormKernel get_rmsnorm_kernel(base::DeviceType dtype);
 RMSNormKernel get_rmsnorm_kernel_dim(base::DeviceType dtype);
 
 MatmulKernel get_matmul_kernel(base::DeviceType dtype);
+
+MatmulKernelQuant get_matmul_quant_kernel(base::DeviceType dtype);
 
 EmbeddingKernel get_embedding_kernel(base::DeviceType dtype);
 
