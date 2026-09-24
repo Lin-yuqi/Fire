@@ -35,6 +35,7 @@ enum class DataType{
     Int8,
     Int32,
     UInt8,
+    Bf16,
 };
 
 enum StatusCode : uint8_t {

@@ -99,6 +99,36 @@ std::vector<uint8_t> V2Fixture() {
     return bytes;
 }
 
+std::vector<uint8_t> V2Bf16Fixture() {
+    const auto original = V2Fixture();
+    std::vector<uint8_t> bytes(432, 0);
+    std::copy_n(original.begin(), 320, bytes.begin());
+    WriteU32Le(bytes, 12, 4);
+    WriteU64Le(bytes, 24, 416);
+    WriteU64Le(bytes, 32 + 64, 416);
+    WriteU64Le(bytes, 32 + 96 + 64, 420);
+    WriteU64Le(bytes, 32 + 2 * 96 + 64, 424);
+
+    constexpr size_t head_entry = 32 + 3 * 96;
+    const char head_name[] = "output.weight";
+    std::memcpy(bytes.data() + head_entry, head_name, sizeof(head_name) - 1);
+    WriteU64Le(bytes, head_entry + 64, 428);
+    WriteU64Le(bytes, head_entry + 72, 4);
+    WriteU32Le(bytes, head_entry + 80, 1);
+    WriteU32Le(bytes, head_entry + 84, 2);
+    bytes[head_entry + 88] = 3; // BF16
+    bytes[head_entry + 89] = 2;
+
+    bytes[416] = original[320];
+    std::copy_n(original.begin() + 324, 4, bytes.begin() + 420);
+    bytes[424] = original[328];
+    bytes[428] = 0x80; // BF16 1.0: 0x3f80, little endian
+    bytes[429] = 0x3f;
+    bytes[430] = 0x00; // BF16 -2.0: 0xc000, little endian
+    bytes[431] = 0xc0;
+    return bytes;
+}
+
 class TemporaryFireFile final {
   public:
     explicit TemporaryFireFile(const std::vector<uint8_t>& bytes) {
@@ -239,6 +269,49 @@ TEST(FireReaderTest, OpensV2PackedInt4AndExposesGroupSize) {
     EXPECT_EQ(scales->dtype, base::DataType::Fp32);
     EXPECT_EQ(scales->quantization_kind, model::QuantizationKind::None);
     EXPECT_EQ(scales->byte_offset, 324U);
+}
+
+TEST(FireReaderTest, OpensV2Bf16AlongsideInt4AndExposesRawTensorBits) {
+    TemporaryFireFile file(V2Bf16Fixture());
+    model::FireReader reader;
+    const base::Status status = reader.open(file.path());
+    ASSERT_TRUE(status.ok()) << status.message();
+    EXPECT_EQ(reader.tensor_count(), 4U);
+
+    const model::TensorInfo* head = reader.find("output.weight");
+    ASSERT_NE(head, nullptr);
+    EXPECT_EQ(head->dtype, base::DataType::Bf16);
+    EXPECT_EQ(head->dims, (std::vector<int32_t>{1, 2}));
+    EXPECT_EQ(head->byte_offset, 428U);
+    EXPECT_EQ(head->byte_size, 4U);
+    EXPECT_EQ(head->quantization_kind, model::QuantizationKind::None);
+
+    tensor::Tensor view(head->dtype, head->dims, reader.mapped_buffer(), head->byte_offset);
+    EXPECT_EQ(view.byte_size(), 4U);
+    EXPECT_EQ(view.ptr<uint16_t>()[0], 0x3f80U);
+    EXPECT_EQ(view.ptr<uint16_t>()[1], 0xc000U);
+}
+
+TEST(FireReaderTest, RejectsMalformedV2Bf16AndV1Bf16) {
+    using Mutation = std::function<void(std::vector<uint8_t>&)>;
+    constexpr size_t head_entry = 32 + 3 * 96;
+    const std::vector<std::pair<std::string, Mutation>> cases = {
+        {"BF16 in v1", [](auto& bytes) { WriteU32Le(bytes, 8, 1); }},
+        {"BF16 byte size", [](auto& bytes) { WriteU64Le(bytes, head_entry + 72, 2); }},
+        {"quantization on BF16", [](auto& bytes) {
+             bytes[head_entry + 90] = 1;
+             WriteU32Le(bytes, head_entry + 91, 2);
+         }},
+    };
+    for (const auto& [label, mutate] : cases) {
+        SCOPED_TRACE(label);
+        auto bytes = V2Bf16Fixture();
+        mutate(bytes);
+        TemporaryFireFile file(bytes);
+        model::FireReader reader;
+        const base::Status status = reader.open(file.path());
+        EXPECT_EQ(status.code(), base::StatusCode::ModelParseError) << status.message();
+    }
 }
 
 TEST(FireReaderTest, RejectsMalformedV2MetadataAndPadding) {

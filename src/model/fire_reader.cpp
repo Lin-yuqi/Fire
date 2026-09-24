@@ -24,6 +24,7 @@ constexpr uint32_t _FormatVersionV1 = 1;
 constexpr uint32_t _FormatVersionV2 = 2;
 constexpr uint8_t _WireDTypeFp32 = 1;
 constexpr uint8_t _WireDTypeUInt8 = 2;
+constexpr uint8_t _WireDTypeBf16 = 3;
 
 constexpr char _Magic[] = "FIRECKPT";
 constexpr size_t _HeaderMagicOffset = 0;
@@ -231,6 +232,8 @@ base::Status FireReader::open(const std::string& path) {
             dtype = base::DataType::Fp32;
         } else if (format_version == _FormatVersionV2 && wire_dtype == _WireDTypeUInt8) {
             dtype = base::DataType::UInt8;
+        } else if (format_version == _FormatVersionV2 && wire_dtype == _WireDTypeBf16) {
+            dtype = base::DataType::Bf16;
         } else {
             return base::error::ModelParseError("FireReader: unsupported tensor dtype");
         }
@@ -303,7 +306,12 @@ base::Status FireReader::open(const std::string& path) {
         }
 
         // ---------------- byte_size validation ----------------
-        const uint64_t element_size = dtype == base::DataType::Fp32 ? 4 : 1;
+        uint64_t element_size = 1;
+        if (dtype == base::DataType::Fp32) {
+            element_size = 4;
+        } else if (dtype == base::DataType::Bf16) {
+            element_size = 2;
+        }
         if (element_count > std::numeric_limits<uint64_t>::max() / element_size) {
             return base::error::ModelParseError("FireReader: tensor byte size overflow");
         }

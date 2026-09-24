@@ -35,6 +35,20 @@ class WireDType(IntEnum):
 
     FP32 = 1
     UINT8 = 2
+    BF16 = 3
+
+
+_ELEMENT_SIZES = {
+    WireDType.FP32: 4,
+    WireDType.UINT8: 1,
+    WireDType.BF16: 2,
+}
+_PAYLOAD_DTYPES = {
+    WireDType.FP32: np.dtype("<f4"),
+    WireDType.UINT8: np.dtype("u1"),
+    # NumPy has no built-in BF16 scalar dtype. The values are raw BF16 bits.
+    WireDType.BF16: np.dtype("<u2"),
+}
 
 
 @dataclass(frozen=True)
@@ -120,7 +134,7 @@ class FireWriter:
 
             if info.dtype not in (
                 (WireDType.FP32,) if self.version == FORMAT_VERSION
-                else (WireDType.FP32, WireDType.UINT8)
+                else (WireDType.FP32, WireDType.UINT8, WireDType.BF16)
             ):
                 raise ValueError(
                     f"unsupported wire dtype for {info.name}: {info.dtype}"
@@ -149,7 +163,7 @@ class FireWriter:
             ):
                 raise ValueError(f"group_size does not divide logical K for {info.name}")
 
-            expected_size = math.prod(info.shape) * (4 if info.dtype == WireDType.FP32 else 1)
+            expected_size = math.prod(info.shape) * _ELEMENT_SIZES[info.dtype]
             if expected_size > _UINT64_MAX:
                 raise ValueError(
                     f"tensor byte_size exceeds uint64 range for {info.name}: "
@@ -230,21 +244,22 @@ class FireWriter:
         self,
         destination: BinaryIO,
         info: TensorInfo,
-        tensor: NDArray[np.float32] | NDArray[np.uint8],
+        tensor: NDArray[np.float32] | NDArray[np.uint8] | NDArray[np.uint16],
     ) -> None:
+        """Write one payload; BF16 values are supplied as raw uint16 bit patterns."""
         if info.dtype not in (
             (WireDType.FP32,) if self.version == FORMAT_VERSION
-            else (WireDType.FP32, WireDType.UINT8)
+            else (WireDType.FP32, WireDType.UINT8, WireDType.BF16)
         ):
             raise ValueError(
                 f"unsupported wire dtype for {info.name}: {info.dtype}"
             )
 
-        expected_dtype = np.float32 if info.dtype == WireDType.FP32 else np.uint8
-        if tensor.dtype != np.dtype(expected_dtype):
+        expected_dtype = _PAYLOAD_DTYPES[info.dtype]
+        if tensor.dtype != expected_dtype:
             raise ValueError(
                 f"dtype mismatch for {info.name}: "
-                f"expected {np.dtype(expected_dtype)}, got {tensor.dtype}"
+                f"expected {expected_dtype}, got {tensor.dtype}"
             )
 
         # 3. 检查 shape

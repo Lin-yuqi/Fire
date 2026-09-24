@@ -22,6 +22,8 @@ namespace tensor {
         switch(dtype){
             case base::DataType::Fp32:
                 return 4;
+            case base::DataType::Bf16:
+                return 2;
             case base::DataType::Int32:
                 return 4;
             case base::DataType::Int8:

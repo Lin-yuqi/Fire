@@ -1,6 +1,6 @@
 # Fire 仓库地图
 
-> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后核对日期：2026-09-20。
+> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后全面核对日期：2026-09-20；BF16 格式和 Qwen3 量化相关段落更新：2026-09-24。
 
 ## 1. 项目定位与当前阶段
 
@@ -9,24 +9,24 @@ Fire 是一个以学习和实验为目标、从零构建的轻量级 CUDA 推理
 当前仓库已经发布 v0.1，并打通 Source Checkpoint 到简单聊天 CLI 的 TinyLlama CPU/CUDA 路径：
 
 - `base` 模块已经接入构建，提供 CPU/GPU 分配器、内存拷贝以及 Buffer 生命周期管理。
-- `tensor` 已接入 `Fire::fire`，具备接口和初步实现，并开始覆盖 Buffer 字节偏移与 clone 行为。
+- `tensor` 已接入 `Fire::fire`，具备接口和初步实现，覆盖 Buffer 字节偏移、clone 行为及 BF16 两字节物理元素；BF16 算术 kernel 尚未接入。
 - `op` 已建立 `Operator`、`ParamOperator` 与执行上下文 `OpContext`，并接通 Add、RMSNorm、Matmul、Linear、Embedding、RoPE、SwiGLU 和 MHA。Softmax 已有 CPU/CUDA kernel 与直接数值测试，但尚无独立公开 Operator 包装；MHA 的 CPU/CUDA 实现内置稳定 softmax。`ParamOperator` 显式允许移动、禁止复制，支持按值组织 Block 中的参数算子。
 - Add 已提供 CPU（Armadillo）与 CUDA FP32 kernel，通过设备类型分派，并覆盖公共 `forward`、参数校验、边界尺寸和非默认 stream 测试。
 - RMSNorm 已提供 CPU/CUDA 一维与逐行二维 FP32 kernel，支持自定义 epsilon 和 CUDA stream；非 4 整数倍行宽会在未对齐行使用标量路径，避免 `float4` 未对齐访问。
-- Matmul/Linear 已具备 FP32 CPU/CUDA kernel 路径与 CPU 数值测试；真实 TinyLlama GPU forward 已覆盖模型 shape，专门的 CUDA shape 矩阵和性能基准仍需补齐。
+- Matmul/Linear 已具备 FP32 CPU/CUDA 与 GPU INT4 权重路径；BF16 `lm_head` 权重路径仍待实现。真实 TinyLlama GPU forward 已覆盖模型 shape，专门的 CUDA shape 矩阵和性能基准仍需补齐。
 - Embedding 已提供 CPU/CUDA FP32 查表 kernel、公开参数检查和单/多 token 测试。
 - RoPE 已按 HF/TinyLlama 的前后半区配对实现 CPU/CUDA 旋转及紧凑 `[max_seq_len, head_dim / 2]` sin/cos cache，并覆盖非零位置、GQA head 数和非默认 stream 测试。
 - SwiGLU 已提供 CPU/CUDA FP32 逐元素实现，检查输入/输出 shape，并验证数值、输入只读性及 CUDA block 边界；Softmax kernel 覆盖一维/二维、原地/非原地、长行和数值稳定性。
-- `model` 已实现 `FireReader`：通过 `open + fstat + mmap` 校验 `.fire` v1，建立 name index，并通过共享 `Buffer` 维持 mapping 生命周期。
-- `tools` 已实现 TinyLlama/Qwen3 model-specific exporter 与最小 FireWriter：TinyLlama 验证固定的 201 tensor profile；Qwen3 按 config 选择 0.6B/8B profile，兼容单文件与 HF source shards，并按两遍流程写出 FP32 `.fire`。
+- `model` 已实现 `FireReader`：通过 `open + fstat + mmap` 校验 `.fire` v1/v2，建立 name index，并通过共享 `Buffer` 维持 mapping 生命周期；v2 可读取 FP32、UInt8 与 BF16 物理 tensor。
+- `tools` 已实现 TinyLlama/Qwen3 model-specific exporter 与 FireWriter：TinyLlama 验证固定的 201 tensor profile；Qwen3 按 config 选择 0.6B/8B profile，兼容单文件与 HF source shards，可写 FP32 `.fire` v1 或从未量化 BF16 源权重导出 INT4 `.fire` v2。Writer 的 v2 BF16 payload 合同已接入，Qwen3 混合 BF16/INT4 导出和 AWQ 导入尚未接入。
 - 独立 260-byte fixture、Reader 异常矩阵、mapping ownership 和 exporter/writer 失败语义均已接入自动化测试。
 - `TinyllamaLoader` 已支持按名字读取单个 CPU mmap Tensor view；`load_weights()` 会校验 201 项 canonical tensor 的数量、名称、FP32 dtype 和 shape，在全部成功后发布结构化权重。
-- Qwen3 已建立 0.6B/8B profile value、结构化权重和共享 `Qwen3Loader/Qwen3Model`；0.6B 的两 token CPU/GPU forward 与 Hugging Face logits 对齐已通过，量化 payload 尚未实现。
+- Qwen3 已建立 0.6B/8B profile value、结构化权重和共享 `Qwen3Loader/Qwen3Model`；0.6B 的 FP32 两 token CPU/GPU forward 与 Hugging Face logits 对齐已通过。Loader 已能读取完整 INT4 profile；混合 BF16 Embedding/`lm_head` profile、真实 8B/AWQ 导入与端到端验收仍待完成。
 - `Model` 纯接口、固定 profile、结构化权重和 Block 参数结构已建立。`TinyLlamaModel` 已实现参数绑定、Runtime/KVCache 分配、RoPE cache、完整单 token forward、K/V 写入与长度提交，以及 reset。真实模型 CPU/GPU 双 token 测试会检查有限 logits、位置推进、非默认 CUDA stream 和 CPU/GPU 一致性。
 - `tokenizer` 已接入 SentencePiece `LlamaTokenizer`，支持真实 `tokenizer.model` 的加载、BOS/EOS 和文本编解码；`sampler` 已接入 CPU/CUDA `ArgmaxSampler` 并验证相同最大值取首次位置。
 - `llama_chat` 已实现 TinyLlama chat template、greedy 自回归生成、128 token 回复上限、跨轮 KV Cache 复用、固定 2048 token 会话、CPU/GPU 选择以及 `/reset`、`/help`、`/exit`。
 
-因此，当前 Base、Tensor、Operator、Model、Tokenizer、Sampler、已实现的 CPU/CUDA kernel、FireReader 和 Loader 均已编入 `Fire::fire`；Python exporter/writer 作为独立工具运行，`llama_chat` 链接 `Fire::fire`。RMSNorm 和 Linear 的量化配置已能表示，但当前算子会拒绝量化权重。
+因此，当前 Base、Tensor、Operator、Model、Tokenizer、Sampler、已实现的 CPU/CUDA kernel、FireReader 和 Loader 均已编入 `Fire::fire`；Python exporter/writer 作为独立工具运行，`llama_chat` 链接 `Fire::fire`。RMSNorm 仍拒绝量化权重；Linear 的 INT4 路径仅支持 GPU，BF16 权重执行尚未接入。
 
 现阶段已经形成 `Source Checkpoint → exporter → FireReader/Loader → TinyLlamaModel → Tokenizer/Sampler → llama_chat` 的 v0.1 闭环。发布后的重点是补强 Loader/状态失败矩阵、加入 Hugging Face 独立参考对齐，并改进 sampling 与生成效率。模型层契约与实施边界见 [模型层设计](model_design_v0_1.md)。
 
@@ -325,11 +325,11 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 ### `tools`: exporter/writer
 
-`fire_writer.py` 固定 `.fire` v1 常量、wire dtype 和规范化 `TensorInfo`，在写入前校验 name、rank、shape、byte size 及紧密排列的 absolute offset。`FireWriter` 编码 32-byte Header 和 96-byte Directory entry，再通过 `memoryview(tensor).cast("B")` 写入单个 FP32 C-contiguous NumPy payload。
+`fire_writer.py` 编码 `.fire` v1/v2 的 32-byte Header 和 96-byte Directory entry，校验 name、rank、shape、dtype、byte size 与 absolute offset。v1 只允许 FP32；v2 允许 FP32、UInt8 和 BF16，含 INT4 元数据及四字节 payload 对齐。BF16 payload 由 little-endian `np.uint16` 原始位模式提供，Writer 不进行 BF16 数值转换。
 
 `export_tinyllama.py` 固定 TinyLlama config、BF16 source dtype、canonical name/shape profile、201 个 tensor 和预期文件大小。它先用 NumPy safetensors metadata pass 完成 preflight，再 exclusive-create 目标，通过单个长期 PyTorch `safe_open` context 逐 tensor 转为 FP32 并写出；已创建目标后遇到普通异常或 `KeyboardInterrupt` 会关闭并 best-effort 删除 partial file。
 
-`export_qwen3.py` 根据 `config.json` 选择 0.6B 或 8B profile，由维度动态构建 11 tensors/layer 的 descriptor。它支持单个 `model.safetensors` 和标准 `model.safetensors.index.json`，严格核对 index、实际 shard keys、dtype、shape 与 source byte size，并按 shard 分组目录项，使 metadata/payload 两遍都只打开每个 shard 一次。0.6B 的真实 metadata preflight 已确认 311 项和预期 `3,006,559,424` bytes FP32 文件长度；自动化测试不生成该大文件。
+`export_qwen3.py` 根据 `config.json` 选择 0.6B 或 8B profile，由维度动态构建 11 tensors/layer 的 descriptor。它支持单个 `model.safetensors` 和标准 `model.safetensors.index.json`，严格核对 index、实际 shard keys、dtype、shape 与 source byte size，并按 shard 分组目录项，使 metadata/payload 两遍都只打开每个 shard 一次。当前 v2 路径从未量化 BF16 源权重生成 INT4 投影和 `lm_head`，Embedding/Norm 转 FP32；计划中的 8B BF16 Embedding/`lm_head` 混合导出尚未实现。
 
 独立 fixture 生成器与 TinyLlama/Qwen3 Python 合同测试已接入 CTest；`fire_v1_fixture` 是 `fire_tests` 的构建依赖，而非需要手动运行的非默认前置。本阶段没有引入通用 model registry、provider、planner 或 streaming framework。
 
@@ -343,9 +343,9 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 Add 测试已覆盖公共 `VecAddOp::forward` 的 CPU/GPU 路径、参数错误、边界尺寸和非默认 stream。RMSNorm 测试覆盖 CPU 一维/逐行二维正确性、自定义 epsilon、参数错误、CUDA 打包尾部以及二维非 4 整数倍行宽。
 
-`MatmulOp` 接受一维或二维输入和 `[out_features, in_features]` 权重，计算 `scale * input * weight^T`。CPU 使用 Armadillo，CUDA 使用分块 kernel。`LinearOp` 绑定 weight 和可选 bias，复用 Matmul/Add kernel，并拒绝量化参数。现有 Matmul/Linear 数值测试覆盖 CPU 向量/矩阵及向量 bias；真实 TinyLlama GPU forward 已覆盖模型使用的 CUDA shape，专门的 CUDA 数值矩阵和性能基准仍需补齐。
+`MatmulOp` 接受一维或二维输入和 `[out_features, in_features]` 权重，计算 `scale * input * weight^T`。CPU 使用 Armadillo，CUDA 使用分块 kernel。`LinearOp` 绑定 weight 和可选 bias；FP32 路径复用 Matmul/Add kernel，GPU INT4 路径使用量化 matmul kernel，尚不接受 BF16 权重。现有 Matmul/Linear 数值测试覆盖 CPU 向量/矩阵及向量 bias；真实 TinyLlama GPU forward 已覆盖模型使用的 CUDA shape，专门的 CUDA 数值矩阵和性能基准仍需补齐。
 
-`EmbeddingOp` 绑定一个未量化 FP32 `[vocab_size, embedding_dim]` weight，接收同设备 INT32 token Tensor，并要求输出元素数等于 token 数乘 embedding width。CPU/CUDA kernel 都按 token 顺序复制权重行；测试覆盖单/多 token、错误参数和 CUDA 非对齐尾部。
+`EmbeddingOp` 当前绑定未量化 FP32 `[vocab_size, embedding_dim]` weight，接收同设备 INT32 token Tensor，并要求输出元素数等于 token 数乘 embedding width。CPU/CUDA kernel 都按 token 顺序复制权重行；测试覆盖单/多 token、错误参数和 CUDA 非对齐尾部。8B 计划增加 BF16 权重查表、FP32 输出。
 
 `RoPEOp` 原地修改二维 `[heads, head_dim]` query/key。`head_dim` 必须为正偶数，key heads 不得多于 query heads；sin/cos cache 使用 `[max_seq_len, head_dim / 2]`，每个 head 内按前后半区配对，符合未 permutation 的 HF Q/K 权重布局。CPU/CUDA cache 生成与旋转测试覆盖非零位置、GQA 和非默认 stream。
 
@@ -393,7 +393,7 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 1. **部分 CUDA 返回值未检查**：部分 memcpy/memset 路径忽略 CUDA API 返回的 `cudaError_t`，失败时可能缺少及时、准确的错误信息；按当前约定可继续使用 `CHECK/LOG(FATAL)` 报错，无需引入额外错误类型。
 2. **RMSNorm 支持范围有限**：当前只有 FP32 实现，CPU 会将连续前导维展平后逐行处理，GPU 多行路径只验证了二维 `{rows, width}`；更高维 GPU 输入的所有前导维度尚未完整接入 block 调度。量化 weight 会返回 `InvalidArgument`。
 3. **聊天入口以简单性优先**：Tokenizer、ArgmaxSampler、EOS 停止条件和 `llama_chat` 已接通，但当前只有 greedy sampling；KV Cache 跨轮复用但只增不减，没有滑动窗口或历史压缩。Hugging Face 参考 logits/token 对齐仍未形成独立验收记录。
-4. **Matmul 验证与量化仍待补齐**：已有 FP32 CPU/CUDA 实现、CPU 单算子数值测试和真实模型 GPU 路径；更系统的 CUDA shape/误差矩阵、性能优化和量化路径属于后续工作。
+4. **Matmul 验证与 BF16 路径仍待补齐**：已有 FP32 CPU/CUDA、GPU INT4 实现及部分单算子数值测试；BF16 `lm_head` 权重执行、更系统的 CUDA shape/误差矩阵和性能优化属于后续工作。
 5. **Softmax 尚未形成独立 Operator**：CPU/CUDA kernel 和直接测试已完成，MHA 已在内部封装 softmax 计算；其他调用方目前仍需要直接使用 kernel 接口。
 6. **状态错误矩阵仍不完整**：KVCache 小尺寸测试已覆盖 K/V 写入、提交、reset、错误 shape 与错误位置，真实模型 forward 也会拒绝重复位置；更多 create/prepare/reset 失败保持场景仍需补齐。
 

@@ -61,3 +61,19 @@ TEST(tensor_test, uint8_tensor_has_one_byte_per_physical_element) {
         EXPECT_EQ(copy.ptr<uint8_t>()[index], values[index]);
     }
 }
+
+TEST(tensor_test, bf16_tensor_preserves_raw_bits_and_two_byte_elements) {
+    uint16_t values[] = {0x3f80, 0xc000};
+    tensor::Tensor view = tensor::Tensor::from_blob(
+        values, base::DataType::Bf16, {1, 2}, base::DeviceType::CPU);
+
+    EXPECT_EQ(view.size(), 2U);
+    EXPECT_EQ(view.byte_size(), sizeof(values));
+    EXPECT_EQ(view.ptr<uint16_t>(), values);
+
+    const auto copy = view.clone();
+    EXPECT_EQ(copy.data_type(), base::DataType::Bf16);
+    EXPECT_EQ(copy.byte_size(), sizeof(values));
+    EXPECT_EQ(copy.ptr<uint16_t>()[0], values[0]);
+    EXPECT_EQ(copy.ptr<uint16_t>()[1], values[1]);
+}
