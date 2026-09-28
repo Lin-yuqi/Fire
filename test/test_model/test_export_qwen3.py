@@ -13,6 +13,8 @@ import unittest
 from unittest import mock
 
 import numpy as np
+from safetensors.torch import save_file
+import torch
 
 
 TOOLS_DIR = Path(__file__).resolve().parents[2] / "tools"
@@ -537,6 +539,125 @@ class Qwen3V2ExportTest(unittest.TestCase):
         self.assertEqual(zeros[2:6], (128, 1, 2, 2))
         self.assertEqual(wire[qweight[0]], 0xF0)
         self.assertAlmostEqual(struct.unpack_from("<f", wire, scales[0])[0], 3 / 15)
+
+
+class Qwen3AWQExportTest(unittest.TestCase):
+    def test_8b_awq_descriptor_keeps_head_and_embedding_bf16(self) -> None:
+        config = dict(export_qwen3.QWEN3_8B.expected_config)
+        config["torch_dtype"] = "float16"
+        config["quantization_config"] = {
+            "quant_method": "awq", "version": "gemm", "bits": 4,
+            "group_size": 128, "zero_point": True,
+        }
+        profile = export_qwen3._select_awq_profile(config)
+        self.assertIs(profile, export_qwen3.QWEN3_8B)
+        patterns = export_qwen3._build_awq_patterns(export_qwen3._build_descriptor(profile))
+        by_name = {pattern.fire_name: pattern for pattern in patterns}
+        self.assertEqual(len(patterns), 903)
+        self.assertEqual(by_name["tok_embeddings.weight"].fire_dtype,
+                         fire_writer.WireDType.BF16)
+        self.assertEqual(by_name["output.weight"].fire_dtype,
+                         fire_writer.WireDType.BF16)
+        self.assertEqual(by_name["layers.0.attention.wq.qweight"].source_shape,
+                         (4096, 512))
+        self.assertEqual(by_name["layers.0.attention.wq.qweight"].fire_shape,
+                         (4096, 2048))
+        self.assertEqual(sum(name.endswith(".qweight") for name in by_name), 252)
+
+    def test_awq_export_preserves_int4_values_and_bf16_bits(self) -> None:
+        profile = export_qwen3._Qwen3Profile(
+            model_id="test/Qwen3-AWQ-tiny",
+            expected_config={"model_type": "qwen3", "hidden_size": 128},
+            vocab_size=8, hidden_size=128, intermediate_size=128,
+            num_layers=1, num_attention_heads=1, num_kv_heads=1, head_dim=128,
+        )
+        patterns = export_qwen3._build_awq_patterns(export_qwen3._build_descriptor(profile))
+        tensors = {
+            pattern.source_name: torch.zeros(
+                pattern.source_shape,
+                dtype=torch.int32 if pattern.source_dtype == "I32" else torch.bfloat16,
+            )
+            for pattern in patterns
+        }
+        awq_order = (0, 2, 4, 6, 1, 3, 5, 7)
+        base = "model.layers.0.self_attn.q_proj"
+        for k in range(128):
+            values = [(k + out) % 16 for out in range(8)]
+            word = sum(values[out] << (4 * index)
+                       for index, out in enumerate(awq_order))
+            tensors[base + ".qweight"][k, 0] = np.array(
+                word, dtype=np.uint32
+            ).view(np.int32).item()
+        zero_word = sum((out + 8) << (4 * index)
+                        for index, out in enumerate(awq_order))
+        tensors[base + ".qzeros"][0, 0] = np.array(
+            zero_word, dtype=np.uint32
+        ).view(np.int32).item()
+        tensors[base + ".scales"][0, :8] = 0.5
+        tensors["model.embed_tokens.weight"].view(torch.uint16)[0, :2] = torch.tensor(
+            [0x3F80, 0x4000], dtype=torch.uint16
+        )
+        tensors["lm_head.weight"].view(torch.uint16)[0, 0] = 0x7FC1
+        tensors["model.norm.weight"][0] = 1.5
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "source"
+            _write_config(source_dir, profile)
+            config_path = source_dir / "config.json"
+            config = json.loads(config_path.read_text())
+            config["torch_dtype"] = "float16"
+            config["quantization_config"] = {
+                "quant_method": "awq", "version": "gemm", "bits": 4,
+                "group_size": 128, "zero_point": True,
+            }
+            config_path.write_text(json.dumps(config))
+            save_file(tensors, source_dir / "model.safetensors")
+            output_path = root / "tiny-awq.fire"
+            with mock.patch.object(export_qwen3, "SUPPORTED_PROFILES", (profile,)):
+                export_qwen3.export_qwen3(source_dir, output_path, quantization="awq")
+            wire = output_path.read_bytes()
+            bad_tensors = dict(tensors)
+            bad_tensors[base + ".scales"] = tensors[base + ".scales"].to(torch.float16)
+            save_file(bad_tensors, source_dir / "model.safetensors")
+            bad_output = root / "bad.fire"
+            with mock.patch.object(export_qwen3, "SUPPORTED_PROFILES", (profile,)):
+                with self.assertRaisesRegex(export_qwen3.ExportError, "dtype mismatch"):
+                    export_qwen3.export_qwen3(source_dir, bad_output, quantization="awq")
+            self.assertFalse(bad_output.exists())
+
+        magic, version, count, _, _ = struct.unpack_from("<8sIIQQ", wire)
+        self.assertEqual((magic, version, count), (b"FIRECKPT", 2, 28))
+        records = {}
+        for index in range(count):
+            offset = 32 + index * 96
+            name = wire[offset:offset + 64].split(b"\0", 1)[0].decode("ascii")
+            records[name] = struct.unpack_from("<QQIIBB6s", wire, offset + 64)
+        embedding = records["tok_embeddings.weight"]
+        head = records["output.weight"]
+        norm = records["norm.weight"]
+        self.assertEqual((embedding[4], head[4], norm[4]), (3, 3, 1))
+        self.assertEqual(struct.unpack_from("<2H", wire, embedding[0]), (0x3F80, 0x4000))
+        self.assertEqual(struct.unpack_from("<H", wire, head[0])[0], 0x7FC1)
+        self.assertEqual(struct.unpack_from("<f", wire, norm[0])[0], 1.5)
+
+        qweight = records["layers.0.attention.wq.qweight"]
+        scales = records["layers.0.attention.wq.scales"]
+        zeros = records["layers.0.attention.wq.zero_points"]
+        self.assertEqual(qweight[6], b"\x01\x80\x00\x00\x00\x00")
+        self.assertEqual((wire[qweight[0]], wire[qweight[0] + 64]), (0x10, 0x21))
+        self.assertEqual(wire[qweight[0] + 4], 0x98)
+        self.assertEqual(wire[zeros[0]:zeros[0] + 8], bytes(range(8, 16)))
+        self.assertEqual(struct.unpack_from("<f", wire, scales[0])[0], 0.5)
+
+    def test_awq_rejects_unsupported_quantization_config(self) -> None:
+        config = dict(export_qwen3.QWEN3_8B.expected_config)
+        config["quantization_config"] = {
+            "quant_method": "awq", "version": "gemv", "bits": 4,
+            "group_size": 128, "zero_point": True,
+        }
+        with self.assertRaisesRegex(export_qwen3.ExportError, "quantization_config"):
+            export_qwen3._select_awq_profile(config)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
-"""Export supported dense Qwen3 checkpoints to a Fire v1 container.
+"""Export supported dense or AWQ Qwen3 checkpoints to Fire containers.
 
 The adapter recognizes an exact model profile from ``config.json`` and accepts
 both a single ``model.safetensors`` file and Hugging Face sharded checkpoints.
-Fire v1 currently stores FP32 payloads, so BF16 source tensors are converted
-one at a time while each source shard is opened only once per export pass.
+Dense sources can be exported as FP32 v1 or INT4 v2. AWQ GEMM sources are
+repacked into the Fire INT4 v2 layout without requantizing their weights.
 """
 
 from __future__ import annotations
@@ -18,7 +18,9 @@ from pathlib import Path
 import sys
 from typing import BinaryIO, Mapping, Sequence
 
+import numpy as np
 from safetensors import safe_open
+import torch
 
 from fire_writer import (
     HEADER_SIZE,
@@ -33,6 +35,7 @@ from quant import pack_uint4, quantize_int4_groupwise
 
 EXPECTED_SOURCE_DTYPE = "BF16"
 INT4_GROUP_SIZE = 128
+_AWQ_REVERSE_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
 _LINEAR_SUFFIXES = (
     ".attention.wq.weight",
     ".attention.wk.weight",
@@ -201,6 +204,24 @@ class _V2ExportEntry:
     tensor_infos: tuple[TensorInfo, ...]
 
 
+@dataclass(frozen=True)
+class _AWQPattern:
+    source_name: str
+    fire_name: str
+    source_dtype: str
+    source_shape: tuple[int, ...]
+    fire_dtype: WireDType
+    fire_shape: tuple[int, ...]
+    quantization: QuantizationInfo | None = None
+
+
+@dataclass(frozen=True)
+class _AWQExportEntry:
+    pattern: _AWQPattern
+    shard_path: Path
+    tensor_info: TensorInfo
+
+
 def _select_profile(config: Mapping[str, object]) -> _Qwen3Profile:
     for profile in SUPPORTED_PROFILES:
         if all(
@@ -222,6 +243,26 @@ def _select_profile(config: Mapping[str, object]) -> _Qwen3Profile:
     )
     identity = ", ".join(f"{key}={config.get(key)!r}" for key in identity_keys)
     raise ExportError(f"unsupported Qwen3 config: {identity}")
+
+
+def _select_awq_profile(config: Mapping[str, object]) -> _Qwen3Profile:
+    quant = config.get("quantization_config")
+    if not isinstance(quant, dict) or (
+        quant.get("quant_method") != "awq"
+        or not isinstance(quant.get("version"), str)
+        or quant["version"].lower() != "gemm"
+        or quant.get("bits") != 4
+        or quant.get("group_size") != INT4_GROUP_SIZE
+        or quant.get("zero_point") is not True
+    ):
+        raise ExportError(
+            "unsupported AWQ quantization_config: expected 4-bit GEMM, "
+            "group_size 128, zero_point=true"
+        )
+    if config.get("torch_dtype") not in ("float16", "bfloat16"):
+        raise ExportError(f"unsupported AWQ torch_dtype: {config.get('torch_dtype')!r}")
+    # The official AWQ config advertises float16 even when tensor metadata is BF16.
+    return _select_profile({**config, "torch_dtype": "bfloat16"})
 
 
 def _build_descriptor(profile: _Qwen3Profile) -> tuple[_TensorPattern, ...]:
@@ -324,6 +365,36 @@ def _build_descriptor(profile: _Qwen3Profile) -> tuple[_TensorPattern, ...]:
     return tuple(result)
 
 
+def _build_awq_patterns(descriptor: Sequence[_TensorPattern]) -> tuple[_AWQPattern, ...]:
+    patterns: list[_AWQPattern] = []
+    for dense in descriptor:
+        if dense.fire_name.endswith(_LINEAR_SUFFIXES):
+            out_features, in_features = dense.shape
+            if in_features % INT4_GROUP_SIZE or out_features % 8:
+                raise ExportError(f"AWQ dimensions incompatible with 4-bit groups: {dense.source_name}")
+            source_base = dense.source_name.removesuffix(".weight")
+            fire_base = dense.fire_name.removesuffix(".weight")
+            group_shape = (out_features, in_features // INT4_GROUP_SIZE)
+            patterns.extend((
+                _AWQPattern(source_base + ".qweight", fire_base + ".qweight", "I32",
+                            (in_features, out_features // 8), WireDType.UINT8,
+                            (out_features, in_features // 2), QuantizationInfo(INT4_GROUP_SIZE)),
+                _AWQPattern(source_base + ".scales", fire_base + ".scales", "BF16",
+                            (in_features // INT4_GROUP_SIZE, out_features), WireDType.FP32,
+                            group_shape),
+                _AWQPattern(source_base + ".qzeros", fire_base + ".zero_points", "I32",
+                            (in_features // INT4_GROUP_SIZE, out_features // 8),
+                            WireDType.UINT8, group_shape),
+            ))
+        else:
+            dtype = WireDType.BF16 if dense.fire_name in (
+                "tok_embeddings.weight", "output.weight"
+            ) else WireDType.FP32
+            patterns.append(_AWQPattern(dense.source_name, dense.fire_name, "BF16",
+                                        dense.shape, dtype, dense.shape))
+    return tuple(patterns)
+
+
 def _validate_shard_name(name: str) -> None:
     path = Path(name)
     if (
@@ -338,7 +409,7 @@ def _validate_shard_name(name: str) -> None:
 
 def _build_source_index(
     source_dir: Path,
-    descriptor: Sequence[_TensorPattern],
+    descriptor: Sequence[_TensorPattern | _AWQPattern],
 ) -> _SourceIndex:
     expected_names = {pattern.source_name for pattern in descriptor}
     index_path = source_dir / "model.safetensors.index.json"
@@ -669,6 +740,153 @@ def _write_int4_payload(
                 del tensor
 
 
+def _build_awq_entries(
+    source_index: _SourceIndex, patterns: Sequence[_AWQPattern]
+) -> tuple[list[_AWQExportEntry], int]:
+    patterns_by_shard: dict[Path, list[_AWQPattern]] = defaultdict(list)
+    for pattern in patterns:
+        patterns_by_shard[source_index.weight_map[pattern.source_name]].append(pattern)
+
+    next_offset = HEADER_SIZE + len(patterns) * TENSOR_INFO_SIZE
+    source_bytes = 0
+    entries: list[_AWQExportEntry] = []
+    for shard_path in source_index.shard_paths:
+        shard_patterns = patterns_by_shard[shard_path]
+        expected_names = {pattern.source_name for pattern in shard_patterns}
+        with safe_open(shard_path, framework="numpy") as handle:
+            actual_names = set(handle.keys())
+            if actual_names != expected_names:
+                raise ExportError(
+                    f"source tensors mismatch in {shard_path}: "
+                    f"missing {sorted(expected_names - actual_names)}, "
+                    f"unexpected {sorted(actual_names - expected_names)}"
+                )
+            for pattern in shard_patterns:
+                tensor_slice = handle.get_slice(pattern.source_name)
+                if tensor_slice.get_dtype() != pattern.source_dtype:
+                    raise ExportError(
+                        f"dtype mismatch for {pattern.source_name}: expected "
+                        f"{pattern.source_dtype}, got {tensor_slice.get_dtype()}"
+                    )
+                if tuple(tensor_slice.get_shape()) != pattern.source_shape:
+                    raise ExportError(
+                        f"shape mismatch for {pattern.source_name}: expected "
+                        f"{pattern.source_shape}, got {tuple(tensor_slice.get_shape())}"
+                    )
+                source_bytes += math.prod(pattern.source_shape) * (
+                    4 if pattern.source_dtype == "I32" else 2
+                )
+                next_offset = (next_offset + 3) & ~3
+                byte_size = math.prod(pattern.fire_shape) * {
+                    WireDType.FP32: 4, WireDType.BF16: 2, WireDType.UINT8: 1,
+                }[pattern.fire_dtype]
+                info = TensorInfo(
+                    pattern.fire_name, pattern.fire_dtype, pattern.fire_shape,
+                    next_offset, byte_size, pattern.quantization,
+                )
+                entries.append(_AWQExportEntry(pattern, shard_path, info))
+                next_offset += byte_size
+
+    if (source_index.declared_source_bytes is not None
+            and source_index.declared_source_bytes != source_bytes):
+        raise ExportError(
+            f"model index total_size mismatch: expected {source_bytes}, "
+            f"got {source_index.declared_source_bytes}"
+        )
+    return entries, next_offset
+
+
+def _unpack_awq_gemm(packed: np.ndarray) -> np.ndarray:
+    """Undo AutoAWQ GEMM's eight-nibble output-channel permutation."""
+    words = packed.view(np.uint32)
+    shifts = np.arange(0, 32, 4, dtype=np.uint32)
+    values = ((words[:, :, None] >> shifts) & 15).astype(np.uint8)
+    values = values.reshape(words.shape[0], -1, 8)[:, :, _AWQ_REVERSE_ORDER]
+    return np.ascontiguousarray(values.reshape(words.shape[0], -1).T)
+
+
+def _write_awq_payload(
+    destination: BinaryIO, entries: Sequence[_AWQExportEntry], writer: FireWriter
+) -> None:
+    entries_by_shard: dict[Path, list[_AWQExportEntry]] = defaultdict(list)
+    for entry in entries:
+        entries_by_shard[entry.shard_path].append(entry)
+
+    for shard_path, shard_entries in entries_by_shard.items():
+        with safe_open(shard_path, framework="pt", device="cpu") as handle:
+            for entry in shard_entries:
+                pattern = entry.pattern
+                tensor = handle.get_tensor(pattern.source_name)
+                expected_dtype = "torch.int32" if pattern.source_dtype == "I32" else "torch.bfloat16"
+                if str(tensor.dtype) != expected_dtype:
+                    raise ExportError(f"payload dtype mismatch for {pattern.source_name}")
+                if tuple(tensor.shape) != pattern.source_shape:
+                    raise ExportError(f"payload shape mismatch for {pattern.source_name}")
+                expected_bytes = math.prod(pattern.source_shape) * (
+                    4 if pattern.source_dtype == "I32" else 2
+                )
+                if tensor.numel() * tensor.element_size() != expected_bytes:
+                    raise ExportError(f"payload byte size mismatch for {pattern.source_name}")
+
+                if pattern.source_dtype == "I32":
+                    unpacked = _unpack_awq_gemm(tensor.contiguous().numpy())
+                    payload = pack_uint4(unpacked) if pattern.source_name.endswith(
+                        ".qweight"
+                    ) else unpacked
+                elif pattern.fire_dtype == WireDType.BF16:
+                    payload = tensor.contiguous().view(torch.uint16).numpy()
+                elif len(pattern.source_shape) == 2:
+                    payload = np.ascontiguousarray(tensor.float().numpy().T)
+                else:
+                    payload = tensor.float().contiguous().numpy()
+
+                writer.write_tensor(destination, entry.tensor_info, payload)
+                if destination.tell() != entry.tensor_info.byte_offset + entry.tensor_info.byte_size:
+                    raise ExportError(f"payload position mismatch for {pattern.fire_name}")
+                del payload
+                if pattern.source_dtype == "I32":
+                    del unpacked
+                del tensor
+
+
+def _export_qwen3_awq(source_dir: Path, output_path: Path) -> None:
+    config = _load_config(source_dir)
+    profile = _select_awq_profile(config)
+    patterns = _build_awq_patterns(_build_descriptor(profile))
+    source_index = _build_source_index(source_dir, patterns)
+    entries, expected_file_size = _build_awq_entries(source_index, patterns)
+    tensor_infos = [entry.tensor_info for entry in entries]
+    writer = FireWriter(version=2)
+    writer.write_header_and_directory(BytesIO(), tensor_infos)
+    print(
+        f"validated {len(patterns)} AWQ source tensors and {len(tensor_infos)} "
+        f"Fire v2 tensors for {profile.model_id} across {len(source_index.shard_paths)} shard(s)"
+    )
+
+    created = False
+    completed = False
+    try:
+        with output_path.open("xb", buffering=0) as destination:
+            created = True
+            writer.write_header_and_directory(destination, tensor_infos)
+            _write_awq_payload(destination, entries, writer)
+            if destination.tell() != expected_file_size:
+                raise ExportError(
+                    f"final file size mismatch for {output_path}: "
+                    f"expected {expected_file_size}, got {destination.tell()}"
+                )
+        completed = True
+    finally:
+        if created and not completed:
+            try:
+                output_path.unlink()
+            except OSError as cleanup_error:
+                print(
+                    f"warning: failed to remove partial output {output_path}: "
+                    f"{cleanup_error}", file=sys.stderr,
+                )
+
+
 def _export_qwen3_int4(source_dir: Path, output_path: Path) -> None:
     config = _load_config(source_dir)
     profile = _select_profile(config)
@@ -715,6 +933,9 @@ def export_qwen3(
         raise ExportError("Fire export requires a little-endian host")
     if quantization == "int4":
         _export_qwen3_int4(source_dir, output_path)
+        return
+    if quantization == "awq":
+        _export_qwen3_awq(source_dir, output_path)
         return
     if quantization != "none":
         raise ExportError(f"unsupported quantization mode: {quantization}")
@@ -770,8 +991,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="local Qwen3 checkpoint directory",
     )
     parser.add_argument(
-        "--quantization", choices=("none", "int4"), default="none",
-        help="none writes FP32 Fire v1; int4 writes group-wise INT4 Fire v2",
+        "--quantization", choices=("none", "int4", "awq"), default="none",
+        help="none writes FP32 v1; int4 quantizes dense weights; awq imports GEMM INT4 into v2",
     )
     return parser
 
