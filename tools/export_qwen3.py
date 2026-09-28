@@ -789,9 +789,10 @@ def _build_awq_entries(
 
     if (source_index.declared_source_bytes is not None
             and source_index.declared_source_bytes != source_bytes):
-        raise ExportError(
-            f"model index total_size mismatch: expected {source_bytes}, "
-            f"got {source_index.declared_source_bytes}"
+        print(
+            "warning: model index total_size differs from verified AWQ tensor "
+            f"bytes: index={source_index.declared_source_bytes}, actual={source_bytes}",
+            file=sys.stderr,
         )
     return entries, next_offset
 
@@ -931,6 +932,10 @@ def export_qwen3(
     """Validate and export one supported local Qwen3 checkpoint."""
     if sys.byteorder != "little":
         raise ExportError("Fire export requires a little-endian host")
+    if output_path.is_dir():
+        raise ExportError(f"output path is a directory: {output_path}; provide a new .fire file")
+    if output_path.exists() or output_path.is_symlink():
+        raise ExportError(f"output path already exists: {output_path}")
     if quantization == "int4":
         _export_qwen3_int4(source_dir, output_path)
         return

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from io import BytesIO
+from io import BytesIO, StringIO
 import json
 from pathlib import Path
 import struct
@@ -613,9 +613,16 @@ class Qwen3AWQExportTest(unittest.TestCase):
             }
             config_path.write_text(json.dumps(config))
             save_file(tensors, source_dir / "model.safetensors")
+            source_bytes = sum(t.numel() * t.element_size() for t in tensors.values())
+            (source_dir / "model.safetensors.index.json").write_text(json.dumps({
+                "metadata": {"total_size": source_bytes + 2 * 1024 * 1024},
+                "weight_map": {name: "model.safetensors" for name in tensors},
+            }))
             output_path = root / "tiny-awq.fire"
-            with mock.patch.object(export_qwen3, "SUPPORTED_PROFILES", (profile,)):
+            with mock.patch.object(export_qwen3, "SUPPORTED_PROFILES", (profile,)), \
+                    mock.patch("sys.stderr", new_callable=StringIO) as stderr:
                 export_qwen3.export_qwen3(source_dir, output_path, quantization="awq")
+            self.assertIn("total_size differs", stderr.getvalue())
             wire = output_path.read_bytes()
             bad_tensors = dict(tensors)
             bad_tensors[base + ".scales"] = tensors[base + ".scales"].to(torch.float16)
