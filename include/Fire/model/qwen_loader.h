@@ -23,12 +23,13 @@ class Qwen3Loader {
     // shares ownership of the file mapping.
     base::Status loader_tensor(const std::string& name, tensor::Tensor& output_tensor) const;
 
-    // Validates the complete canonical FP32 or INT4 profile before publishing output.
+    // Validates complete FP32, INT4, or mixed BF16/INT4 profiles before publishing output.
     base::Status load_weights(Qwen3Weights& output_weights) const;
 
   private:
     base::Status load_tensor(const std::string& name, const std::vector<int32_t>& expected_dims,
-                             tensor::Tensor& output_tensor) const;
+                             tensor::Tensor& output_tensor,
+                             base::DataType expected_dtype = base::DataType::Fp32) const;
 
     base::Status load_tensor(const std::string& name, const std::vector<int32_t>& expected_dims,
                              op::Parameter& output_parameter) const;

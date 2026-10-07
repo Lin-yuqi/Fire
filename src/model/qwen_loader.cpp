@@ -30,13 +30,14 @@ base::Status Qwen3Loader::loader_tensor(const std::string& name,
 
 base::Status Qwen3Loader::load_tensor(const std::string& name,
                                       const std::vector<int32_t>& expected_dims,
-                                      tensor::Tensor& output_tensor) const {
+                                      tensor::Tensor& output_tensor,
+                                      base::DataType expected_dtype) const {
     tensor::Tensor tensor;
     auto status = loader_tensor(name, tensor);
     if (!status) {
         return status;
     }
-    if (tensor.data_type() != base::DataType::Fp32 || tensor.dims() != expected_dims) {
+    if (tensor.data_type() != expected_dtype || tensor.dims() != expected_dims) {
         return base::error::ModelParseError("invalid Qwen3 tensor: " + name);
     }
     output_tensor = std::move(tensor);
@@ -46,20 +47,25 @@ base::Status Qwen3Loader::load_tensor(const std::string& name,
 base::Status Qwen3Loader::load_tensor(const std::string& name,
                                       const std::vector<int32_t>& expected_dims,
                                       op::Parameter& output_parameter) const {
-    // .qweight .scales .zero_points int4
-    // .weight FP32
-    
+    // The mixed AWQ layout keeps only output.weight as a plain BF16 linear.
+    const size_t mixed_tensor_count =
+        _profile.tensor_count() + 2 * static_cast<size_t>(_profile.num_layers) * 7;
+    const bool mixed = _reader.tensor_count() == mixed_tensor_count;
+    const bool plain_expected = _reader.tensor_count() == _profile.tensor_count() ||
+                                (mixed && name == "output.weight");
+
     op::Parameter parameter;
     if (_reader.find(name) != nullptr) {
-        if (_reader.tensor_count() != _profile.tensor_count()) {
-            return base::error::ModelParseError("unexpected FP32 Qwen3 linear tensor: " + name);
+        if (!plain_expected) {
+            return base::error::ModelParseError("unexpected plain Qwen3 linear tensor: " + name);
         }
-        auto status = load_tensor(name, expected_dims, parameter._data);
+        auto status = load_tensor(name, expected_dims, parameter._data,
+                                  mixed ? base::DataType::Bf16 : base::DataType::Fp32);
         if (!status) {
             return status;
         }
     } else {
-        if (_reader.tensor_count() == _profile.tensor_count()) {
+        if (plain_expected) {
             return base::error::ModelParseError("Qwen3 tensor not found: " + name);
         }
         constexpr int32_t group_size = 128;
@@ -118,12 +124,14 @@ base::Status Qwen3Loader::load_weights(Qwen3Weights& output_weights) const {
     if (!_profile.is_valid()) {
         return base::error::InvalidArgument("invalid Qwen3 profile");
     }
-    // INT4 replaces each of the seven linear weights per layer and the output
-    // weight with a qweight/scales/zero_points triplet.
-    const size_t quantized_tensor_count =
-        _profile.tensor_count() + 2 * (static_cast<size_t>(_profile.num_layers) * 7 + 1);
+    // INT4 replaces each projection with a qweight/scales/zero_points triplet.
+    // The mixed layout leaves output.weight plain and saves embedding as BF16.
+    const size_t mixed_tensor_count =
+        _profile.tensor_count() + 2 * static_cast<size_t>(_profile.num_layers) * 7;
+    const size_t quantized_tensor_count = mixed_tensor_count + 2;
     if (_reader.tensor_count() != _profile.tensor_count() &&
-        _reader.tensor_count() != quantized_tensor_count) {
+        _reader.tensor_count() != quantized_tensor_count &&
+        _reader.tensor_count() != mixed_tensor_count) {
         return base::error::ModelParseError("Qwen3 tensor count does not match profile");
     }
 
@@ -132,7 +140,10 @@ base::Status Qwen3Loader::load_weights(Qwen3Weights& output_weights) const {
     weights.layers.resize(static_cast<size_t>(_profile.num_layers));
 
     auto status = load_tensor("tok_embeddings.weight",
-                              {_profile.model.vocab_size, _profile.hidden_size}, weights.embedding);
+                              {_profile.model.vocab_size, _profile.hidden_size}, weights.embedding,
+                              _reader.tensor_count() == mixed_tensor_count
+                                  ? base::DataType::Bf16
+                                  : base::DataType::Fp32);
     if (!status) {
         return status;
     }

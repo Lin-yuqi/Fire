@@ -40,7 +40,8 @@ void WriteU64(std::vector<uint8_t>& bytes, size_t offset, uint64_t value) {
     }
 }
 
-std::vector<uint8_t> SmallQwenFixture(bool quantized, bool wrong_group = false) {
+std::vector<uint8_t> SmallQwenFixture(bool quantized, bool wrong_group = false,
+                                      bool mixed_awq = false, bool wrong_head_dtype = false) {
     struct Entry {
         std::string name;
         uint8_t dtype;
@@ -48,12 +49,17 @@ std::vector<uint8_t> SmallQwenFixture(bool quantized, bool wrong_group = false) 
         uint32_t group_size = 0;
     };
     std::vector<Entry> entries;
-    const auto add_plain = [&](std::string name, std::vector<int32_t> dims) {
-        entries.push_back({std::move(name), 1, std::move(dims)});
+    const auto add_plain = [&](std::string name, std::vector<int32_t> dims,
+                               uint8_t dtype = 1) {
+        entries.push_back({std::move(name), dtype, std::move(dims)});
     };
     const auto add_linear = [&](std::string name, int32_t rows, int32_t columns) {
         if (!quantized) {
             add_plain(std::move(name), {rows, columns});
+            return;
+        }
+        if (mixed_awq && name == "output.weight") {
+            add_plain(std::move(name), {rows, columns}, wrong_head_dtype ? 1 : 3);
             return;
         }
         const std::string prefix = name.substr(0, name.size() - 7); // remove .weight
@@ -63,7 +69,7 @@ std::vector<uint8_t> SmallQwenFixture(bool quantized, bool wrong_group = false) 
         entries.push_back({prefix + ".zero_points", 2, {rows, columns / 128}});
     };
 
-    add_plain("tok_embeddings.weight", {128, 128});
+    add_plain("tok_embeddings.weight", {128, 128}, mixed_awq ? 3 : 1);
     add_plain("layers.0.attention_norm.weight", {128});
     add_linear("layers.0.attention.wq.weight", 128, 128);
     add_linear("layers.0.attention.wk.weight", 128, 128);
@@ -91,7 +97,7 @@ std::vector<uint8_t> SmallQwenFixture(bool quantized, bool wrong_group = false) 
         std::memcpy(bytes.data() + offset, entry.name.data(), entry.name.size());
         const size_t elements = static_cast<size_t>(entry.dims[0]) *
                                 (entry.dims.size() == 2 ? entry.dims[1] : 1);
-        const size_t size = elements * (entry.dtype == 1 ? 4 : 1);
+        const size_t size = elements * (entry.dtype == 1 ? 4 : entry.dtype == 3 ? 2 : 1);
         WriteU64(bytes, offset + 64, bytes.size());
         WriteU64(bytes, offset + 72, size);
         WriteU32(bytes, offset + 80, entry.dims[0]);
@@ -102,7 +108,12 @@ std::vector<uint8_t> SmallQwenFixture(bool quantized, bool wrong_group = false) 
             bytes[offset + 90] = 1;
             WriteU32(bytes, offset + 91, entry.group_size);
         }
-        bytes.resize(bytes.size() + size, 0);
+        const size_t payload_offset = bytes.size();
+        bytes.resize(payload_offset + size, 0);
+        if (entry.dtype == 3 && (entry.name == "tok_embeddings.weight" ||
+                                 entry.name == "output.weight")) {
+            WriteU32(bytes, payload_offset, 0x40003f80); // BF16 1.0, 2.0
+        }
     }
     return bytes;
 }
@@ -175,6 +186,64 @@ TEST(Qwen3LoaderTest, RejectsUnsupportedInt4GroupSize) {
     EXPECT_EQ(status.code(), base::StatusCode::ModelParseError);
     EXPECT_TRUE(weights.layers.empty());
 }
+
+TEST(Qwen3LoaderTest, LoadsMixedAwqWeightsAndKeepsBf16Bits) {
+    TemporaryQwenFile file(SmallQwenFixture(true, false, true));
+    model::Qwen3Weights weights;
+    {
+        model::Qwen3Loader loader(SmallQwenProfile());
+        auto status = loader.open(file.path());
+        ASSERT_TRUE(status.ok()) << status.message();
+        status = loader.load_weights(weights);
+        ASSERT_TRUE(status.ok()) << status.message();
+    }
+
+    EXPECT_EQ(weights.embedding.data_type(), base::DataType::Bf16);
+    EXPECT_EQ(weights.embedding.byte_size(), 128U * 128U * 2U);
+    EXPECT_EQ(weights.embedding.ptr<uint16_t>()[0], 0x3f80);
+    EXPECT_EQ(weights.embedding.ptr<uint16_t>()[1], 0x4000);
+    EXPECT_EQ(weights.norm.data_type(), base::DataType::Fp32);
+    EXPECT_FALSE(weights.output.is_quantized());
+    EXPECT_EQ(weights.output._data.data_type(), base::DataType::Bf16);
+    EXPECT_EQ(weights.output._data.ptr<uint16_t>()[0], 0x3f80);
+    const auto& projection = weights.layers.front().wq;
+    EXPECT_EQ(projection._quant_config._quant_type, op::QuantType::Int4GroupWise);
+    EXPECT_EQ(projection._data.data_type(), base::DataType::UInt8);
+    EXPECT_EQ(projection._scales.data_type(), base::DataType::Fp32);
+    EXPECT_EQ(projection._zero_points.data_type(), base::DataType::UInt8);
+}
+
+TEST(Qwen3LoaderTest, RejectsFp32HeadInMixedAwqLayout) {
+    TemporaryQwenFile file(SmallQwenFixture(true, false, true, true));
+    model::Qwen3Loader loader(SmallQwenProfile());
+    auto status = loader.open(file.path());
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    model::Qwen3Weights weights;
+    status = loader.load_weights(weights);
+    EXPECT_EQ(status.code(), base::StatusCode::ModelParseError);
+    EXPECT_TRUE(weights.layers.empty());
+}
+
+TEST(Qwen3LoaderTest, LoadsLocalQwen3Awq8BFile) {
+    const char* path = std::getenv("FIRE_QWEN3_AWQ_PATH");
+    if (path == nullptr) {
+        GTEST_SKIP() << "set FIRE_QWEN3_AWQ_PATH to an exported 8B AWQ .fire file";
+    }
+    model::Qwen3Loader loader(model::qwen3_profiles::Qwen3_8B);
+    auto status = loader.open(path);
+    ASSERT_TRUE(status.ok()) << status.message();
+    model::Qwen3Weights weights;
+    status = loader.load_weights(weights);
+    ASSERT_TRUE(status.ok()) << status.message();
+    EXPECT_EQ(weights.embedding.data_type(), base::DataType::Bf16);
+    EXPECT_EQ(weights.output._data.data_type(), base::DataType::Bf16);
+    EXPECT_FALSE(weights.output.is_quantized());
+    EXPECT_EQ(weights.layers.size(), 36U);
+    EXPECT_EQ(weights.layers.front().wq._quant_config._group_size, 128);
+    EXPECT_TRUE(weights.layers.back().w3.is_quantized());
+}
+
 TEST(Qwen3ProfileTest, PresetsKeepArchitectureDifferencesInData) {
     const auto& small = model::qwen3_profiles::Qwen3_0_6B;
     const auto& large = model::qwen3_profiles::Qwen3_8B;
