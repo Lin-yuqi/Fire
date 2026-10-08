@@ -192,6 +192,9 @@ TEST(TinyllamaTest, GpuForwardTwoTokensOnNonDefaultStream) {
 }
 
 TEST(TinyllamaTest, LoadRmsNormWeight) {
+    if (!std::filesystem::exists(FIRE_TINYLLAMA_PATH)) {
+        GTEST_SKIP() << "TinyLlama .fire file is unavailable: " << FIRE_TINYLLAMA_PATH;
+    }
     // 没有 CUDA 就跳过
     int device_count = 0;
     auto error = cudaGetDeviceCount(&device_count);

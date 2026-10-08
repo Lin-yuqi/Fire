@@ -29,6 +29,14 @@ include(GoogleTest)
 
 gtest_discover_tests(fire_tests)
 
+add_test(NAME fire_qwen_chat_help COMMAND qwen_chat --help)
+add_test(NAME fire_qwen_chat_invalid_context COMMAND qwen_chat --context-size 0)
+add_test(NAME fire_qwen_chat_invalid_profile COMMAND qwen_chat --profile 7b)
+set_tests_properties(
+    fire_qwen_chat_invalid_context fire_qwen_chat_invalid_profile
+    PROPERTIES WILL_FAIL TRUE
+)
+
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(FIRE_V1_FIXTURE_PATH "${CMAKE_CURRENT_BINARY_DIR}/fixtures/fire_v1_contract.fire")

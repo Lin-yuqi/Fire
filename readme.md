@@ -2,29 +2,28 @@
 
 > 一个从零实现、面向学习和实验的轻量级 CUDA LLM 推理框架。
 
-**Fire v0.1 已发布。** 当前版本围绕固定的
-[`TinyLlama/TinyLlama-1.1B-Chat-v1.0`](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0)
-Model Profile，打通了以下端到端路径：
+**Fire v0.2 已接通 Qwen3 聊天。** 保留 v0.1 的 TinyLlama FP32 基线，新增
+Qwen3-0.6B/8B profile、ByteLevel BPE tokenizer 和 `qwen_chat`。本地
+Qwen3-8B-AWQ 已完成 GPU 多轮中文生成与 `/reset` 验证。
 
 ```text
-Hugging Face checkpoint
+TinyLlama / Qwen3 checkpoint
         ↓
-TinyLlama exporter → FP32 .fire v1
+Model-specific exporter → FP32 .fire v1 / INT4、BF16 .fire v2
         ↓
-FireReader / TinyllamaLoader
+FireReader / TinyllamaLoader / Qwen3Loader
         ↓
-TinyLlamaModel CPU/CUDA forward + KV Cache
+TinyLlamaModel / Qwen3Model forward + KV Cache
         ↓
-SentencePiece tokenizer + Argmax sampler
+SentencePiece / Qwen3 ByteLevel BPE tokenizer + Argmax sampler
         ↓
-llama_chat CLI
+llama_chat / qwen_chat CLI
 ```
 
-Fire 是个人学习项目。v0.1 的目标是提供一条结构清晰、可以阅读和测试的
-TinyLlama FP32 推理基线，不是生产级推理服务，也不试图替代 llama.cpp、vLLM
-或 Transformers。
+Fire 是个人学习项目。v0.2 在 TinyLlama 基线上补齐 Qwen3 文本生成入口，保持
+单序列、逐 token 的执行方式，便于阅读和测试。
 
-## v0.1 能做什么
+## v0.2 能做什么
 
 - 读取固定 TinyLlama profile 的 BF16 Hugging Face safetensors，并导出为 FP32
   `.fire` v1 Tensor Container。
@@ -33,10 +32,16 @@ TinyLlama FP32 推理基线，不是生产级推理服务，也不试图替代 l
   Attention/FFN、RoPE、GQA、KV Cache、final RMSNorm 和 LM Head。
 - 使用 SentencePiece 完成文本编解码，使用 ArgmaxSampler 做 greedy decoding。
 - 运行一个简单的多轮聊天 CLI；跨轮复用 KV Cache，达到 2048 token 上限后结束会话。
+- 通过同一套 Qwen3Loader/Qwen3Model 执行 0.6B/8B profile；FP32 权重支持
+  CPU/CUDA，INT4 权重执行要求 GPU。
+- 将官方 Qwen3-8B-AWQ GEMM 权重导入 `.fire` v2；Embedding/LM Head 保留
+  BF16，投影使用 Fire 的 INT4 布局，激活和 KV Cache 使用 FP32。
+- 使用 Qwen3 tokenizer 和聊天模板进行多轮生成，支持 thinking 开关、流式 UTF-8
+  输出、上下文预算、两种 EOS 和 `/reset`。
 - 通过 GoogleTest 和 Python contract tests 验证 Buffer、Tensor、Operator、Reader、
   exporter、tokenizer、sampler 和模型运行路径。
 
-当前明确不支持 batching、量化、随机采样、PagedAttention、通用模型自动识别或
+当前明确不支持 batching、随机采样、PagedAttention、通用模型自动识别或
 生产服务。完整限制见[已知限制](#已知限制)。
 
 ## 快速开始
@@ -54,6 +59,8 @@ TinyLlama FP32 推理基线，不是生产级推理服务，也不试图替代 l
 - glog
 - Armadillo
 - SentencePiece development headers/library
+- nlohmann_json CMake package / headers
+- ICU development headers/libraries（uc、i18n）
 - GoogleTest（只在构建测试时需要）
 - Python 3.9+（导出和 Python tests）
 
@@ -68,6 +75,8 @@ sudo apt install -y \
   libgoogle-glog-dev \
   libarmadillo-dev \
   libsentencepiece-dev \
+  nlohmann-json3-dev \
+  libicu-dev \
   libgtest-dev \
   python3 \
   python3-pip \
@@ -101,7 +110,8 @@ cmake --build build --parallel
 ```text
 build/src/libfire.a       # Fire 静态库
 build/test/fire_tests     # C++ GTest
-build/demo/llama_chat     # 聊天 CLI
+build/demo/llama_chat     # TinyLlama 聊天 CLI
+build/demo/qwen_chat      # Qwen3 聊天 CLI
 ```
 
 如果只想构建库和 demo、不安装 GoogleTest：
@@ -110,7 +120,7 @@ build/demo/llama_chat     # 聊天 CLI
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=OFF
-cmake --build build --target fire llama_chat --parallel
+cmake --build build --target fire llama_chat qwen_chat --parallel
 ```
 
 重新开启测试时需要重新配置：
@@ -118,6 +128,10 @@ cmake --build build --target fire llama_chat --parallel
 ```bash
 cmake -S . -B build -DBUILD_TESTING=ON
 ```
+
+如果 Conda 和系统中存在不同版本的 ICU，需要让 ICU 头文件和库来自同一安装。
+本机配置时添加 `-Dnlohmann_json_DIR=/usr/local/share/cmake/nlohmann_json`，选择
+系统 JSON 包，避免 Conda include 路径覆盖系统 ICU 头文件。
 
 ### 3. 准备 Python 导出环境
 
@@ -211,7 +225,7 @@ stat -c '%n %s bytes' tmp/llama.fire
 `.fire` 只保存模型 tensor，不包含 tokenizer；启动 demo 时仍需要原始
 `tokenizer.model`。`tmp/` 同样已被 `.gitignore` 忽略。
 
-#### Qwen3 exporter（v0.2 开发中）
+#### Qwen3 exporter（v0.2）
 
 同一个 exporter 会从 `config.json` 自动识别 Qwen3-0.6B 或 Qwen3-8B，并支持单个
 `model.safetensors` 或标准 HF shard index：
@@ -225,8 +239,20 @@ python -B tools/export_qwen3.py \
 0.6B 会校验 311 个 BF16 source tensor，生成预期长度为 `3,006,559,424` bytes
 （约 2.80 GiB）的 FP32 `.fire` v1。当前本地 0.6B 文件已通过 Loader、两 token
 CPU/GPU forward 和 Hugging Face eager attention 的逐位置 logits 对齐；GPU 测试使用非默认
-CUDA stream。Qwen3 的 tokenizer/chat 入口和量化执行仍未验收。8B 的相同路径会生成约
-30.5 GiB 的 FP32 文件；Fire v1 目前没有量化 payload 编码，不应把它当作最终 8B 量化方案。
+CUDA stream。8B 的相同 FP32 路径会生成约 30.5 GiB 的文件。
+
+本地已量化的 Qwen3-8B-AWQ 使用独立的导入模式，转换 packing 而不再量化投影：
+
+```bash
+python -B tools/export_qwen3.py \
+  --hf models/Qwen3-8B-AWQ \
+  --quantization awq \
+  tmp/qwen3-8B-awq.fire
+```
+
+该路径生成混合 BF16/INT4 的 `.fire` v2；运行时使用 Qwen3Model 的 GPU 执行路径。
+它已通过原始 AWQ/Hugging Face FP32 两 token logits 对齐和 2048 token
+teacher-forcing 验证；这些检查与聊天 smoke test 不代替完整的语料质量评估。
 
 ### 6. 启动聊天 demo
 
@@ -272,6 +298,36 @@ CLI 内支持：
 真实 GPU forward 测试要求至少约 5 GiB 空闲显存；demo 的实际需求还会受到 CUDA
 runtime、allocator cache 和设备上其他进程影响。
 
+#### Qwen3 聊天
+
+默认加载 `tmp/qwen3-8B-awq.fire` 和 `models/Qwen3-8B-AWQ/` 的 tokenizer：
+
+```bash
+./build/demo/qwen_chat
+./build/demo/qwen_chat --help
+```
+
+默认使用 8B profile、GPU、2048 token 上下文、128 token 回复上限，关闭 thinking。
+支持与 TinyLlama demo 相同的 `/help`、`/reset`、`/exit` 和 `/quit` 命令。
+
+```bash
+# 使用自己导出的 0.6B FP32 文件；FP32 也可以选择 cpu
+./build/demo/qwen_chat --profile 0.6b \
+  tmp/qwen3-0.6b.fire models/Qwen3-0.6B gpu
+
+# 显式启用 thinking，并调整生成预算
+./build/demo/qwen_chat --thinking --max-new-tokens 256 --context-size 2048
+```
+
+`qwen_chat` 不添加 BOS，按本地 Qwen3 无工具模板构造消息。它只在 tokenizer 有效
+词表范围内做 greedy 采样，遇到 `<|im_end|>` 或 `<|endoftext|>` 停止，随后补齐
+assistant 的 `<|im_end|>\n`。预先为结束标记与换行留出空间；历史和输入过长时
+保留当前对话，并提示缩短输入或 `/reset`。
+
+下一轮模板的 token 前缀与现有缓存一致时复用 KV Cache；移除旧 thinking 内容等
+模板变化会触发 reset 并重放历史。输入仍是单行文本，不支持工具调用或滑动窗口。
+INT4/AWQ 模型必须选择 GPU；启动时会检查可用显存。
+
 ## 测试
 
 完成构建、模型下载和导出后运行全部已注册测试：
@@ -289,7 +345,7 @@ ctest --test-dir build --output-on-failure
 只运行 tokenizer 或 sampler：
 
 ```bash
-ctest --test-dir build -R 'LlamaTokenizer|ArgmaxSampler' --output-on-failure
+ctest --test-dir build -R 'Tokenizer|BPETest|QwenChatTest|fire_qwen_chat_|ArgmaxSampler' --output-on-failure
 ```
 
 Python Writer/exporter contract tests：
@@ -340,7 +396,7 @@ Fire/
 │   ├── tensor/               # Tensor shape、view 与存储
 │   ├── op/                   # Operator 公共接口
 │   ├── model/                # Reader、Loader、KVCache、TinyLlama、Qwen3 框架
-│   ├── tokenizer/            # Tokenizer 接口与 Llama SentencePiece 实现
+│   ├── tokenizer/            # Tokenizer、SentencePiece 与 Qwen3 ByteLevel BPE
 │   └── sampler/              # Sampler 接口与 ArgmaxSampler
 ├── src/
 │   ├── base/
@@ -355,7 +411,9 @@ Fire/
 │   ├── export_tinyllama.py
 │   └── export_qwen3.py
 ├── demo/
-│   └── llama_chat.cpp
+│   ├── llama_chat.cpp
+│   ├── qwen_chat.cpp
+│   └── qwen_chat_utils.h
 ├── docs/
 │   ├── model_export_v0_1.md
 │   ├── model_design_v0_1.md
@@ -400,14 +458,15 @@ TinyLlama 的名称、shape 和配置约束由 `TinyllamaLoader` 与固定 Model
 
 ## 已知限制
 
-- v0.1 只支持 `TinyLlama/TinyLlama-1.1B-Chat-v1.0` 这一固定 profile。
-- 模型执行是单序列、单 token、FP32；没有 batching 和量化执行路径。
-- `llama_chat` 只有 greedy sampling，KV Cache 只追加、不支持滑动窗口或历史压缩。
+- 模型范围是固定 TinyLlama profile 与 Qwen3-0.6B/8B dense profile。
+- 模型执行是单序列、单 token；激活和 KV Cache 保持 FP32，没有 batching。
+- 两个聊天 demo 只有 greedy sampling，不支持滑动窗口或历史压缩。
+- INT4/AWQ 执行只支持 GPU。Qwen3 默认容量为 2048；更大的容量需要单独测量显存。
 - CPU 推理仅适合作为正确性基线，速度很慢。
 - 项目配置阶段即要求 CUDA Toolkit；尚未提供纯 CPU-only build。
 - 部分底层约束仍通过 glog `CHECK/LOG(FATAL)` 处理，不适合作为不可信输入服务边界。
-- 尚未形成与 Hugging Face 参考实现逐位置 logits/token 的独立对齐记录；已有验证主要是
-  CPU/GPU 自一致性、算子数值测试和端到端生成路径。
+- 已有固定 token 的 Hugging Face logits 对齐；更完整的语料质量回归与量化质量评估
+  仍需补充，不能把短提示词生成视为完整模型质量验收。
 - Softmax 已有 CPU/CUDA kernel 并用于 MHA，但尚无独立公开 `SoftmaxOp`。
 
 ## Roadmap
@@ -422,12 +481,21 @@ TinyLlama 的名称、shape 和配置约束由 `TinyllamaLoader` 与固定 Model
 - [x] 简单多轮 `llama_chat` CLI
 - [x] 真实模型 CPU/GPU 双 token 验证
 
-### v0.1 后续验证与 v0.2+
+### v0.2：Qwen3 文本生成
+
+- [x] 0.6B/8B 共用的 profile、Loader 和 Qwen3Model
+- [x] `.fire` v2 INT4/BF16 与官方 8B AWQ 导入
+- [x] Qwen3 ByteLevel BPE tokenizer 与 HF 编码样例对齐
+- [x] `qwen_chat`、thinking 开关、上下文管理与 UTF-8 流式输出
+- [x] 本地 8B AWQ 两 token HF logits 对齐、2048 token teacher forcing
+- [x] 本地 8B AWQ 多轮中文生成与 `/reset`
+
+### 后续验证与优化
 
 - Hugging Face 参考 logits/token 独立对齐
 - 更完整的 Loader/状态失败矩阵与 CUDA 错误传播
 - temperature、top-k、top-p 等 sampling 策略
-- Batch、量化与更灵活的 Model Profile
+- Batch、量化质量回归与更灵活的 Model Profile
 - Kernel Fusion、显存复用和 profiling
 - PagedAttention 与更完整的生成 runtime
 

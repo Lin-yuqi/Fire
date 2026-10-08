@@ -1,6 +1,6 @@
 # Qwen3 量化路线
 
-状态：量化数学、`.fire` v2 Writer/Reader、Qwen3 INT4 Exporter、Qwen3 Loader 和 GPU INT4 Linear 已有实现及小型合同验证；v2 的 BF16 wire dtype 与 Tensor 字节宽度也已实现。8B 混合 BF16/INT4 导出、Loader 绑定、BF16 Embedding/`lm_head` 算子、官方 AWQ 导入及真实 8B 模型验收尚未完成。格式可读不等于量化模型可运行。
+状态（2026-10-08）：RTN INT4、v2 Writer/Reader、BF16 Embedding/`lm_head`、混合布局 Loader 与官方 8B AWQ 导入已经接通。8B AWQ 已通过原始权重/HF FP32 两 token logits 对齐、2048 token teacher forcing，以及 v0.2 `qwen_chat` 多轮中文生成与 `/reset`。未量化 8B 的混合 RTN 导出仍待实现；完整语料质量回归、量化质量门槛和 4096 容量验收仍未完成。
 
 ## 路线决策
 
@@ -15,10 +15,10 @@
 - 8B 的每层七个投影（Q/K/V/O、gate/up/down）使用 INT4；Embedding 与 `lm_head` 保留 BF16，Norm 保持 FP32。现有 0.6B RTN 基线仍使用 INT4 `lm_head` 和 FP32 Embedding；将 8B 导出路径改为混合布局是后续实现工作。
 - 统一物理布局：每个 UInt8 打包两个 UInt4 qweight；每组一个 FP32 scale、一个未打包的 UInt8 zero-point。通用 `Tensor` 只看到字节可寻址的物理 tensor，不引入 0.5 字节元素的 dtype。已锁定偶数列位于低 nibble、奇数列位于高 nibble，量化舍入使用 NumPy `rint` 的 ties-to-even；全零组编码为 `q=0, scale=1, zero=0`。
 - `.fire` v2 保存量化参数关联、`group_size` 和可混用的 BF16 普通 tensor；v1 仍只表示 FP32。Qwen3 INT4 当前只接受 group size 128，且拒绝 `K % 128 != 0`；Exporter 预检，Loader 防御性复核。模型专用的名称映射、tensor 选择和 profile 校验留在 Qwen3 exporter/loader；量化数学、packing 和 Linear 执行为通用原语。
-- `Qwen3Weights` 中可供 Linear 使用的权重统一用 `op::Parameter` 表示：FP32/BF16 路径为 `quant_type=None`，INT4 路径携带 qweight、scales、zero-points 和显式 `group_size`。Embedding/Norm 保持普通 Tensor。后续 BF16 Embedding 查表输出 FP32，BF16 `lm_head` 接收 FP32 hidden 并输出 FP32 logits；`Parameter` 的设备迁移、设备校验继续覆盖全部量化数据 tensor。
+- `Qwen3Weights` 中可供 Linear 使用的权重统一用 `op::Parameter` 表示：FP32/BF16 路径为 `quant_type=None`，INT4 路径携带 qweight、scales、zero-points 和显式 `group_size`。Embedding/Norm 保持普通 Tensor。BF16 Embedding 查表输出 FP32，BF16 `lm_head` 接收 FP32 hidden 并输出 FP32 logits；`Parameter` 的设备迁移、设备校验覆盖全部量化数据 tensor。
 - Exporter 从源 safetensors 分片直接流式写出 v2 量化文件，不先生成约 30.5 GiB 的 FP32 8B `.fire`。初期 CPU 路径重在可读的数值基准；CUDA 路径须避免常驻完整 FP32 反量化权重，并记录速度与峰值显存。
 
-`.fire` v2 保留 32 字节 header 和 96 字节目录项，版本号为 2；wire dtype `1=FP32`、`2=UInt8`、`3=BF16`。BF16 payload 是 little-endian `uint16` 原始位模式，每个元素 2 字节；Python Writer 接收 `np.uint16` 位模式而不做数值转换。目录项最后 6 字节在 v1 全零，在 v2 编码 `quant_kind:u8, group_size:u32 little-endian, reserved:u8`；FP32/BF16 普通 tensor 六字节全零，INT4 qweight 使用 `quant_kind=1`、`group_size=128`。量化 Linear 以同一前缀的 `.qweight`、`.scales`、`.zero_points` 三条目录项关联；每条 payload 起点四字节对齐，间隙必须填零。BF16 只在 v2 有效，不能携带量化元数据；Reader/Writer 已验证这些格式规则。Qwen3 Loader 仍需支持 8B 混合布局并复核完整 profile。
+`.fire` v2 保留 32 字节 header 和 96 字节目录项，版本号为 2；wire dtype `1=FP32`、`2=UInt8`、`3=BF16`。BF16 payload 是 little-endian `uint16` 原始位模式，每个元素 2 字节；Python Writer 接收 `np.uint16` 位模式而不做数值转换。目录项最后 6 字节在 v1 全零，在 v2 编码 `quant_kind:u8, group_size:u32 little-endian, reserved:u8`；FP32/BF16 普通 tensor 六字节全零，INT4 qweight 使用 `quant_kind=1`、`group_size=128`。量化 Linear 以同一前缀的 `.qweight`、`.scales`、`.zero_points` 三条目录项关联；每条 payload 起点四字节对齐，间隙必须填零。BF16 只在 v2 有效，不能携带量化元数据；Reader/Writer 已验证这些格式规则。Qwen3 Loader 已支持 8B 混合布局并复核完整 profile。
 
 ## 阶段与完成条件
 
@@ -37,4 +37,4 @@
 | 2048 | 5945.93 MiB | 576 MiB | 20.25 MiB | 6542.18 MiB | 1645.82 MiB |
 | 4096 | 5945.93 MiB | 1152 MiB | 20.50 MiB | 7118.43 MiB | 1069.57 MiB |
 
-表中尚未包括其他 Runtime tensor、logits、CUDA context、allocator 额外占用、临时工作区、显存碎片和其他进程。当前只完成 BF16 格式层，表中布局尚不能在模型中加载和执行。后续须在实际可用显存下测量完整初始化、`prepare(capacity)` 和生成峰值；尤其不能据此宣布 4096 已可运行。若 2048 仍不能运行，先检查实际空闲显存与临时分配，再评估 BF16 KV Cache 等独立改造。
+表中尚未包括其他 Runtime tensor、logits、CUDA context、allocator 额外占用、临时工作区、显存碎片和其他进程。本地 8B AWQ 已加载该混合布局并执行 2048 token teacher forcing；该检查观察到设备总显存占用峰值约 7876.7 MiB。v0.2 聊天 demo 也已在 2048 容量完成多轮生成和 reset。4096 尚未验收，不能据估算表宣布可运行；仍需按实际可用显存测量。

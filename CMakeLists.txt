@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.17)
 
-project(Fire LANGUAGES CXX CUDA)
+project(Fire VERSION 0.2.0 LANGUAGES CXX CUDA)
 
 # ==============================
 # C++ 基本配置
