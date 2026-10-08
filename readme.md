@@ -129,9 +129,9 @@ cmake --build build --target fire llama_chat qwen_chat --parallel
 cmake -S . -B build -DBUILD_TESTING=ON
 ```
 
-如果 Conda 和系统中存在不同版本的 ICU，需要让 ICU 头文件和库来自同一安装。
-本机配置时添加 `-Dnlohmann_json_DIR=/usr/local/share/cmake/nlohmann_json`，选择
-系统 JSON 包，避免 Conda include 路径覆盖系统 ICU 头文件。
+CMake 会在构建目录中为选中的 ICU 建立独立头文件入口，并优先用于 Fire 编译，
+避免 Conda 的 JSON 包引入其他版本的 ICU 头文件。正常配置无需手动指定
+`nlohmann_json_DIR`；已有构建目录直接重新运行 `cmake -S . -B build` 即可。
 
 ### 3. 准备 Python 导出环境
 
@@ -490,13 +490,33 @@ TinyLlama 的名称、shape 和配置约束由 `TinyllamaLoader` 与固定 Model
 - [x] 本地 8B AWQ 两 token HF logits 对齐、2048 token teacher forcing
 - [x] 本地 8B AWQ 多轮中文生成与 `/reset`
 
+### 下一阶段：算子优化与吞吐提升
+
+以当前单序列 Qwen3-8B-AWQ GPU 路径为基线，先测量瓶颈，再逐项优化 CUDA
+算子。主要目标是提高 decode 的 tokens/s、降低 TPOT，同时观察 TTFT 和显存
+占用；以下工作尚未实现，优化效果以实测为准。
+
+- [ ] 建立可重复的性能基线：固定模型、提示词、上下文长度和生成长度，预热后
+  多次测量，记录 TTFT、TPOT、decode tokens/s 和峰值显存；分别观察 prompt
+  prefill 与逐 token decode，并记录多轮聊天中历史重放的开销。
+- [ ] 使用 CUDA events、Nsight Systems / Nsight Compute 定位耗时，区分算子
+  执行、kernel launch、CPU/GPU 数据传输和同步开销，再确定优化顺序。
+- [ ] 优先尝试 Linear 的单 token 路径：为 `N=1` 设计 INT4 GEMV，改进权重读取、
+  解包、group metadata 复用和并行归约；评估 FP32/BF16 GEMV 对 LM Head 等
+  dense projection 的收益。
+- [ ] 根据 profiling 结果优化 MHA 的 KV Cache 访问与归约，以及 RMSNorm、
+  SwiGLU 等算子；尝试融合能减少中间读写和 launch 次数的操作。
+- [ ] 每项优化都对照 CPU/原 kernel 与 HF logits 验证数值，覆盖模型实际 shape
+  和非默认 CUDA stream，再比较算子耗时、端到端吞吐及显存；保留性能结果与
+  已知适用范围。
+
 ### 后续验证与优化
 
 - Hugging Face 参考 logits/token 独立对齐
 - 更完整的 Loader/状态失败矩阵与 CUDA 错误传播
 - temperature、top-k、top-p 等 sampling 策略
 - Batch、量化质量回归与更灵活的 Model Profile
-- Kernel Fusion、显存复用和 profiling
+- 更进一步的显存复用与生成执行优化
 - PagedAttention 与更完整的生成 runtime
 
 ## Why Fire?

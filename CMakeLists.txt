@@ -52,6 +52,15 @@ find_package(CUDAToolkit REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(ICU REQUIRED COMPONENTS uc i18n)
 
+# Expose only the selected ICU headers through a non-implicit include path.
+# Merely prepending /usr/include cannot prevent another dependency's prefix
+# (for example Conda's nlohmann_json) from shadowing those headers.
+set(FIRE_ICU_HEADER_ROOT "${CMAKE_CURRENT_BINARY_DIR}/icu_include")
+file(MAKE_DIRECTORY "${FIRE_ICU_HEADER_ROOT}")
+file(CREATE_LINK "${ICU_INCLUDE_DIR}/unicode"
+    "${FIRE_ICU_HEADER_ROOT}/unicode" SYMBOLIC
+)
+
 
 # ==============================
 # Fire 核心库

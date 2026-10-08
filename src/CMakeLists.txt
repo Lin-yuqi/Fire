@@ -26,6 +26,8 @@ add_library(fire STATIC
 )
 
 
+target_include_directories(fire BEFORE PRIVATE "${FIRE_ICU_HEADER_ROOT}")
+
 target_include_directories(fire
     PUBLIC
         ${PROJECT_SOURCE_DIR}/include
