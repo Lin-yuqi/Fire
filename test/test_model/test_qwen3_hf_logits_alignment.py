@@ -1,9 +1,11 @@
-"""Compare Fire Qwen3-0.6B logits with Hugging Face references."""
+"""Compare two Fire Qwen3 tokens with independent Hugging Face references."""
 
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import gc
+import json
 import mmap
 import os
 from pathlib import Path
@@ -38,12 +40,171 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=repository / "tmp" / "qwen3-0.6b.fire",
     )
-    parser.add_argument(
+    quantization = parser.add_mutually_exclusive_group()
+    quantization.add_argument(
         "--quantized",
         action="store_true",
         help="compare GPU INT4 logits with the exported weights dequantized in Hugging Face",
     )
+    quantization.add_argument(
+        "--awq",
+        action="store_true",
+        help="compare GPU Qwen3-8B AWQ logits with original safetensors in FP32 HF layers",
+    )
+    parser.add_argument("--report-path", type=Path, help="save alignment metrics as JSON")
     return parser.parse_args()
+
+
+def _awq_dense_weight(qweight, qzeros, scales, group_size: int):
+    """Decode original AutoAWQ GEMM packing, independently of the Fire exporter."""
+    import torch
+
+    input_size, packed_output_size = qweight.shape
+    output_size = packed_output_size * 8
+    if group_size <= 0 or input_size % group_size:
+        raise AssertionError("AWQ input size must be divisible by group size")
+    groups = input_size // group_size
+    if (qweight.dtype != torch.int32 or qzeros.dtype != torch.int32
+            or tuple(qzeros.shape) != (groups, packed_output_size)
+            or tuple(scales.shape) != (groups, output_size)):
+        raise AssertionError("unexpected AWQ GEMM tensor layout")
+
+    # AutoAWQ packs channels in [0, 2, 4, 6, 1, 3, 5, 7] order.
+    # These bit positions recover logical output channels directly.
+    # https://github.com/casper-hansen/AutoAWQ/blob/main/awq/utils/packing_utils.py
+    shifts = torch.tensor([0, 16, 4, 20, 8, 24, 12, 28], dtype=torch.int32)
+    dense = torch.empty((output_size, input_size), dtype=torch.float32)
+    for start in range(0, output_size, 256):
+        end = min(start + 256, output_size)
+        words = qweight[:, start // 8:end // 8]
+        values = ((words.unsqueeze(-1) >> shifts) & 15).reshape(
+            groups, group_size, end - start
+        ).float()
+        zero_words = qzeros[:, start // 8:end // 8]
+        zeros = ((zero_words.unsqueeze(-1) >> shifts) & 15).reshape(
+            groups, end - start
+        ).float()
+        # GEMM zero points have no GPTQ/ExLlama +1 adjustment.
+        values.sub_(zeros[:, None, :])
+        values.mul_(scales[:, None, start:end].float())
+        dense[start:end].copy_(values.reshape(input_size, end - start).T)
+    return dense
+
+
+def _hugging_face_awq_logits(model_path: Path):
+    """Run HF decoder layers on CPU with one original AWQ layer resident at a time.
+
+    BF16 embedding/head values are widened at use; all math is FP32, matching
+    Fire's activation/accumulation contract rather than a fused FP16 AWQ backend.
+    No weights are read from the exported Fire file.
+    """
+    import torch
+    from safetensors import safe_open
+    from transformers import AutoConfig
+    from transformers.models.qwen3.modeling_qwen3 import (
+        Qwen3DecoderLayer, Qwen3RMSNorm, Qwen3RotaryEmbedding,
+    )
+
+    config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    quantization = config.quantization_config
+    if (quantization.get("quant_method") != "awq"
+            or quantization.get("version", "").lower() != "gemm"
+            or quantization.get("bits") != 4
+            or not quantization.get("zero_point")):
+        raise AssertionError("reference requires asymmetric 4-bit AWQ GEMM weights")
+    if (config.hidden_size, config.intermediate_size, config.num_hidden_layers,
+            config.num_attention_heads, config.num_key_value_heads, config.head_dim,
+            config.vocab_size) != (4096, 12288, 36, 32, 8, 128, _VOCAB_SIZE):
+        raise AssertionError("--awq requires the Qwen3-8B profile")
+    config._attn_implementation = "eager"
+    torch.set_num_threads(min(8, os.cpu_count() or 1))
+    weight_map = json.loads(
+        (model_path / "model.safetensors.index.json").read_text()
+    )["weight_map"]
+
+    def source_reader(stack):
+        handles = {}
+
+        def source(name):
+            shard = weight_map[name]
+            if shard not in handles:
+                handles[shard] = stack.enter_context(
+                    safe_open(model_path / shard, framework="pt", device="cpu")
+                )
+            return handles[shard], name
+
+        return source
+
+    with torch.inference_mode():
+        with ExitStack() as stack:
+            handle, name = source_reader(stack)("model.embed_tokens.weight")
+            embedding = handle.get_slice(name)
+            if embedding.get_dtype() != "BF16":
+                raise AssertionError("AWQ embedding must retain BF16 source values")
+            hidden = torch.cat([
+                embedding[token_id:token_id + 1].float() for token_id in _TOKEN_IDS
+            ]).unsqueeze(0)
+            del embedding
+
+        positions = torch.arange(len(_TOKEN_IDS), dtype=torch.long).unsqueeze(0)
+        rotary = Qwen3RotaryEmbedding(config=config)
+        position_embeddings = rotary(hidden, positions)
+        mask = torch.full((len(_TOKEN_IDS), len(_TOKEN_IDS)), float("-inf"))
+        mask = mask.triu(diagonal=1)[None, None, :, :]
+
+        for layer_index in range(config.num_hidden_layers):
+            with torch.device("meta"):
+                layer = Qwen3DecoderLayer(config, layer_index)
+            state = {}
+            with ExitStack() as stack:
+                source = source_reader(stack)
+                for name, parameter in layer.named_parameters():
+                    base = f"model.layers.{layer_index}.{name.removesuffix('.weight')}"
+                    if name.endswith("_proj.weight"):
+                        tensors = []
+                        for suffix in ("qweight", "qzeros", "scales"):
+                            handle, source_name = source(base + "." + suffix)
+                            tensors.append(handle.get_tensor(source_name))
+                        weight = _awq_dense_weight(
+                            *tensors, group_size=quantization["group_size"]
+                        )
+                        del tensors
+                    else:
+                        handle, source_name = source(base + ".weight")
+                        weight = handle.get_tensor(source_name).float()
+                    if weight.shape != parameter.shape:
+                        raise AssertionError(f"AWQ reference shape mismatch: {base}")
+                    state[name] = weight
+                layer.load_state_dict(state, strict=True, assign=True)
+            layer.eval()
+            hidden = layer(
+                hidden, attention_mask=mask, position_ids=positions,
+                position_embeddings=position_embeddings, use_cache=False,
+            )
+            if not torch.isfinite(hidden).all():
+                raise AssertionError(f"nonfinite HF hidden states at layer {layer_index}")
+            del state, layer, weight, parameter
+            print(f"HF AWQ FP32 reference: layer {layer_index + 1}/{config.num_hidden_layers}",
+                  flush=True)
+
+        with ExitStack() as stack:
+            source = source_reader(stack)
+            handle, name = source("model.norm.weight")
+            norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            norm.load_state_dict({"weight": handle.get_tensor(name).float()}, assign=True)
+            hidden = norm(hidden)[0]
+            handle, name = source("lm_head.weight")
+            head = handle.get_slice(name)
+            if head.get_dtype() != "BF16":
+                raise AssertionError("AWQ lm_head must retain BF16 source values")
+            logits = torch.empty((len(_TOKEN_IDS), config.vocab_size), dtype=torch.float32)
+            for start in range(0, config.vocab_size, 1024):
+                end = min(start + 1024, config.vocab_size)
+                logits[:, start:end] = torch.nn.functional.linear(hidden, head[start:end].float())
+            del head
+        reference = logits.numpy().copy()
+    gc.collect()
+    return reference
 
 
 def _load_fire_int4_weights(model, model_path: Path) -> None:
@@ -170,12 +331,15 @@ def _hugging_face_logits(model_path: Path, quantized_model_path: Path | None):
     return reference, quantized_reference
 
 
-def _fire_logits(runner: Path, model_path: Path, output_path: Path, *, quantized: bool):
+def _fire_logits(runner: Path, model_path: Path, output_path: Path, *, quantized: bool,
+                 awq: bool = False):
     import numpy as np
 
     command = [str(runner), str(model_path), str(output_path)]
-    if quantized:
+    if quantized or awq:
         command.append("--gpu")
+    if awq:
+        command.extend(("--profile", "8b"))
     command.extend(str(token_id) for token_id in _TOKEN_IDS)
     subprocess.run(command, check=True)
 
@@ -211,7 +375,7 @@ def _report_quantization_effect(original, quantized) -> None:
         )
 
 
-def _assert_aligned(reference, actual, *, reference_name: str) -> None:
+def _assert_aligned(reference, actual, *, reference_name: str):
     import numpy as np
 
     if reference.shape != actual.shape:
@@ -221,17 +385,32 @@ def _assert_aligned(reference, actual, *, reference_name: str) -> None:
     if not np.isfinite(reference).all() or not np.isfinite(actual).all():
         raise AssertionError("both implementations must produce only finite logits")
 
+    metrics = []
     for position, token_id in enumerate(_TOKEN_IDS):
         reference_row = reference[position]
         fire_row = actual[position]
         absolute_error = np.abs(reference_row - fire_row)
         expected_argmax = int(np.argmax(reference_row))
         fire_argmax = int(np.argmax(fire_row))
+        reference64 = reference_row.astype(np.float64)
+        actual64 = fire_row.astype(np.float64)
+        cosine = float(np.dot(reference64, actual64) /
+                       (np.linalg.norm(reference64) * np.linalg.norm(actual64)))
+        overlap = len(set(np.argpartition(reference_row, -10)[-10:]) &
+                      set(np.argpartition(fire_row, -10)[-10:]))
+        metrics.append({
+            "position": position, "token_id": token_id,
+            "max_abs_error": float(absolute_error.max()),
+            "mean_abs_error": float(absolute_error.mean()),
+            "cosine": cosine, "reference_argmax": expected_argmax,
+            "fire_argmax": fire_argmax, "top10_overlap": overlap,
+        })
         print(
             f"alignment position={position} token={token_id} "
             f"max_abs_error={float(absolute_error.max()):.8g} "
             f"mean_abs_error={float(absolute_error.mean()):.8g} "
-            f"argmax={expected_argmax}/{fire_argmax}"
+            f"cosine={cosine:.10g} argmax={expected_argmax}/{fire_argmax} "
+            f"top10_overlap={overlap}/10"
         )
         if expected_argmax != fire_argmax:
             raise AssertionError(
@@ -246,6 +425,7 @@ def _assert_aligned(reference, actual, *, reference_name: str) -> None:
         atol=_ABSOLUTE_TOLERANCE,
         err_msg=f"Fire Qwen3 logits differ from {reference_name} logits",
     )
+    return metrics
 
 
 def main() -> int:
@@ -264,19 +444,31 @@ def main() -> int:
         if not path.exists():
             raise FileNotFoundError(f"{description} is unavailable: {path}")
 
-    original, quantized_reference = _hugging_face_logits(
-        args.hf_model, args.fire_model if args.quantized else None
-    )
+    if args.awq:
+        original = _hugging_face_awq_logits(args.hf_model)
+        quantized_reference = None
+    else:
+        original, quantized_reference = _hugging_face_logits(
+            args.hf_model, args.fire_model if args.quantized else None
+        )
     with tempfile.TemporaryDirectory(prefix="fire-qwen3-hf-logits-") as temporary_directory:
         output_path = Path(temporary_directory) / "fire_logits.bin"
         actual = _fire_logits(args.runner, args.fire_model, output_path,
-                              quantized=args.quantized)
+                              quantized=args.quantized, awq=args.awq)
     if args.quantized:
         _report_quantization_effect(original, quantized_reference)
-        _assert_aligned(quantized_reference, actual,
-                        reference_name="quantized Hugging Face")
+        reference_name = "quantized Hugging Face"
+        metrics = _assert_aligned(quantized_reference, actual, reference_name=reference_name)
     else:
-        _assert_aligned(original, actual, reference_name="Hugging Face")
+        reference_name = "original AWQ / Hugging Face FP32" if args.awq else "Hugging Face"
+        metrics = _assert_aligned(original, actual, reference_name=reference_name)
+    if args.report_path is not None:
+        args.report_path.write_text(json.dumps({
+            "reference": reference_name, "hf_model": str(args.hf_model),
+            "fire_model": str(args.fire_model), "token_ids": _TOKEN_IDS,
+            "atol": _ABSOLUTE_TOLERANCE, "rtol": _RELATIVE_TOLERANCE,
+            "passed": True, "positions": metrics,
+        }, indent=2) + "\n")
     return 0
 
 

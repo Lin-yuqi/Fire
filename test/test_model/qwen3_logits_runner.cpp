@@ -21,34 +21,64 @@ int fail(const std::string& message) {
     return 1;
 }
 
-bool parse_token_id(const char* text, int32_t& token_id) {
+bool parse_token_id(const char* text, int32_t vocab_size, int32_t& token_id) {
     const std::string value(text);
     const auto [end, error] =
         std::from_chars(value.data(), value.data() + value.size(), token_id);
     return error == std::errc{} && end == value.data() + value.size() && token_id >= 0 &&
-           token_id < model::qwen3_profiles::Qwen3_0_6B.model.vocab_size;
+           token_id < vocab_size;
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
-    const bool use_gpu = argc >= 4 && std::string(argv[3]) == "--gpu";
-    const int first_token_argument = use_gpu ? 4 : 3;
-    if (argc <= first_token_argument) {
-        return fail("usage: qwen3_logits_runner <model.fire> <output.bin> [--gpu] <token-id>...");
+    const std::string usage =
+        "usage: qwen3_logits_runner <model.fire> <output.bin> [--gpu] "
+        "[--profile 0.6b|8b] <token-id>...";
+    if (argc < 4) {
+        return fail(usage);
     }
 
+    bool use_gpu = false;
+    const model::Qwen3Profile* selected_profile = &model::qwen3_profiles::Qwen3_0_6B;
+    int first_token_argument = 3;
+    while (first_token_argument < argc) {
+        const std::string argument(argv[first_token_argument]);
+        if (argument == "--gpu") {
+            use_gpu = true;
+            ++first_token_argument;
+        } else if (argument == "--profile") {
+            if (first_token_argument + 1 >= argc) {
+                return fail("--profile requires 0.6b or 8b");
+            }
+            const std::string name(argv[first_token_argument + 1]);
+            if (name == "0.6b") {
+                selected_profile = &model::qwen3_profiles::Qwen3_0_6B;
+            } else if (name == "8b") {
+                selected_profile = &model::qwen3_profiles::Qwen3_8B;
+            } else {
+                return fail("unsupported profile: " + name);
+            }
+            first_token_argument += 2;
+        } else {
+            break;
+        }
+    }
+    if (argc <= first_token_argument) {
+        return fail(usage);
+    }
+
+    const auto& profile = *selected_profile;
     std::vector<int32_t> token_ids;
     token_ids.reserve(static_cast<size_t>(argc - first_token_argument));
     for (int argument = first_token_argument; argument < argc; ++argument) {
         int32_t token_id = 0;
-        if (!parse_token_id(argv[argument], token_id)) {
+        if (!parse_token_id(argv[argument], profile.model.vocab_size, token_id)) {
             return fail("invalid token id: " + std::string(argv[argument]));
         }
         token_ids.push_back(token_id);
     }
 
-    const auto& profile = model::qwen3_profiles::Qwen3_0_6B;
     model::Qwen3Loader loader(profile);
     auto status = loader.open(argv[1]);
     if (!status) {

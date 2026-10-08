@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -463,6 +464,29 @@ TEST(Qwen3ModelTest, LocalAwq8BGpuForwardProducesFiniteLogits) {
                         "to run the 8B AWQ GPU model";
     }
 
+    const auto& profile = model::qwen3_profiles::Qwen3_8B;
+    std::vector<int32_t> tokens{151643, 9707};
+    if (const char* token_path = std::getenv("FIRE_QWEN3_AWQ_TOKEN_IDS_PATH")) {
+        std::ifstream input(token_path);
+        ASSERT_TRUE(input.is_open()) << "cannot open token IDs: " << token_path;
+        tokens.clear();
+        int32_t token = 0;
+        for (;;) {
+            input >> std::ws;
+            if (input.eof()) {
+                break;
+            }
+            ASSERT_TRUE(static_cast<bool>(input >> token))
+                << "token IDs must be whitespace-separated integers";
+            ASSERT_GE(token, 0);
+            ASSERT_LT(token, profile.model.vocab_size);
+            tokens.push_back(token);
+        }
+    }
+    ASSERT_FALSE(tokens.empty());
+    ASSERT_LE(tokens.size(), static_cast<size_t>(profile.model.max_seq_len));
+    const auto capacity = static_cast<int32_t>(tokens.size());
+
     int device_count = 0;
     const auto device_status = cudaGetDeviceCount(&device_count);
     if (device_status == cudaErrorNoDevice || device_status == cudaErrorInsufficientDriver ||
@@ -474,12 +498,15 @@ TEST(Qwen3ModelTest, LocalAwq8BGpuForwardProducesFiniteLogits) {
     size_t free_bytes = 0;
     size_t total_bytes = 0;
     ASSERT_EQ(cudaMemGetInfo(&free_bytes, &total_bytes), cudaSuccess);
-    // Stored BF16/INT4 weights plus room for a two-token runtime and RoPE cache.
-    if (free_bytes < std::filesystem::file_size(path) + 128ULL * 1024 * 1024) {
+    const size_t kv_bytes = 2ULL * profile.num_layers * capacity * profile.kv_dim() * sizeof(float);
+    const size_t rope_bytes =
+        static_cast<size_t>(profile.model.max_seq_len) * profile.head_dim * sizeof(float);
+    // Allow space for the selected KV capacity, RoPE, other runtime tensors and CUDA overhead.
+    if (free_bytes < std::filesystem::file_size(path) + kv_bytes + rope_bytes +
+                         128ULL * 1024 * 1024) {
         GTEST_SKIP() << "insufficient free VRAM for the 8B AWQ weights and runtime";
     }
 
-    const auto& profile = model::qwen3_profiles::Qwen3_8B;
     model::Qwen3Loader loader(profile);
     auto status = loader.open(path);
     ASSERT_TRUE(status.ok()) << status.message();
@@ -493,23 +520,27 @@ TEST(Qwen3ModelTest, LocalAwq8BGpuForwardProducesFiniteLogits) {
     std::unique_ptr<model::Qwen3Model> qwen3;
     status = model::Qwen3Model::create(weights, context, qwen3);
     ASSERT_TRUE(status.ok()) << status.message();
-    status = qwen3->prepare(2, context);
+    status = qwen3->prepare(capacity, context);
     ASSERT_TRUE(status.ok()) << status.message();
 
     tensor::Tensor logits(base::DataType::Fp32, {profile.model.vocab_size}, context._allocator);
-    const std::array<int32_t, 2> tokens{151643, 9707};
+    std::vector<float> observed(logits.size());
     std::vector<float> first_logits;
     bool logits_changed = false;
+    size_t minimum_free_bytes = free_bytes;
+    const auto start = std::chrono::steady_clock::now();
     for (size_t position = 0; position < tokens.size(); ++position) {
         status = qwen3->forward(tokens[position], static_cast<int32_t>(position), logits, context);
-        ASSERT_TRUE(status.ok()) << status.message();
+        ASSERT_TRUE(status.ok()) << "position " << position << ": " << status.message();
         ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-        std::vector<float> observed(logits.size());
         ASSERT_EQ(cudaMemcpy(observed.data(), logits.ptr<float>(), logits.byte_size(),
                               cudaMemcpyDeviceToHost), cudaSuccess);
+        const auto invalid = std::find_if(observed.begin(), observed.end(),
+                                          [](float value) { return !std::isfinite(value); });
+        ASSERT_TRUE(invalid == observed.end())
+            << "position " << position << ", logit index " << (invalid - observed.begin());
         float max_abs_logit = 0.f;
         for (size_t index = 0; index < observed.size(); ++index) {
-            ASSERT_TRUE(std::isfinite(observed[index])) << "logit index " << index;
             max_abs_logit = std::max(max_abs_logit, std::abs(observed[index]));
             if (position != 0) {
                 logits_changed = logits_changed || observed[index] != first_logits[index];
@@ -517,8 +548,40 @@ TEST(Qwen3ModelTest, LocalAwq8BGpuForwardProducesFiniteLogits) {
         }
         EXPECT_GT(max_abs_logit, 0.f);
         if (position == 0) {
-            first_logits = std::move(observed);
+            first_logits = observed;
+        }
+        ASSERT_EQ(cudaMemGetInfo(&free_bytes, &total_bytes), cudaSuccess);
+        minimum_free_bytes = std::min(minimum_free_bytes, free_bytes);
+        if ((position + 1) % 128 == 0 || position + 1 == tokens.size()) {
+            const double seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
+            std::cout << "AWQ sequence " << (position + 1) << '/' << tokens.size()
+                      << ", elapsed=" << seconds << " s, free="
+                      << free_bytes / (1024.0 * 1024.0) << " MiB\n" << std::flush;
         }
     }
-    EXPECT_TRUE(logits_changed);
+    if (std::any_of(tokens.begin(), tokens.end(),
+                    [&](int32_t token) { return token != tokens.front(); })) {
+        EXPECT_TRUE(logits_changed);
+    }
+    EXPECT_EQ(qwen3->forward(tokens.back(), capacity - 1, logits, context).code(),
+              base::InvalidArgument);
+    EXPECT_EQ(qwen3->forward(tokens.back(), capacity, logits, context).code(),
+              base::InvalidArgument);
+    status = qwen3->reset(context);
+    ASSERT_TRUE(status.ok()) << status.message();
+    status = qwen3->forward(tokens.front(), 0, logits, context);
+    ASSERT_TRUE(status.ok()) << status.message();
+    ASSERT_EQ(cudaMemcpy(observed.data(), logits.ptr<float>(), logits.byte_size(),
+                          cudaMemcpyDeviceToHost), cudaSuccess);
+    float reset_max_error = 0.f;
+    for (size_t index = 0; index < observed.size(); ++index) {
+        ASSERT_TRUE(std::isfinite(observed[index]));
+        reset_max_error = std::max(reset_max_error, std::abs(observed[index] - first_logits[index]));
+    }
+    EXPECT_LT(reset_max_error, 1e-5f);
+    std::cout << "AWQ capacity=" << capacity << ", peak observed device used="
+              << (total_bytes - minimum_free_bytes) / (1024.0 * 1024.0)
+              << " MiB, minimum free=" << minimum_free_bytes / (1024.0 * 1024.0)
+              << " MiB, reset max logit error=" << reset_max_error << '\n';
 }
