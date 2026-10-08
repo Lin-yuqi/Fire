@@ -40,6 +40,10 @@ target_link_libraries(fire
         glog::glog
         ${ARMADILLO_LIBRARIES}
         ${SENTENCEPIECE_TARGET}
+    PRIVATE
+        nlohmann_json::nlohmann_json
+        ICU::uc
+        ICU::i18n
 )
 
 set_target_properties(fire PROPERTIES

@@ -22,6 +22,7 @@ target_link_libraries(fire_tests
     PRIVATE
         Fire::fire
         GTest::gtest_main
+        nlohmann_json::nlohmann_json
 )
 
 include(GoogleTest)
@@ -36,6 +37,8 @@ set(FIRE_QWEN3_0_6B_PATH "${CMAKE_SOURCE_DIR}/tmp/qwen3-0.6b.fire")
 set(FIRE_TINYLLAMA_TOKENIZER_PATH
     "${CMAKE_SOURCE_DIR}/models/TinyLlama-1.1B-Chat-v1.0/tokenizer.model"
 )
+set(FIRE_QWEN3_TOKENIZER_DIRECTORY "${CMAKE_SOURCE_DIR}/models/Qwen3-0.6B")
+set(FIRE_QWEN3_AWQ_TOKENIZER_DIRECTORY "${CMAKE_SOURCE_DIR}/models/Qwen3-8B-AWQ")
 
 add_custom_command(
     OUTPUT ${FIRE_V1_FIXTURE_PATH}
@@ -58,6 +61,8 @@ target_compile_definitions(
     PRIVATE FIRE_TINYLLAMA_PATH="${FIRE_TINYLLAMA_PATH}"
     PRIVATE FIRE_QWEN3_0_6B_PATH="${FIRE_QWEN3_0_6B_PATH}"
     PRIVATE FIRE_TINYLLAMA_TOKENIZER_PATH="${FIRE_TINYLLAMA_TOKENIZER_PATH}"
+    PRIVATE FIRE_QWEN3_TOKENIZER_DIRECTORY="${FIRE_QWEN3_TOKENIZER_DIRECTORY}"
+    PRIVATE FIRE_QWEN3_AWQ_TOKENIZER_DIRECTORY="${FIRE_QWEN3_AWQ_TOKENIZER_DIRECTORY}"
 )
 
 add_test(

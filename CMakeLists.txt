@@ -49,6 +49,8 @@ endif()
 find_package(glog REQUIRED)
 find_package(Armadillo REQUIRED)
 find_package(CUDAToolkit REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+find_package(ICU REQUIRED COMPONENTS uc i18n)
 
 
 # ==============================
@@ -72,4 +74,3 @@ if(BUILD_TESTING)
     find_package(GTest REQUIRED)
     add_subdirectory(test)
 endif()
-
