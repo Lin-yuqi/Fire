@@ -2,7 +2,9 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -107,6 +109,159 @@ TEST(linear_test, cpu_matrix_with_default_scale_and_no_bias) {
     EXPECT_FLOAT_EQ(output.ptr<float>()[3], 8.f);
 }
 
+void check_bf16_linear(base::DeviceType device_type, cudaStream_t stream = nullptr) {
+    constexpr int K = 37;
+    constexpr int M = 19;
+    constexpr float scale = 0.7f;
+    const std::array<uint16_t, 7> bits{0xc020, 0xbf00, 0x3c00, 0x3f81, 0x3d00, 0x4000, 0x0000};
+    const std::array<float, 7> values{-2.5f, -0.5f, 0.0078125f, 1.0078125f, 0.03125f, 2.f, 0.f};
+    std::vector<float> reference_values(M * K);
+    tensor::Tensor bf16_weight(base::DataType::Bf16, {M, K},
+                               base::CPUAllocatorFactory::get_instance());
+    for (size_t index = 0; index < reference_values.size(); ++index) {
+        bf16_weight.ptr<uint16_t>()[index] = bits[index % bits.size()];
+        reference_values[index] = values[index % values.size()];
+    }
+    const auto reference_weight = make_cpu_tensor({M, K}, reference_values);
+    if (device_type == base::DeviceType::GPU) {
+        bf16_weight.to_cuda(stream);
+    }
+
+    for (int rows : {1, 17}) {
+        SCOPED_TRACE(rows);
+        const std::vector<int32_t> input_dims = rows == 1 ? std::vector<int32_t>{K}
+                                                         : std::vector<int32_t>{rows, K};
+        const std::vector<int32_t> output_dims = rows == 1 ? std::vector<int32_t>{M}
+                                                          : std::vector<int32_t>{rows, M};
+        std::vector<float> input_values(rows * K);
+        for (size_t index = 0; index < input_values.size(); ++index) {
+            // FP32 values that would change if activations were narrowed to BF16.
+            input_values[index] = 0.01234567f * (static_cast<int>((index * 7) % 17) - 8);
+        }
+        auto input = make_cpu_tensor(input_dims, input_values);
+        tensor::Tensor expected(base::DataType::Fp32, output_dims,
+                                base::CPUAllocatorFactory::get_instance());
+        std::vector<float> bias_values(expected.size());
+        for (size_t index = 0; index < bias_values.size(); ++index) {
+            bias_values[index] = 0.00321f * static_cast<float>(index % 11);
+        }
+        auto bias = make_cpu_tensor(output_dims, bias_values);
+        op::LinearOp reference(scale);
+        reference.reset_param_size(rows == 1 ? 1 : 2);
+        reference.set_param(0, reference_weight);
+        if (rows != 1) {
+            reference.set_param(1, bias);
+        }
+        auto status = reference.forward(input, expected, cpu_context());
+        ASSERT_TRUE(status.ok()) << status.message();
+
+        op::OpContext context;
+        context._device_type = device_type;
+        context._stream = rows == 1 ? nullptr : stream;
+        std::shared_ptr<base::DeviceAllocator> allocator = base::CPUAllocatorFactory::get_instance();
+        if (device_type == base::DeviceType::GPU) {
+            allocator = base::GPUAllocatorFactory::get_instance();
+            input.to_cuda(context._stream);
+            bias.to_cuda(context._stream);
+        }
+        tensor::Tensor output(base::DataType::Fp32, output_dims, allocator);
+        op::LinearOp linear(scale);
+        linear.reset_param_size(rows == 1 ? 1 : 2);
+        linear.set_param(0, bf16_weight);
+        if (rows != 1) {
+            linear.set_param(1, bias);
+        }
+        status = linear.forward(input, output, context);
+        ASSERT_TRUE(status.ok()) << status.message();
+        EXPECT_FALSE(linear.get_param(0).is_quantized());
+        EXPECT_EQ(linear.get_param(0)._data.data_type(), base::DataType::Bf16);
+        EXPECT_EQ(linear.get_param(0)._data.byte_size(), static_cast<size_t>(M * K * 2));
+        if (device_type == base::DeviceType::GPU) {
+            ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(context._stream), cudaSuccess);
+            output.to_cpu();
+        }
+        for (size_t index = 0; index < output.size(); ++index) {
+            EXPECT_NEAR(output.ptr<float>()[index], expected.ptr<float>()[index], 1e-5f)
+                << "output index " << index;
+        }
+    }
+}
+
+TEST(linear_test, cpu_bf16_weights_match_fp32_reference) {
+    check_bf16_linear(base::DeviceType::CPU);
+}
+
+TEST(linear_test, bf16_weight_path_requires_fp32_activations_and_bias) {
+    const auto allocator = base::CPUAllocatorFactory::get_instance();
+    auto input = make_cpu_tensor({3}, {1.f, 2.f, 3.f});
+    auto output = make_cpu_tensor({2}, {0.f, 0.f});
+    tensor::Tensor weight(base::DataType::Bf16, {2, 3}, allocator);
+    op::LinearOp linear;
+    linear.reset_param_size(1);
+    linear.set_param(0, weight);
+
+    tensor::Tensor bf16_input(base::DataType::Bf16, {3}, allocator);
+    EXPECT_EQ(linear.forward(bf16_input, output, cpu_context()).code(), base::InvalidArgument);
+    tensor::Tensor bf16_output(base::DataType::Bf16, {2}, allocator);
+    EXPECT_EQ(linear.forward(input, bf16_output, cpu_context()).code(), base::InvalidArgument);
+    linear.set_param(0, tensor::Tensor(base::DataType::Bf16, {2, 4}, allocator));
+    EXPECT_EQ(linear.forward(input, output, cpu_context()).code(), base::InvalidArgument);
+    linear.set_param(0, tensor::Tensor(base::DataType::UInt8, {2, 3}, allocator));
+    EXPECT_EQ(linear.forward(input, output, cpu_context()).code(), base::InvalidArgument);
+    linear.set_param(0, weight);
+    linear.reset_param_size(2);
+    linear.set_param(1, tensor::Tensor(base::DataType::Bf16, {2}, allocator));
+    EXPECT_EQ(linear.forward(input, output, cpu_context()).code(), base::InvalidArgument);
+}
+
+class LinearCudaTest : public ::testing::Test {
+  protected:
+    void SetUp() override {
+        int device_count = 0;
+        const auto error = cudaGetDeviceCount(&device_count);
+        if (error == cudaErrorNoDevice || error == cudaErrorInsufficientDriver ||
+            (error == cudaSuccess && device_count == 0)) {
+            GTEST_SKIP() << "CUDA unavailable";
+        }
+        ASSERT_EQ(error, cudaSuccess) << cudaGetErrorString(error);
+        ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    }
+    void TearDown() override {
+        if (stream) {
+            EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+        }
+    }
+    cudaStream_t stream = nullptr;
+};
+
+TEST_F(LinearCudaTest, bf16_weights_match_fp32_reference_on_default_and_non_default_streams) {
+    check_bf16_linear(base::DeviceType::GPU, stream);
+}
+
+TEST_F(LinearCudaTest, fp32_weights_preserve_scaled_matrix_results) {
+    auto input = make_cpu_tensor({2, 3}, {1.f, 2.f, 3.f, 4.f, 5.f, 6.f});
+    auto weight = make_cpu_tensor({2, 3}, {1.f, 2.f, 3.f, -1.f, 0.f, 2.f});
+    input.to_cuda(stream);
+    weight.to_cuda(stream);
+    tensor::Tensor output(base::DataType::Fp32, {2, 2},
+                          base::GPUAllocatorFactory::get_instance());
+    op::LinearOp linear(0.5f);
+    linear.reset_param_size(1);
+    linear.set_param(0, weight);
+    op::OpContext context;
+    context._device_type = base::DeviceType::GPU;
+    context._stream = stream;
+    const auto status = linear.forward(input, output, context);
+    ASSERT_TRUE(status.ok()) << status.message();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    output.to_cpu();
+    const std::array<float, 4> expected{7.f, 2.5f, 16.f, 4.f};
+    for (size_t index = 0; index < expected.size(); ++index) {
+        EXPECT_FLOAT_EQ(output.ptr<float>()[index], expected[index]);
+    }
+}
 
 TEST(linear_test, cuda_quantized_int4_matches_cpu_fp32_matmul) {
     int device_count = 0;

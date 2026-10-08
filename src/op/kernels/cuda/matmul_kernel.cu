@@ -1,4 +1,5 @@
 #include "matmul_kernel.cuh"
+#include <cuda_bf16.h>
 #include <cstdint>
 namespace kernel {
 /*简单实现，一个线程搬运一个数据*/
@@ -15,8 +16,8 @@ namespace kernel {
 // }
 
 // 通用矩阵乘v1共享显存,在运算时通过访问隐式转置
-template <const int BLOCK_SIZE>
-__global__ void matmul_kernel_cu_fp32(const float* input1, const float* input2, float scale,
+template <const int BLOCK_SIZE, typename WeightType>
+__global__ void matmul_kernel_cu_dense(const float* input1, const WeightType* input2, float scale,
                                       float* output, const int N, const int M, const int K) {
     int tx = threadIdx.x;
     int ty = threadIdx.y;
@@ -48,7 +49,8 @@ __global__ void matmul_kernel_cu_fp32(const float* input1, const float* input2, 
         const int b_row = blockIdx.x * BLOCK_SIZE + ty;
 
         if (b_row < M && k0 + tx < K) {
-            Bs[tx][ty] = input2[b_row * K + k0 + tx];
+            // Widen BF16 at load; shared tiles and accumulation stay FP32.
+            Bs[tx][ty] = static_cast<float>(input2[b_row * K + k0 + tx]);
         } else {
             Bs[tx][ty] = 0.f;
         }
@@ -106,12 +108,13 @@ void matmul_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& input2
     dim3 threads(thread_size, thread_size);
     dim3 blocks((M + thread_size - 1) / thread_size, (N + thread_size - 1) / thread_size);
     cudaStream_t _stream = static_cast<cudaStream_t>(stream);
-    if (_stream)
-        matmul_kernel_cu_fp32<16><<<blocks, threads, 0, _stream>>>(
+    if (input2.data_type() == base::DataType::Bf16) {
+        matmul_kernel_cu_dense<thread_size><<<blocks, threads, 0, _stream>>>(
+            input1.ptr<float>(), input2.ptr<__nv_bfloat16>(), scale, output.ptr<float>(),
+            N, M, K);
+    } else {
+        matmul_kernel_cu_dense<thread_size><<<blocks, threads, 0, _stream>>>(
             input1.ptr<float>(), input2.ptr<float>(), scale, output.ptr<float>(), N, M, K);
-    else {
-        matmul_kernel_cu_fp32<16><<<blocks, threads>>>(input1.ptr<float>(), input2.ptr<float>(),
-                                                       scale, output.ptr<float>(), N, M, K);
     }
 }
 

@@ -455,3 +455,70 @@ TEST(Qwen3ModelTest, GpuForwardTwoTokensMatchesCpuOnNonDefaultStream) {
     gpu_model.reset();
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
+
+TEST(Qwen3ModelTest, LocalAwq8BGpuForwardProducesFiniteLogits) {
+    const char* path = std::getenv("FIRE_QWEN3_AWQ_PATH");
+    if (std::getenv("FIRE_RUN_QWEN3_AWQ_GPU_FORWARD_TEST") == nullptr || path == nullptr) {
+        GTEST_SKIP() << "set FIRE_RUN_QWEN3_AWQ_GPU_FORWARD_TEST=1 and FIRE_QWEN3_AWQ_PATH "
+                        "to run the 8B AWQ GPU model";
+    }
+
+    int device_count = 0;
+    const auto device_status = cudaGetDeviceCount(&device_count);
+    if (device_status == cudaErrorNoDevice || device_status == cudaErrorInsufficientDriver ||
+        (device_status == cudaSuccess && device_count == 0)) {
+        GTEST_SKIP() << "CUDA unavailable";
+    }
+    ASSERT_EQ(device_status, cudaSuccess) << cudaGetErrorString(device_status);
+    ASSERT_TRUE(std::filesystem::exists(path));
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    ASSERT_EQ(cudaMemGetInfo(&free_bytes, &total_bytes), cudaSuccess);
+    // Stored BF16/INT4 weights plus room for a two-token runtime and RoPE cache.
+    if (free_bytes < std::filesystem::file_size(path) + 128ULL * 1024 * 1024) {
+        GTEST_SKIP() << "insufficient free VRAM for the 8B AWQ weights and runtime";
+    }
+
+    const auto& profile = model::qwen3_profiles::Qwen3_8B;
+    model::Qwen3Loader loader(profile);
+    auto status = loader.open(path);
+    ASSERT_TRUE(status.ok()) << status.message();
+    model::Qwen3Weights weights;
+    status = loader.load_weights(weights);
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    op::OpContext context;
+    context._device_type = base::DeviceType::GPU;
+    context._allocator = base::GPUAllocatorFactory::get_instance();
+    std::unique_ptr<model::Qwen3Model> qwen3;
+    status = model::Qwen3Model::create(weights, context, qwen3);
+    ASSERT_TRUE(status.ok()) << status.message();
+    status = qwen3->prepare(2, context);
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    tensor::Tensor logits(base::DataType::Fp32, {profile.model.vocab_size}, context._allocator);
+    const std::array<int32_t, 2> tokens{151643, 9707};
+    std::vector<float> first_logits;
+    bool logits_changed = false;
+    for (size_t position = 0; position < tokens.size(); ++position) {
+        status = qwen3->forward(tokens[position], static_cast<int32_t>(position), logits, context);
+        ASSERT_TRUE(status.ok()) << status.message();
+        ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+        std::vector<float> observed(logits.size());
+        ASSERT_EQ(cudaMemcpy(observed.data(), logits.ptr<float>(), logits.byte_size(),
+                              cudaMemcpyDeviceToHost), cudaSuccess);
+        float max_abs_logit = 0.f;
+        for (size_t index = 0; index < observed.size(); ++index) {
+            ASSERT_TRUE(std::isfinite(observed[index])) << "logit index " << index;
+            max_abs_logit = std::max(max_abs_logit, std::abs(observed[index]));
+            if (position != 0) {
+                logits_changed = logits_changed || observed[index] != first_logits[index];
+            }
+        }
+        EXPECT_GT(max_abs_logit, 0.f);
+        if (position == 0) {
+            first_logits = std::move(observed);
+        }
+    }
+    EXPECT_TRUE(logits_changed);
+}

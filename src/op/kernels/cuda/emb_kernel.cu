@@ -1,4 +1,5 @@
 #include "emb_kernel.cuh"
+#include <cuda_bf16.h>
 #include <cstdint>
 
 namespace kernel {
@@ -50,6 +51,15 @@ __global__ void emb_kernel_cu_fp32(int32_t dim, const int32_t* input, const floa
     }
 }
 
+__global__ void emb_kernel_cu_bf16(int32_t dim, const int32_t* input,
+                                  const __nv_bfloat16* weight, float* output) {
+    const size_t weight_offset = static_cast<size_t>(input[blockIdx.x]) * dim;
+    const size_t output_offset = static_cast<size_t>(blockIdx.x) * dim;
+    for (int32_t col = threadIdx.x; col < dim; col += blockDim.x) {
+        output[output_offset + col] = __bfloat162float(weight[weight_offset + col]);
+    }
+}
+
 
 void emb_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
                    tensor::Tensor& output, void* stream) {
@@ -59,11 +69,16 @@ void emb_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
     int32_t dim = weight.get_dim(1);
 
     constexpr int thread_num = 256;
-    const float* wei = weight.ptr<float>();
     float* out = output.ptr<float>();
     cudaStream_t _stream = static_cast<cudaStream_t>(stream);
 
     const int32_t* in = input.ptr<int32_t>();
+    if (weight.data_type() == base::DataType::Bf16) {
+        emb_kernel_cu_bf16<<<input_num, thread_num, 0, _stream>>>(
+            dim, in, weight.ptr<__nv_bfloat16>(), out);
+        return;
+    }
+    const float* wei = weight.ptr<float>();
     if (_stream)
         emb_kernel_cu_fp32<<<input_num, thread_num, 0, _stream>>>(dim, in, wei, out);
     else

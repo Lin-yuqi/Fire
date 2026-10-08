@@ -116,7 +116,11 @@ base::Status LinearOp::_check(const tensor::Tensor& input, tensor::Tensor& outpu
             return base::error::InvalidArgument("quantized linear zero points shape mismatch");
         }
     } else {
-        status = _check_tensor(weight, device_type, base::DataType::Fp32);
+        if (weight.data_type() != base::DataType::Fp32 &&
+            weight.data_type() != base::DataType::Bf16) {
+            return base::error::InvalidArgument("linear weight must be FP32 or BF16");
+        }
+        status = _check_tensor(weight, device_type, weight.data_type());
         if (!status) {
             return status;
         }

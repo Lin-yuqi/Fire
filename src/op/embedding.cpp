@@ -41,7 +41,11 @@ base::Status EmbeddingOp::_check(const tensor::Tensor& tokens, tensor::Tensor& e
     }
 
     const auto& weight = _params[0]._data;
-    status = _check_tensor(weight, device_type, base::DataType::Fp32);
+    if (weight.data_type() != base::DataType::Fp32 &&
+        weight.data_type() != base::DataType::Bf16) {
+        return base::error::InvalidArgument("embedding weight must be FP32 or BF16");
+    }
+    status = _check_tensor(weight, device_type, weight.data_type());
     if (!status) {
         return status;
     }

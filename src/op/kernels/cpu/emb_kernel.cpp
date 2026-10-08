@@ -1,4 +1,5 @@
 #include "emb_kernel.h"
+#include "bf16.h"
 #include "Fire/base/alloc.h"
 #include <armadillo>
 #include <cstdint>
@@ -22,8 +23,16 @@ void emb_kernel_cpu(const tensor::Tensor& input, const tensor::Tensor& weight,
             LOG(FATAL)<<"error token_id";
         }else{
             float* dst_ptr = &output.ptr<float>()[i*weight_dim];
-            float* src_ptr = const_cast<float*>(&weight.ptr<float>()[token_id*weight_dim]);
-            alloc->memcpy(src_ptr, dst_ptr, weight_dim*sizeof(float));
+            if (weight.data_type() == base::DataType::Bf16) {
+                const uint16_t* src_ptr =
+                    weight.ptr<uint16_t>() + static_cast<size_t>(token_id) * weight_dim;
+                for (int32_t col = 0; col < weight_dim; ++col) {
+                    dst_ptr[col] = bf16_to_fp32(src_ptr[col]);
+                }
+            } else {
+                float* src_ptr = const_cast<float*>(&weight.ptr<float>()[token_id*weight_dim]);
+                alloc->memcpy(src_ptr, dst_ptr, weight_dim*sizeof(float));
+            }
         }
     }
 
