@@ -361,6 +361,7 @@ int run_chat(const Options& options, const op::OpContext& context) {
         }
         const auto started_at = PerformanceClock::now();
         std::vector<int32_t> prompt;
+        // prompt->toekn_ids
         status = tokenizer.encode(qwen_chat::format_prompt(history, user_input, options.thinking),
                                   prompt, false, false);
         if (!status) {
@@ -381,13 +382,17 @@ int run_chat(const Options& options, const op::OpContext& context) {
             }
             cached.clear();
         }
+        // prefill阶段
         status = forward_tokens(*model, prompt, cached.size(), logits, context, cached);
+        
         if (!status) {
             return report_error("prefilling prompt", status);
         }
         std::cout << "Assistant> " << std::flush;
         GenerationMetrics metrics;
         std::string response;
+
+        //decode阶段
         status = generate_response(*model, tokenizer, sampler, budget, closing, logits, context,
                                    cached, started_at, metrics, response);
         std::cout << '\n';
