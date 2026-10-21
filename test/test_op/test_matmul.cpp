@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -263,6 +264,117 @@ TEST_F(LinearCudaTest, fp32_weights_preserve_scaled_matrix_results) {
     }
 }
 
+TEST_F(LinearCudaTest, dense_gemv_matches_reference_for_fp32_and_bf16_weights) {
+    constexpr int M = 7; // Four rows per block leaves an inactive warp in the last block.
+    constexpr float scale = -0.7f;
+    const std::array<uint16_t, 7> bf16_bits{0xc020, 0xbf00, 0x3c00, 0x3f81, 0x3d00, 0x4000, 0x0000};
+    const std::array<float, 7> bf16_values{-2.5f, -0.5f, 0.0078125f, 1.0078125f, 0.03125f, 2.f, 0.f};
+    struct Case {
+        int K;
+        bool matrix_input;
+        int input_offset;
+        int weight_offset;
+    };
+    const std::array<Case, 10> cases{{
+        {1, false, 0, 0},
+        {4, false, 0, 0},
+        {37, true, 0, 0},
+        {128, true, 0, 0},
+        {132, false, 0, 0}, // A vectorized loop with a partial final warp of packs.
+        {4096, false, 0, 0},
+        {12288, true, 0, 0},
+        {4097, false, 0, 0},
+        {128, false, 1, 0},
+        {128, true, 0, 1},
+    }};
+    const auto allocator = base::GPUAllocatorFactory::get_instance();
+    for (const auto dtype : {base::DataType::Fp32, base::DataType::Bf16}) {
+        const size_t weight_element_size = dtype == base::DataType::Fp32 ? sizeof(float)
+                                                                         : sizeof(uint16_t);
+        for (const auto& test_case : cases) {
+            const int K = test_case.K;
+            SCOPED_TRACE(::testing::Message() << "BF16=" << (dtype == base::DataType::Bf16)
+                                             << ", K=" << K << ", matrix=" << test_case.matrix_input
+                                             << ", input_offset=" << test_case.input_offset
+                                             << ", weight_offset=" << test_case.weight_offset);
+            std::vector<float> inputs(K);
+            for (int k = 0; k < K; ++k) {
+                inputs[k] = 0.01234567f * ((k * 7) % 43 - 21);
+            }
+            std::vector<float> fp32_weights(M * K);
+            std::vector<uint16_t> bf16_weights(M * K);
+            std::array<double, M> expected{};
+            for (int m = 0; m < M; ++m) {
+                for (int k = 0; k < K; ++k) {
+                    const int index = m * K + k;
+                    const int bf16_index = (m * 5 + k * 3) % bf16_bits.size();
+                    bf16_weights[index] = bf16_bits[bf16_index];
+                    fp32_weights[index] = 0.006172839f * ((m * 11 + k * 7) % 67 - 33);
+                    const float weight = dtype == base::DataType::Fp32 ? fp32_weights[index]
+                                                                        : bf16_values[bf16_index];
+                    expected[m] += static_cast<double>(inputs[k]) * weight;
+                }
+                expected[m] *= scale;
+            }
+
+            const std::vector<int32_t> input_dims = test_case.matrix_input
+                                                      ? std::vector<int32_t>{1, K}
+                                                      : std::vector<int32_t>{K};
+            const std::vector<int32_t> output_dims = test_case.matrix_input
+                                                       ? std::vector<int32_t>{1, M}
+                                                       : std::vector<int32_t>{M};
+            tensor::Tensor input_storage(base::DataType::Fp32, {K + test_case.input_offset}, allocator);
+            auto input = tensor::Tensor::from_blob(
+                input_storage.ptr<float>() + test_case.input_offset, base::DataType::Fp32,
+                input_dims, base::DeviceType::GPU);
+            tensor::Tensor weight_storage(dtype, {M * K + test_case.weight_offset}, allocator);
+            auto weight = tensor::Tensor::from_blob(
+                weight_storage.ptr<uint8_t>() + test_case.weight_offset * weight_element_size,
+                dtype, {M, K}, base::DeviceType::GPU);
+            std::array<float, M + 2> observed;
+            observed.fill(321.25f);
+            tensor::Tensor output_storage(base::DataType::Fp32, {M + 2}, allocator);
+            auto output = tensor::Tensor::from_blob(output_storage.ptr<float>() + 1,
+                                                    base::DataType::Fp32, output_dims,
+                                                    base::DeviceType::GPU);
+            const cudaStream_t test_stream = K == 128 && test_case.input_offset == 0 &&
+                                                    test_case.weight_offset == 0 ? nullptr : stream;
+            ASSERT_EQ(cudaMemcpyAsync(input.ptr<float>(), inputs.data(), K * sizeof(float),
+                                      cudaMemcpyHostToDevice, test_stream), cudaSuccess);
+            const void* host_weights = dtype == base::DataType::Fp32
+                                           ? static_cast<const void*>(fp32_weights.data())
+                                           : static_cast<const void*>(bf16_weights.data());
+            ASSERT_EQ(cudaMemcpyAsync(weight.ptr<uint8_t>(), host_weights,
+                                      M * K * weight_element_size, cudaMemcpyHostToDevice,
+                                      test_stream), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(output_storage.ptr<float>(), observed.data(), sizeof(observed),
+                                      cudaMemcpyHostToDevice, test_stream), cudaSuccess);
+
+            op::OpContext context;
+            context._device_type = base::DeviceType::GPU;
+            context._stream = test_stream;
+            op::LinearOp linear(scale);
+            linear.reset_param_size(1);
+            linear.set_param(0, weight);
+            op::MatmulOp matmul;
+            const auto status = dtype == base::DataType::Fp32 && test_case.matrix_input
+                                    ? matmul.forward(input, weight, scale, output, context)
+                                    : linear.forward(input, output, context);
+            ASSERT_TRUE(status.ok()) << status.message();
+            ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(observed.data(), output_storage.ptr<float>(), sizeof(observed),
+                                      cudaMemcpyDeviceToHost, test_stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(test_stream), cudaSuccess);
+            EXPECT_FLOAT_EQ(observed.front(), 321.25f);
+            EXPECT_FLOAT_EQ(observed.back(), 321.25f);
+            for (int m = 0; m < M; ++m) {
+                EXPECT_NEAR(observed[m + 1], expected[m], 2e-4 + 2e-5 * std::abs(expected[m]))
+                    << "output row " << m;
+            }
+        }
+    }
+}
+
 TEST(linear_test, cuda_quantized_int4_matches_cpu_fp32_matmul) {
     int device_count = 0;
     const auto device_status = cudaGetDeviceCount(&device_count);
@@ -357,6 +469,115 @@ TEST(linear_test, cuda_quantized_int4_matches_cpu_fp32_matmul) {
         for (size_t index = 0; index < expected.size(); ++index) {
             EXPECT_NEAR(gpu_output.ptr<float>()[index], expected.ptr<float>()[index], 1e-3f)
                 << "output index " << index;
+        }
+    }
+}
+
+TEST_F(LinearCudaTest, int4_gemv_matches_reference_with_group_and_alignment_boundaries) {
+    constexpr int M = 7; // Four rows per block leaves one inactive warp in the last block.
+    struct Case {
+        int K;
+        int group_size;
+        bool matrix_input;
+        int input_offset;
+        int weight_offset;
+    };
+    const std::array<Case, 7> cases{{
+        {128, 128, false, 0, 0},
+        {384, 128, true, 0, 0},
+        {4096, 128, false, 0, 0},
+        {12288, 128, true, 0, 0},
+        {384, 128, false, 1, 0},
+        {384, 128, true, 0, 1},
+        {258, 3, false, 0, 0}, // An odd group can split the two nibbles in one byte.
+    }};
+    const auto allocator = base::GPUAllocatorFactory::get_instance();
+    for (const auto& test_case : cases) {
+        const int K = test_case.K;
+        const int groups_per_row = K / test_case.group_size;
+        SCOPED_TRACE(::testing::Message() << "K=" << K << ", group=" << test_case.group_size
+                                         << ", matrix=" << test_case.matrix_input
+                                         << ", input_offset=" << test_case.input_offset
+                                         << ", weight_offset=" << test_case.weight_offset);
+        std::vector<float> inputs(K);
+        for (int k = 0; k < K; ++k) {
+            inputs[k] = 0.0314159f * ((k * 7) % 43 - 21);
+        }
+        std::vector<uint8_t> weights(M * K / 2, 0);
+        std::vector<float> scales(M * groups_per_row);
+        std::vector<uint8_t> zeros(M * groups_per_row);
+        std::array<double, M> expected{};
+        for (int m = 0; m < M; ++m) {
+            for (int group = 0; group < groups_per_row; ++group) {
+                const int index = m * groups_per_row + group;
+                scales[index] = 0.006172839f * (1 + (m * 5 + group * 3) % 11);
+                zeros[index] = static_cast<uint8_t>((m + group * 5) % 16);
+            }
+            for (int k = 0; k < K; ++k) {
+                const int index = m * groups_per_row + k / test_case.group_size;
+                const int q = (m * 11 + k * 7 + (k / 2) * 3) % 16;
+                weights[m * (K / 2) + k / 2] |= static_cast<uint8_t>(q << (4 * (k % 2)));
+                const float weight = (q - static_cast<int>(zeros[index])) * scales[index];
+                expected[m] += static_cast<double>(inputs[k]) * weight;
+            }
+        }
+
+        const std::vector<int32_t> input_dims = test_case.matrix_input
+                                                  ? std::vector<int32_t>{1, K}
+                                                  : std::vector<int32_t>{K};
+        const std::vector<int32_t> output_dims = test_case.matrix_input
+                                                   ? std::vector<int32_t>{1, M}
+                                                   : std::vector<int32_t>{M};
+        tensor::Tensor input_storage(base::DataType::Fp32, {K + test_case.input_offset}, allocator);
+        auto input = tensor::Tensor::from_blob(input_storage.ptr<float>() + test_case.input_offset,
+                                               base::DataType::Fp32, input_dims,
+                                               base::DeviceType::GPU);
+        tensor::Tensor weight_storage(base::DataType::UInt8,
+                                       {M * K / 2 + test_case.weight_offset}, allocator);
+        op::LinearOp linear;
+        linear.reset_param_size(1);
+        auto& parameter = linear.get_param(0);
+        parameter._data = tensor::Tensor::from_blob(
+            weight_storage.ptr<uint8_t>() + test_case.weight_offset, base::DataType::UInt8,
+            {M, K / 2}, base::DeviceType::GPU);
+        parameter._scales = tensor::Tensor(base::DataType::Fp32, {M, groups_per_row}, allocator);
+        parameter._zero_points =
+            tensor::Tensor(base::DataType::UInt8, {M, groups_per_row}, allocator);
+        parameter._quant_config._quant_type = op::QuantType::Int4GroupWise;
+        parameter._quant_config._group_size = test_case.group_size;
+        parameter._quant_config._symmetric = false;
+
+        std::array<float, M + 2> observed;
+        observed.fill(321.25f);
+        tensor::Tensor output_storage(base::DataType::Fp32, {M + 2}, allocator);
+        auto output = tensor::Tensor::from_blob(output_storage.ptr<float>() + 1,
+                                                base::DataType::Fp32, output_dims,
+                                                base::DeviceType::GPU);
+        ASSERT_EQ(cudaMemcpyAsync(input.ptr<float>(), inputs.data(), K * sizeof(float),
+                                  cudaMemcpyHostToDevice, stream), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(parameter._data.ptr<uint8_t>(), weights.data(), weights.size(),
+                                  cudaMemcpyHostToDevice, stream), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(parameter._scales.ptr<float>(), scales.data(),
+                                  scales.size() * sizeof(float), cudaMemcpyHostToDevice, stream),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(parameter._zero_points.ptr<uint8_t>(), zeros.data(), zeros.size(),
+                                  cudaMemcpyHostToDevice, stream), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(output_storage.ptr<float>(), observed.data(), sizeof(observed),
+                                  cudaMemcpyHostToDevice, stream), cudaSuccess);
+        op::OpContext context;
+        context._device_type = base::DeviceType::GPU;
+        context._stream = stream;
+        const auto status = linear.forward(input, output, context);
+        ASSERT_TRUE(status.ok()) << status.message();
+        ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(observed.data(), output_storage.ptr<float>(), sizeof(observed),
+                                  cudaMemcpyDeviceToHost, stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_FLOAT_EQ(observed.front(), 321.25f);
+        EXPECT_FLOAT_EQ(observed.back(), 321.25f);
+        for (int m = 0; m < M; ++m) {
+            EXPECT_NEAR(observed[m + 1], expected[m], 2e-4 + 2e-5 * std::abs(expected[m]))
+                << "output row " << m;
         }
     }
 }

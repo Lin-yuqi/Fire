@@ -1,6 +1,7 @@
 #include "matmul_kernel.cuh"
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <type_traits>
 namespace kernel {
 /*简单实现，一个线程搬运一个数据*/
 // __global__ void matmul_kernel_cu_fp32(const float* input1, const float* input2, float scale,
@@ -18,7 +19,7 @@ namespace kernel {
 // 通用矩阵乘v1共享显存,在运算时通过访问隐式转置
 template <const int BLOCK_SIZE, typename WeightType>
 __global__ void matmul_kernel_cu_dense(const float* input1, const WeightType* input2, float scale,
-                                      float* output, const int N, const int M, const int K) {
+                                       float* output, const int N, const int M, const int K) {
     int tx = threadIdx.x;
     int ty = threadIdx.y;
 
@@ -72,6 +73,75 @@ __global__ void matmul_kernel_cu_dense(const float* input1, const WeightType* in
         output[n * M + m] = tmp * scale;
     }
 }
+
+// One warp computes one output row; BF16 weights are widened before FP32 accumulation.
+template <typename WeightType, bool Vectorized>
+__global__ void GEMV_bf16_fp32_v1(const float* input, const WeightType* weight, float scale,
+                                  float* output, int M, int K) {
+    constexpr int warp_size = 32;
+    const int lane = threadIdx.x % warp_size;
+    const int m = blockIdx.x * (blockDim.x / warp_size) + threadIdx.x / warp_size;
+    // The row index is uniform across the warp, including an inactive tail warp.
+    if (m >= M) {
+        return;
+    }
+
+    const WeightType* row = weight + static_cast<size_t>(m) * K;
+    float4 sums = make_float4(0.f, 0.f, 0.f, 0.f);
+    if constexpr (Vectorized) {
+        for (int pack = lane; pack < K / 4; pack += warp_size) {
+            const float4 values = reinterpret_cast<const float4*>(input)[pack];
+            float4 weights;
+            if constexpr (std::is_same_v<WeightType, float>) {
+                weights = reinterpret_cast<const float4*>(row)[pack];
+            } else {
+                // One 64-bit load contains two pairs of BF16 weights.
+                const uint2 packed = reinterpret_cast<const uint2*>(row)[pack];
+                weights = make_float4(
+                    __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(packed.x))),
+                    __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(packed.x >> 16))),
+                    __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(packed.y))),
+                    __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(packed.y >> 16))));
+            }
+            // Independent accumulators shorten the dependency chain along K.
+            sums.x += values.x * weights.x;
+            sums.y += values.y * weights.y;
+            sums.z += values.z * weights.z;
+            sums.w += values.w * weights.w;
+        }
+    } else {
+        // Handles arbitrary K and tensor views without vector-load alignment.
+        for (int k = lane; k < K; k += warp_size) {
+            sums.x += input[k] * static_cast<float>(row[k]);
+        }
+    }
+
+    float sum = (sums.x + sums.y) + (sums.z + sums.w);
+    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    if (lane == 0) {
+        output[m] = sum * scale;
+    }
+}
+
+template <typename WeightType>
+void launch_dense_gemv(const float* input, const WeightType* weight, float scale, float* output,
+                       int M, int K, cudaStream_t stream) {
+    constexpr int threads = 128;
+    constexpr int rows_per_block = threads / 32;
+    const int blocks = (M + rows_per_block - 1) / rows_per_block;
+    // K%4 also keeps every weight row aligned for its vector type.
+    if (K % 4 == 0 && reinterpret_cast<uintptr_t>(input) % alignof(float4) == 0 &&
+        reinterpret_cast<uintptr_t>(weight) % (4 * sizeof(WeightType)) == 0) {
+        GEMV_bf16_fp32_v1<WeightType, true><<<blocks, threads, 0, stream>>>(
+            input, weight, scale, output, M, K);
+    } else {
+        GEMV_bf16_fp32_v1<WeightType, false><<<blocks, threads, 0, stream>>>(
+            input, weight, scale, output, M, K);
+    }
+}
+
 // input1可以是1D/2D,input2是2D
 void matmul_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& input2, float scale,
                       tensor::Tensor& output, void* stream) {
@@ -104,14 +174,24 @@ void matmul_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& input2
     const int M = input2.get_dim(0);
     CHECK_EQ(input2.get_dim(1), K);
 
+    cudaStream_t _stream = static_cast<cudaStream_t>(stream);
+    if (N == 1) {
+        if (input2.data_type() == base::DataType::Bf16) {
+            launch_dense_gemv(input1.ptr<float>(), input2.ptr<__nv_bfloat16>(), scale,
+                              output.ptr<float>(), M, K, _stream);
+        } else {
+            launch_dense_gemv(input1.ptr<float>(), input2.ptr<float>(), scale,
+                              output.ptr<float>(), M, K, _stream);
+        }
+        return;
+    }
+
     constexpr int thread_size = 16;
     dim3 threads(thread_size, thread_size);
     dim3 blocks((M + thread_size - 1) / thread_size, (N + thread_size - 1) / thread_size);
-    cudaStream_t _stream = static_cast<cudaStream_t>(stream);
     if (input2.data_type() == base::DataType::Bf16) {
         matmul_kernel_cu_dense<thread_size><<<blocks, threads, 0, _stream>>>(
-            input1.ptr<float>(), input2.ptr<__nv_bfloat16>(), scale, output.ptr<float>(),
-            N, M, K);
+            input1.ptr<float>(), input2.ptr<__nv_bfloat16>(), scale, output.ptr<float>(), N, M, K);
     } else {
         matmul_kernel_cu_dense<thread_size><<<blocks, threads, 0, _stream>>>(
             input1.ptr<float>(), input2.ptr<float>(), scale, output.ptr<float>(), N, M, K);
@@ -120,8 +200,8 @@ void matmul_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& input2
 
 // 不就是matmul吗？先实现简单的，一个元素一个线程
 __global__ void matmul_quant_int4_fp32_naive(const float* input, const uint8_t* qweight,
-                                       const float* scales, const uint8_t* zero_points,
-                                       float* output, int N, int M, int K, int group_size) {
+                                             const float* scales, const uint8_t* zero_points,
+                                             float* output, int N, int M, int K, int group_size) {
     const int m = blockIdx.x * blockDim.x + threadIdx.x;
     const int n = blockIdx.y * blockDim.y + threadIdx.y;
     if (m >= M || n >= N)
@@ -144,6 +224,46 @@ __global__ void matmul_quant_int4_fp32_naive(const float* input, const uint8_t* 
     }
 
     output[n * M + m] = sum;
+}
+
+// group_size=128: one warp computes one row, four weights per lane and group.
+__global__ void GEMV_int4_v1(const float* input, const uint8_t* qweight, const float* scales,
+                            const uint8_t* zero_points, float* output, int M, int K) {
+    constexpr int warp_size = 32;
+    constexpr int group_size = 128;
+    const int lane = threadIdx.x % warp_size;
+    const int m = blockIdx.x * (blockDim.x / warp_size) + threadIdx.x / warp_size;
+    // All lanes in an out-of-range warp leave before the warp reduction.
+    if (m >= M) {
+        return;
+    }
+
+    const int groups_per_row = K / group_size;
+    const auto* packed_row = reinterpret_cast<const uint16_t*>(
+        qweight + static_cast<size_t>(m) * (K / 2));
+    const auto* input_packs = reinterpret_cast<const float4*>(input);
+    float sum = 0.0f;
+    for (int group = 0; group < groups_per_row; ++group) {
+        const size_t metadata_idx = static_cast<size_t>(m) * groups_per_row + group;
+        const float scale = scales[metadata_idx];
+        const int zero = zero_points[metadata_idx];
+        const int pack = group * (group_size / 4) + lane;
+
+        // Two packed bytes contain two adjacent pairs of INT4 weights.
+        const uint16_t weights = packed_row[pack];
+        const float4 values = input_packs[pack];
+        sum += values.x * ((static_cast<int>(weights & 0x0f) - zero) * scale);
+        sum += values.y * ((static_cast<int>((weights >> 4) & 0x0f) - zero) * scale);
+        sum += values.z * ((static_cast<int>((weights >> 8) & 0x0f) - zero) * scale);
+        sum += values.w * ((static_cast<int>((weights >> 12) & 0x0f) - zero) * scale);
+    }
+
+    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    if (lane == 0) {
+        output[m] = sum;
+    }
 }
 /*
 input1:
@@ -170,9 +290,6 @@ void matmul_quant_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& 
     const int K = input1.get_dim(input1.dims_size() - 1);
     const int M = input2.get_dim(0);
     CHECK_EQ(input2.get_dim(1), K / 2);
-    dim3 block(16, 16);
-    dim3 grid((M + block.x - 1) / block.x, (N + block.y - 1) / block.y);
-
     const float* in1 = input1.ptr<float>();
     const uint8_t* in2 = input2.ptr<uint8_t>();
     float* out = output.ptr<float>();
@@ -180,8 +297,20 @@ void matmul_quant_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& 
     const uint8_t* zero = zero_points.ptr<uint8_t>();
 
     cudaStream_t _stream = static_cast<cudaStream_t>(stream);
+    if (N == 1 && group_size == 128 && K % 128 == 0 &&
+        reinterpret_cast<uintptr_t>(in1) % alignof(float4) == 0 &&
+        reinterpret_cast<uintptr_t>(in2) % alignof(uint16_t) == 0) {
+        constexpr int threads = 128;
+        constexpr int rows_per_block = threads / 32;
+        GEMV_int4_v1<<<(M + rows_per_block - 1) / rows_per_block, threads, 0, _stream>>>(
+            in1, in2, sca, zero, out, M, K);
+        return;
+    }
+
+    dim3 block(16, 16);
+    dim3 grid((M + block.x - 1) / block.x, (N + block.y - 1) / block.y);
     matmul_quant_int4_fp32_naive<<<grid, block, 0, _stream>>>(in1, in2, sca, zero, out, N, M, K,
-                                                        group_size);
+                                                              group_size);
 }
 
 } // namespace kernel

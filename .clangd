@@ -10,8 +10,10 @@ CompileFlags:
     - -x
     - cuda
     - --cuda-path=/usr/local/cuda
+    - --cuda-gpu-arch=sm_89
     - -I/usr/local/cuda/include
     - -I/usr/local/cuda/include/cccl
   Remove:
     - -forward-unknown-to-host-compiler
     - -dc
+    - --generate-code=*
