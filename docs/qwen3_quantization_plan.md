@@ -1,6 +1,16 @@
 # Qwen3 量化路线
 
-状态（2026-10-08）：RTN INT4、v2 Writer/Reader、BF16 Embedding/`lm_head`、混合布局 Loader 与官方 8B AWQ 导入已经接通。8B AWQ 已通过原始权重/HF FP32 两 token logits 对齐、2048 token teacher forcing，以及 v0.2 `qwen_chat` 多轮中文生成与 `/reset`。未量化 8B 的混合 RTN 导出仍待实现；完整语料质量回归、量化质量门槛和 4096 容量验收仍未完成。
+状态（2026-10-23）：RTN INT4、v2 Writer/Reader、BF16 Embedding/`lm_head`、混合布局 Loader 与官方 8B AWQ 导入已经接通。8B AWQ 已有原始权重/HF FP32 两 token logits 对齐、2048 token teacher forcing，以及 v0.2 `qwen_chat` 多轮中文生成与 `/reset` 的验证记录。单 token CUDA INT4 与 FP32/BF16 GEMV 已实现并完成相关正确性测试，性能结果见 [baseline.md](baseline.md)。未量化 8B 的混合 RTN 导出、CPU 量化 Linear、完整语料质量回归、量化质量门槛和 4096 容量验收仍未完成；本次文档同步未重跑重型验证。
+
+## 当前导出与执行状态
+
+| 模式 | 已实现的输出 | 执行边界 |
+| --- | --- | --- |
+| `--quantization none` | FP32 `.fire` v1 | CPU/CUDA 普通 Linear |
+| `--quantization int4` | 投影与 `lm_head` 为 INT4，Embedding/Norm 为 FP32，`.fire` v2 | 量化 Linear 仅 GPU；CPU 使用反量化 FP32 参考作对照 |
+| `--quantization awq` | 官方 8B AWQ 导入：INT4 七类投影、BF16 Embedding/`lm_head`、FP32 Norm，`.fire` v2 | GPU；BF16/INT4 满足条件时使用 GEMV |
+
+未量化 8B 的 RTN 路径目前仍量化 `lm_head`、将 Embedding 写成 FP32；下文要求的混合 BF16/INT4 RTN 是目标布局，尚未与 AWQ 路径统一。
 
 ## 路线决策
 
@@ -10,23 +20,25 @@
 
 ## 统一合同
 
-- 输入分为未量化的 Qwen3 Source Checkpoint 与已量化的官方 AWQ Source Checkpoint。前者由 Fire 离线量化；后者只做格式导入，绝不重新量化已量化投影。两条 8B 路径产出相同的混合 BF16/INT4 Fire 布局。
+- 输入分为未量化的 Qwen3 Source Checkpoint 与已量化的官方 AWQ Source Checkpoint。前者由 Fire 离线量化；后者只做格式导入，绝不重新量化已量化投影。目标是让两条 8B 路径产出相同的混合 BF16/INT4 Fire 布局；目前仅 AWQ 路径已产出该混合布局。
 - 首版是无需校准语料的 RTN、非对称 UInt4 group-wise weight-only；每个输出行沿输入维 K 分组，`group_size = 128`，反量化为 `scale[o,g] × (q[o,k] - zero[o,g])`，其中 `g = floor(k / 128)`。激活和 KV Cache 保持 FP32；不声称 Fire 自己实现了 AWQ 搜索算法。
 - 8B 的每层七个投影（Q/K/V/O、gate/up/down）使用 INT4；Embedding 与 `lm_head` 保留 BF16，Norm 保持 FP32。现有 0.6B RTN 基线仍使用 INT4 `lm_head` 和 FP32 Embedding；将 8B 导出路径改为混合布局是后续实现工作。
 - 统一物理布局：每个 UInt8 打包两个 UInt4 qweight；每组一个 FP32 scale、一个未打包的 UInt8 zero-point。通用 `Tensor` 只看到字节可寻址的物理 tensor，不引入 0.5 字节元素的 dtype。已锁定偶数列位于低 nibble、奇数列位于高 nibble，量化舍入使用 NumPy `rint` 的 ties-to-even；全零组编码为 `q=0, scale=1, zero=0`。
 - `.fire` v2 保存量化参数关联、`group_size` 和可混用的 BF16 普通 tensor；v1 仍只表示 FP32。Qwen3 INT4 当前只接受 group size 128，且拒绝 `K % 128 != 0`；Exporter 预检，Loader 防御性复核。模型专用的名称映射、tensor 选择和 profile 校验留在 Qwen3 exporter/loader；量化数学、packing 和 Linear 执行为通用原语。
 - `Qwen3Weights` 中可供 Linear 使用的权重统一用 `op::Parameter` 表示：FP32/BF16 路径为 `quant_type=None`，INT4 路径携带 qweight、scales、zero-points 和显式 `group_size`。Embedding/Norm 保持普通 Tensor。BF16 Embedding 查表输出 FP32，BF16 `lm_head` 接收 FP32 hidden 并输出 FP32 logits；`Parameter` 的设备迁移、设备校验覆盖全部量化数据 tensor。
-- Exporter 从源 safetensors 分片直接流式写出 v2 量化文件，不先生成约 30.5 GiB 的 FP32 8B `.fire`。初期 CPU 路径重在可读的数值基准；CUDA 路径须避免常驻完整 FP32 反量化权重，并记录速度与峰值显存。
+- Exporter 从源 safetensors 分片直接流式写出 v2 量化文件，不先生成约 30.5 GiB 的 FP32 8B `.fire`。当前 CPU 对照使用 Python 反量化或普通 FP32 Matmul，并非 CPU INT4 执行。CUDA 在计算时反量化，不常驻完整 FP32 反量化权重；速度与显存按各项验证单独记录。
 
 `.fire` v2 保留 32 字节 header 和 96 字节目录项，版本号为 2；wire dtype `1=FP32`、`2=UInt8`、`3=BF16`。BF16 payload 是 little-endian `uint16` 原始位模式，每个元素 2 字节；Python Writer 接收 `np.uint16` 位模式而不做数值转换。目录项最后 6 字节在 v1 全零，在 v2 编码 `quant_kind:u8, group_size:u32 little-endian, reserved:u8`；FP32/BF16 普通 tensor 六字节全零，INT4 qweight 使用 `quant_kind=1`、`group_size=128`。量化 Linear 以同一前缀的 `.qweight`、`.scales`、`.zero_points` 三条目录项关联；每条 payload 起点四字节对齐，间隙必须填零。BF16 只在 v2 有效，不能携带量化元数据；Reader/Writer 已验证这些格式规则。Qwen3 Loader 已支持 8B 混合布局并复核完整 profile。
 
 ## 阶段与完成条件
 
+以下列出路线目标与验收条件，不表示各阶段所有条目已经完成；实际已接通的模式和仍缺少的验证以上述状态为准。
+
 1. **Qwen3-0.6B，建立闭环**：实现 v2 Writer/Reader/Loader、RTN 导出、FP32/INT4 共用的 Linear 参数绑定、CPU 参考和 CUDA 量化 Linear。分别通过 pack/unpack/zero-point 合同、量化 Linear 与浮点反量化参考对齐、CUDA 与 CPU 量化路径对齐、固定 token logits/提示词/语料的端到端质量回归。不能以“能生成文字”代替质量验收。
 2. **Qwen3-8B，混合 BF16/INT4 与实机验收**：导出每层七个 INT4 投影、BF16 Embedding/`lm_head` 和 FP32 Norm；让 Loader 按名称和 dtype 接受混合布局，并增加 BF16 Embedding 查表及 FP32 输入 × BF16 权重 → FP32 logits 的 Linear 路径。复用同一个 Qwen3Model，验证源分片预检、输出回读、端到端单序列 GPU 生成、质量回归、峰值显存和 token 延迟。先验收 `capacity=2048`，再按实测余量尝试 4096；不足时检查可用显存与临时分配，再决定是否单独调整 KV 表示。不得把仅能加载权重视为 Model Support。40,960-token 最大 profile 长度不属于本阶段承诺。
 3. **官方 Qwen3-8B-AWQ，导入兼容**：核对本地 checkpoint 的实际 tensor/dtype/packing；将已量化投影无损重排到 Fire 统一布局，保留 BF16 Embedding 与 `lm_head` 的原始位值，Norm 转为 FP32。验证每类投影的反量化值与来源参考一致，并完成端到端 logits、质量、显存与生成验收。本地配置标明 AWQ 4-bit、group size 128、zero-point 和 GEMM；本地 safetensors 实际包含 I32 `qweight/qzeros`、BF16 `scales`、BF16 Embedding/`lm_head`，导入时应以 tensor metadata 为准。
 
-质量是阶段门槛，不只是记录项。每阶段在模型级验收前固定测试语料、提示词、参考实现和数值容差；报告 logits 差异、交叉熵或 perplexity 退化及生成样例。若 RTN 达不到门槛，调整量化策略并重新验证，而不放宽“Model Support”的含义。当前没有实测基线，故不预设具体退化百分比。
+质量是阶段门槛，不只是记录项。每阶段在模型级验收前固定测试语料、提示词、参考实现和数值容差；报告 logits 差异、交叉熵或 perplexity 退化及生成样例。若 RTN 达不到门槛，调整量化策略并重新验证，而不放宽“Model Support”的含义。当前尚无固定语料的 RTN 质量退化基线，故不预设具体退化百分比；这与已有的性能基线是不同验证范围。
 
 ## 8B 显存预算（估算，非验收结果）
 

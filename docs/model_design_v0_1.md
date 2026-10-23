@@ -2,6 +2,8 @@
 
 > 设计已确认；实现状态最后核对日期：2026-09-19。Fire v0.1 已发布，TinyLlama FP32 单 token forward、Tokenizer、ArgmaxSampler 与简单聊天生成循环均已接通。
 
+> 本文保留 v0.1 的设计与当时的实现边界。v0.2 已接通 Qwen3、BF16/INT4 和单 token CUDA GEMV；当前功能、运行方式和性能记录以 [README](../readme.md)、[仓库地图](repo_map.md) 与 [基线记录](baseline.md) 为准，本文中的后续计划不作为当前状态清单。
+
 ## 1. 范围与当前进度
 
 v0.1 只面向 `TinyLlama/TinyLlama-1.1B-Chat-v1.0` 的单序列、单 token、FP32 文本自回归推理。v0.2 接入 Qwen3 时，再根据真实重复代码提取公共实现；Qwen3.5 放在 v0.3。

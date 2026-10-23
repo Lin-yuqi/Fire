@@ -2,7 +2,9 @@
 
 > 状态：Accepted。Q1-Q15 的格式、职责、失败语义和验收边界已经确认。
 
-> 实现进度（2026-09-20）：Fire v0.1 已发布。FireWriter、TinyLlama exporter、FireReader、`TinyllamaLoader` 与 core wire/profile 合同测试均已完成并接入 CTest。Qwen3 exporter 已支持按 `config.json` 自动识别 0.6B/8B profile，并读取单文件或 HF shard index；0.6B 的 311 项完整 FP32 文件已通过 Loader、两 token CPU/GPU forward 和 Hugging Face logits 对齐，8B 的 399 项/5 分片真实 checkpoint metadata preflight 也已通过。Qwen3 量化 wire 尚不在已完成范围内。模型接口与执行设计见 [模型层设计](model_design_v0_1.md)。
+> 实现进度（2026-10-23）：Fire v0.2 已接通 Qwen3 聊天。FireWriter/FireReader 同时支持 FP32 v1 与 INT4/BF16 v2；Qwen3 exporter 支持 0.6B/8B、单文件/HF shards、RTN INT4 和官方 8B AWQ 导入。0.6B FP32 与 8B AWQ 的已有模型验证范围见 [README](../readme.md)；本次文档更新未重跑模型对齐。
+
+> 本文正文保留 `.fire` v1 的格式与验收合同，包括 FP32-only、紧密 payload 和保留字节全零等规则。v2 的 dtype、量化元数据、对齐和当前实现边界见 [Qwen3 量化路线](qwen3_quantization_plan.md)，不能将两种格式规则混用。模型接口与执行设计见 [模型层设计](model_design_v0_1.md)。
 
 ## 1. 目标
 
@@ -20,13 +22,13 @@ Hugging Face checkpoint
 
 `.fire` 是可 mmap 的 Fire Tensor Container，而不是通用或自描述的模型 checkpoint。它通过 tensor directory 消除 exporter 与 loader 对隐式 tensor 排列顺序的依赖。
 
-当前开发分支还建立了 Qwen3 的导出路径：
+本文涉及的 Qwen3 v1 FP32 导出路径为：
 
 ```text
 Qwen3-0.6B / Qwen3-8B local checkpoint
         -> profile-selected Qwen3 exporter
         -> FP32 .fire v1
-        -> FireReader / Qwen3Loader / Qwen3Model（0.6B CPU 已验证）
+        -> FireReader / Qwen3Loader / Qwen3Model（0.6B CPU/GPU/HF 已有验证）
 ```
 
 ## 2. 能力与版本边界
@@ -50,7 +52,9 @@ TinyLlama exporter 的输入边界仍是本地、精确匹配该 Model Profile �
 - 将 BF16 转为 FP32，并保证 tensor 为 C-contiguous。
 - 用内部两遍算法协调 directory 规划与逐 tensor payload 写出。
 
-### Qwen3 exporter
+### Qwen3 exporter 的 `--quantization none` 路径
+
+当前 CLI 另有 `int4` 和 `awq` 两种 v2 模式；本节列出默认 FP32 v1 路径的职责。
 
 - 根据 model-semantic config 字段自动选择 0.6B 或 8B profile，不要求调用方重复指定型号。
 - 从 profile 动态推导 canonical descriptor；0.6B 的 `q_dim = 2048`，独立于 `hidden_size = 1024`。
@@ -310,7 +314,7 @@ std::shared_ptr<base::Buffer> FireReader::mapped_buffer() const;
 
 ## 12. 最小验收测试
 
-截至 2026-09-20，本节的 core 合同已自动化：CMake 在构建 `fire_tests` 前生成独立 fixture，FireReader GTest 覆盖有效文件、坏文件矩阵、显式 `uint64` 溢出、Status 分类和 mapping lifetime；CTest 项 `fire_export_tinyllama_contract` 运行 13 个 Writer/exporter unittest，`fire_export_qwen3_contract` 运行 9 个 Qwen3 exporter unittest。这些测试验证 wire 和 profile 合同，不代替本节末尾的真实权重里程碑。
+本节的 core 合同已自动化：CMake 在构建 `fire_tests` 前生成独立 fixture，FireReader GTest 覆盖有效文件、坏文件矩阵、显式 `uint64` 溢出、Status 分类和 mapping lifetime；CTest 项 `fire_export_tinyllama_contract` 与 `fire_export_qwen3_contract` 运行 Writer/exporter 合同测试。当前还注册了 `fire_quant_contract`、`fire_writer_v2_contract`，Qwen3 exporter 测试包含 RTN v2 与 AWQ 的成功/失败分支。这些检查验证 wire 和 profile 合同，不代替本节末尾的真实权重里程碑；测试数量以当前运行结果为准。
 
 ### Wire contract fixture
 

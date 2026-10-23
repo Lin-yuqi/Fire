@@ -4,7 +4,8 @@
 
 **Fire v0.2 已接通 Qwen3 聊天。** 保留 v0.1 的 TinyLlama FP32 基线，新增
 Qwen3-0.6B/8B profile、ByteLevel BPE tokenizer 和 `qwen_chat`。本地
-Qwen3-8B-AWQ 已完成 GPU 多轮中文生成与 `/reset` 验证。
+Qwen3-8B-AWQ 已完成 GPU 多轮中文生成与 `/reset` 验证，并接入 INT4、BF16/FP32
+单 token CUDA GEMV。固定负载的性能记录见 [基线与优化复测](docs/baseline.md)。
 
 ```text
 TinyLlama / Qwen3 checkpoint
@@ -27,7 +28,8 @@ Fire 是个人学习项目。v0.2 在 TinyLlama 基线上补齐 Qwen3 文本生�
 
 - 读取固定 TinyLlama profile 的 BF16 Hugging Face safetensors，并导出为 FP32
   `.fire` v1 Tensor Container。
-- 通过 mmap 读取 `.fire`，校验并绑定 201 个 canonical tensor。
+- 通过 mmap 读取 `.fire`，由模型专用 Loader 校验名称、dtype 和 shape；TinyLlama
+  的 FP32 profile 包含 201 个 canonical tensor。
 - 在 CPU 或 CUDA 上执行完整 TinyLlama forward：Embedding、22 层
   Attention/FFN、RoPE、GQA、KV Cache、final RMSNorm 和 LM Head。
 - 使用 SentencePiece 完成文本编解码，使用 ArgmaxSampler 做 greedy decoding。
@@ -36,6 +38,10 @@ Fire 是个人学习项目。v0.2 在 TinyLlama 基线上补齐 Qwen3 文本生�
   CPU/CUDA，INT4 权重执行要求 GPU。
 - 将官方 Qwen3-8B-AWQ GEMM 权重导入 `.fire` v2；Embedding/LM Head 保留
   BF16，投影使用 Fire 的 INT4 布局，激活和 KV Cache 使用 FP32。
+- 从未量化 Qwen3 checkpoint 执行 RTN INT4 导出；这条路径的 Embedding/Norm
+  为 FP32，投影与 LM Head 为 INT4，与 AWQ 的混合布局分开处理。
+- 为 CUDA 单 token Linear 提供 INT4、FP32/BF16 GEMV：warp 按行计算、向量化
+  加载与归约；不满足专用条件时保留标量或通用矩阵乘路径。
 - 使用 Qwen3 tokenizer 和聊天模板进行多轮生成，支持 thinking 开关、流式 UTF-8
   输出、上下文预算、两种 EOS 和 `/reset`。
 - 通过 GoogleTest 和 Python contract tests 验证 Buffer、Tensor、Operator、Reader、
@@ -48,6 +54,9 @@ Fire 是个人学习项目。v0.2 在 TinyLlama 基线上补齐 Qwen3 文本生�
 
 下面的命令假设使用 64-bit little-endian Linux，并在仓库根目录执行。Ubuntu/Debian
 可以直接参考；其他发行版请安装对应的开发包。
+
+TinyLlama 和 Qwen3 的权重可以按需准备。如果只运行默认的 `qwen_chat`，下载
+Qwen3-8B-AWQ 并执行对应的 AWQ 导入命令即可，无需先下载或导出 TinyLlama。
 
 ### 1. 安装 C++ 构建依赖
 
@@ -144,11 +153,14 @@ python -m pip install --upgrade pip
 python -m pip install numpy safetensors torch huggingface_hub
 ```
 
-`torch` 只用于 exporter 在 CPU 上读取 BF16 tensor 并转换为 FP32；聊天 demo
-本身不依赖 Python 或 PyTorch。若需要特定 PyTorch wheel，请使用
+`torch` 用于 exporter 在 CPU 上读取 tensor、转换 FP32 或保留 BF16 位模式；
+独立的 Hugging Face 对齐测试也使用它。聊天 demo 本身不依赖 Python 或 PyTorch。
+若需要特定 PyTorch wheel，请使用
 [PyTorch 官方安装选择器](https://pytorch.org/get-started/locally/)。
 
-### 4. 下载 TinyLlama
+### 4. 下载模型
+
+#### TinyLlama
 
 仓库约定把 Source Checkpoint 放到：
 
@@ -182,15 +194,44 @@ models/TinyLlama-1.1B-Chat-v1.0/
 模型为公开仓库，正常情况下无需登录；受限网络环境可能需要配置 Hugging Face
 mirror/proxy。
 
+#### Qwen3
+
+默认聊天与本文性能记录使用官方 8B AWQ checkpoint：
+
+```bash
+hf download Qwen/Qwen3-8B-AWQ \
+  --include '*.json' --include '*.safetensors' \
+  --local-dir models/Qwen3-8B-AWQ
+```
+
+若希望先运行较小的 FP32 基线，可以改为下载 0.6B：
+
+```bash
+hf download Qwen/Qwen3-0.6B \
+  --include '*.json' --include '*.safetensors' \
+  --local-dir models/Qwen3-0.6B
+```
+
+Qwen3 exporter 需要 `config.json` 和单个 safetensors 文件，或 shard index 及其
+引用的全部分片；tokenizer 需要 `tokenizer.json` 与 `tokenizer_config.json`。
+上述过滤会下载这些 JSON 与权重文件。参数用法见
+[Hugging Face CLI 文档](https://huggingface.co/docs/huggingface_hub/guides/cli)。
+
 `models/` 已被 `.gitignore` 忽略，不会误提交数 GB 的权重文件。
 
-### 5. 导出 `tmp/llama.fire`
+### 5. 导出 Fire 权重
 
-Fire v0.1 不直接读取 Hugging Face safetensors。先将 checkpoint 导出到仓库约定位置：
+两种模型共用默认输出目录，导出前先创建：
 
 ```bash
 mkdir -p tmp
+```
 
+#### TinyLlama
+
+Fire 的运行时不直接读取 Hugging Face safetensors。先将 checkpoint 导出到仓库约定位置：
+
+```bash
 python -B tools/export_tinyllama.py \
   --hf models/TinyLlama-1.1B-Chat-v1.0 \
   tmp/llama.fire
@@ -225,7 +266,7 @@ stat -c '%n %s bytes' tmp/llama.fire
 `.fire` 只保存模型 tensor，不包含 tokenizer；启动 demo 时仍需要原始
 `tokenizer.model`。`tmp/` 同样已被 `.gitignore` 忽略。
 
-#### Qwen3 exporter（v0.2）
+#### 导出 Qwen3
 
 同一个 exporter 会从 `config.json` 自动识别 Qwen3-0.6B 或 Qwen3-8B，并支持单个
 `model.safetensors` 或标准 HF shard index：
@@ -241,6 +282,18 @@ python -B tools/export_qwen3.py \
 CPU/GPU forward 和 Hugging Face eager attention 的逐位置 logits 对齐；GPU 测试使用非默认
 CUDA stream。8B 的相同 FP32 路径会生成约 30.5 GiB 的文件。
 
+从未量化 checkpoint 生成 Fire 自有的 RTN INT4 表示：
+
+```bash
+python -B tools/export_qwen3.py \
+  --hf models/Qwen3-0.6B \
+  --quantization int4 \
+  tmp/qwen3-0.6b-int4.fire
+```
+
+该模式写 `.fire` v2，量化全部 Linear（含 LM Head），Embedding/Norm 写 FP32。
+目前尚未为未量化 8B 实现保留 BF16 Embedding/LM Head 的混合 RTN 导出。
+
 本地已量化的 Qwen3-8B-AWQ 使用独立的导入模式，转换 packing 而不再量化投影：
 
 ```bash
@@ -253,6 +306,17 @@ python -B tools/export_qwen3.py \
 该路径生成混合 BF16/INT4 的 `.fire` v2；运行时使用 Qwen3Model 的 GPU 执行路径。
 它已通过原始 AWQ/Hugging Face FP32 两 token logits 对齐和 2048 token
 teacher-forcing 验证；这些检查与聊天 smoke test 不代替完整的语料质量评估。
+
+三种模式的边界如下，Qwen3 INT4 执行均要求 GPU：
+
+| `--quantization` | Source Checkpoint | 输出布局 |
+| --- | --- | --- |
+| `none`（默认） | 未量化 BF16 | FP32 `.fire` v1 |
+| `int4` | 未量化 BF16 | INT4 投影/LM Head，FP32 Embedding/Norm，`.fire` v2 |
+| `awq` | 官方 8B AWQ GEMM | INT4 七类投影，BF16 Embedding/LM Head，FP32 Norm，`.fire` v2 |
+
+所有模式均要求输出路径尚不存在。更多布局与待完成项见
+[Qwen3 量化路线](docs/qwen3_quantization_plan.md)。
 
 ### 6. 启动聊天 demo
 
@@ -348,11 +412,23 @@ ctest --test-dir build --output-on-failure
 ctest --test-dir build -R 'Tokenizer|BPETest|QwenChatTest|fire_qwen_chat_|ArgmaxSampler' --output-on-failure
 ```
 
-Python Writer/exporter contract tests：
+只运行 Matmul/Linear 与 GEMV 的相关正确性检查：
+
+```bash
+./build/test/fire_tests \
+  --gtest_filter='matmul_test.*:linear_test.*:LinearCudaTest.*'
+```
+
+这些检查包含 FP32/BF16、INT4、矩阵回退、长 K、输出行尾、未对齐 Tensor view
+以及默认/非默认 CUDA stream。
+
+Python Writer/exporter/quantization contract tests：
 
 ```bash
 python3 -B test/test_model/test_export_tinyllama.py
 python3 -B test/test_model/test_export_qwen3.py
+python3 -B test/test_model/test_quant.py
+python3 -B test/test_model/test_fire_writer_v2.py
 ```
 
 真实模型的双 token forward 属于重型集成测试，默认不会运行：
@@ -384,8 +460,66 @@ FIRE_RUN_QWEN3_HF_ALIGNMENT_TEST=1 \
   ctest --test-dir build -R '^fire_qwen3_hf_logits_alignment$' --output-on-failure
 ```
 
+8B AWQ 的 GPU smoke test 与独立 HF 对齐使用以下入口；HF 对齐还需要
+`transformers`，属于耗时较长的模型验证：
+
+```bash
+FIRE_RUN_QWEN3_AWQ_GPU_FORWARD_TEST=1 \
+FIRE_QWEN3_AWQ_PATH="$PWD/tmp/qwen3-8B-awq.fire" \
+  ./build/test/fire_tests \
+  --gtest_filter='Qwen3ModelTest.LocalAwq8BGpuForwardProducesFiniteLogits'
+
+FIRE_RUN_QWEN3_HF_ALIGNMENT_TEST=1 \
+  python3 -B test/test_model/test_qwen3_hf_logits_alignment.py \
+  --runner build/test/qwen3_logits_runner \
+  --hf-model models/Qwen3-8B-AWQ \
+  --fire-model tmp/qwen3-8B-awq.fire \
+  --awq
+```
+
+CTest 中的 `fire_qwen3_hf_logits_alignment` 默认配置为 0.6B FP32；上面的 `--awq`
+命令才选择 8B AWQ 参考路径。两 token 对齐、teacher forcing、算子测试与性能复测
+是不同范围的验证，新增 GEMV 的正确性测试不代表自动重跑全部 HF/长序列回归。
+
 没有 CUDA device/driver 时，CUDA tests 会跳过。部分真实模型测试还会根据环境变量、
-`tmp/llama.fire` 是否存在和可用显存决定是否跳过。
+本地模型/tokenizer 文件是否存在和可用显存决定是否跳过；应同时查看 passed 与 skipped。
+
+## CUDA GEMV 与性能记录
+
+当前 prefill 与 decode 都逐 token 调用模型，因此两者的 Linear 输入均为 `N=1`。
+CUDA 调度按实际形状和对齐条件选择：
+
+| 权重类型 | 当前单 token 路径 | 其他情况 |
+| --- | --- | --- |
+| FP32/BF16 | `GEMV_bf16_fp32_v1`；K 为 4 的倍数且地址对齐时向量化加载 | `N=1` 使用标量 GEMV，`N>1` 使用原 tiled dense |
+| INT4 | `N=1`、group=128、K 为 128 的倍数且地址对齐时使用 `GEMV_int4_v1` | 使用通用 INT4 kernel |
+
+两条 GEMV 都保持 FP32 激活、累加和输出，并沿用调用方 CUDA stream。当前 8B AWQ
+每次 forward 有 252 次 INT4 投影和一次 BF16 LM Head；MHA 使用独立 kernel。
+真正的批量 prefill、Tensor Core 路径和跳过中间 prompt logits 尚未实现。
+
+2026-10-21 的 RTX 4070 Laptop GPU 实测，固定 Qwen3-8B-AWQ、160 token 输入
+（含模板）、2048 容量、每轮生成 16 token，使用一次预热与三次正式测量的中位数：
+
+| 阶段 | TTFT（ms） | TPOT（ms/token） | Decode（tokens/s） |
+| --- | ---: | ---: | ---: |
+| 原始 kernel | 44868.69 | 280.23 | 3.57 |
+| INT4 GEMV | 5860.49 | 37.33 | 26.78 |
+| INT4 + BF16 GEMV | 3742.36 | 23.89 | 41.85 |
+
+最终 decode 吞吐量约为原始基线的 11.72 倍；这是该设备与短负载的记录，不是所有
+模型、硬件或上下文长度的性能保证。最新报告的所选 decode 区间中，INT4 GEMV 占
+GPU kernel 累计时间的 71.33%，BF16 GEMV 占 22.34%。
+
+`qwen_chat` 每轮打印 TTFT、TPOT 和 Decode throughput。TTFT 不含模型加载；
+TPOT/Decode 统计首 token 之后的 forward 与采样等待，不含文本解码和终端输出。
+复测应保持提示词、实际生成数量与 `/reset` 方式一致，并在未挂 profiler 时比较
+吞吐量；`--profile 8b` 选择模型配置，不会启用 profiler。
+
+详细口径、编译选项和新旧 nsys 数据见 [基线与优化复测](docs/baseline.md)；分析流程见
+[性能计划](docs/performance_plan.md)，候选优化点见 [INT4 GEMV 文档](docs/int4_gemv_optimization.md)。
+提示词、日志与原始报告放在 Git 忽略的 `profile/`，不会随克隆分发；新增采集应使用
+独立报告名以保留可比较的结果。
 
 ## 项目结构
 
@@ -408,6 +542,7 @@ Fire/
 ├── test/                     # C++ GTest 与 Python contract tests
 ├── tools/
 │   ├── fire_writer.py
+│   ├── quant.py
 │   ├── export_tinyllama.py
 │   └── export_qwen3.py
 ├── demo/
@@ -417,7 +552,11 @@ Fire/
 ├── docs/
 │   ├── model_export_v0_1.md
 │   ├── model_design_v0_1.md
-│   └── repo_map.md
+│   ├── qwen3_quantization_plan.md
+│   ├── repo_map.md
+│   ├── performance_plan.md
+│   ├── int4_gemv_optimization.md
+│   └── baseline.md
 ├── CONTEXT.md
 ├── CMakeLists.txt
 └── readme.md
@@ -426,7 +565,16 @@ Fire/
 核心 C++ 代码编译为静态库 `libfire.a`，并通过 CMake target `Fire::fire` 提供给
 测试和 demo。
 
-## v0.1 技术概览
+## 模型执行概览
+
+模型接口每次消费一个 token，prefill 当前也由 demo 逐 token 驱动。已接入的固定
+profile 如下；最大 profile 长度不等于已验证的聊天容量或显存承诺：
+
+| Profile | 层数 | Hidden / Q dim | Q / KV heads | 词表大小 | 最大 profile 长度 |
+| --- | ---: | --- | --- | ---: | ---: |
+| TinyLlama-1.1B | 22 | 2048 / 2048 | 32 / 4 | 32000 | 2048 |
+| Qwen3-0.6B | 28 | 1024 / 2048 | 16 / 8 | 151936 | 40960 |
+| Qwen3-8B | 36 | 4096 / 4096 | 32 / 8 | 151936 | 40960 |
 
 一次 `TinyLlamaModel::forward` 消费一个 token，并产生下一 token 的
 `logits[32000]`：
@@ -446,6 +594,10 @@ Runtime Tensor 跨层复用。K/V Cache 使用连续布局
 `[num_layers, capacity, num_kv_heads, head_dim]`，只有整个 token forward 成功后才
 提交新的有效长度。
 
+`Qwen3Model` 使用 profile 决定层数和维度，并在 Q/K 投影后增加逐 head RMSNorm。
+0.6B 的 Q dim 与 hidden size 不相同；0.6B/8B 共用同一模型实现。当前 AWQ 的
+Embedding/LM Head 为 BF16 权重，Norm、激活与 KV Cache 保持 FP32。
+
 `.fire` 是 model-agnostic 的 Tensor Container，不是自描述的通用模型格式。
 TinyLlama 的名称、shape 和配置约束由 `TinyllamaLoader` 与固定 Model Profile 负责。
 
@@ -454,6 +606,8 @@ TinyLlama 的名称、shape 和配置约束由 `TinyllamaLoader` 与固定 Model
 - [模型层设计](docs/model_design_v0_1.md)
 - [模型导出与 `.fire` v1 格式](docs/model_export_v0_1.md)
 - [仓库地图](docs/repo_map.md)
+- [Qwen3 量化路线与格式边界](docs/qwen3_quantization_plan.md)
+- [CUDA 性能基线与优化结果](docs/baseline.md)
 - [领域术语](CONTEXT.md)
 
 ## 已知限制
@@ -490,33 +644,25 @@ TinyLlama 的名称、shape 和配置约束由 `TinyllamaLoader` 与固定 Model
 - [x] 本地 8B AWQ 两 token HF logits 对齐、2048 token teacher forcing
 - [x] 本地 8B AWQ 多轮中文生成与 `/reset`
 
-### 下一阶段：算子优化与吞吐提升
+### 单 token CUDA 优化：已完成的首轮工作
 
-以当前单序列 Qwen3-8B-AWQ GPU 路径为基线，先测量瓶颈，再逐项优化 CUDA
-算子。主要目标是提高 decode 的 tokens/s、降低 TPOT，同时观察 TTFT 和显存
-占用；以下工作尚未实现，优化效果以实测为准。
-
-- [ ] 建立可重复的性能基线：固定模型、提示词、上下文长度和生成长度，预热后
-  多次测量，记录 TTFT、TPOT、decode tokens/s 和峰值显存；分别观察 prompt
-  prefill 与逐 token decode，并记录多轮聊天中历史重放的开销。
-- [ ] 使用 CUDA events、Nsight Systems / Nsight Compute 定位耗时，区分算子
-  执行、kernel launch、CPU/GPU 数据传输和同步开销，再确定优化顺序。
-- [ ] 优先尝试 Linear 的单 token 路径：为 `N=1` 设计 INT4 GEMV，改进权重读取、
-  解包、group metadata 复用和并行归约；评估 FP32/BF16 GEMV 对 LM Head 等
-  dense projection 的收益。
-- [ ] 根据 profiling 结果优化 MHA 的 KV Cache 访问与归约，以及 RMSNorm、
-  SwiGLU 等算子；尝试融合能减少中间读写和 launch 次数的操作。
-- [ ] 每项优化都对照 CPU/原 kernel 与 HF logits 验证数值，覆盖模型实际 shape
-  和非默认 CUDA stream，再比较算子耗时、端到端吞吐及显存；保留性能结果与
-  已知适用范围。
+- [x] 固定 8B AWQ、提示词、上下文与生成长度，记录预热后三次测量的中位数。
+- [x] 用 Nsight Systems 的采样边界与调用计数比较 decode kernel 耗时。
+- [x] INT4 GEMV：warp 按行、成对解包、向量加载、量化组元数据复用与归约。
+- [x] FP32/BF16 GEMV：`N=1` 分流、向量/标量加载、FP32 多累加器与归约。
+- [x] 新增边界、未对齐地址和 stream 正确性测试，保留通用回退。
+- [x] 记录原始、仅 INT4 GEMV、INT4 + BF16 GEMV 的端到端与 nsys 对比。
 
 ### 后续验证与优化
 
-- Hugging Face 参考 logits/token 独立对齐
+- 在现有固定 token HF 对齐基础上，扩大语料质量回归，并对后续数值改动重新验证
+- 用 Nsight Compute 分析代表性热点；扩展长上下文、历史重放、形状与峰值显存测量
+- 继续按实测选择 INT4 GEMV、MHA、融合或显存复用的单项优化
+- 评估 prefill 仅计算最后 token logits、真正的批量 prefill 与 Tensor Core 路径
+- 未量化 8B 的混合 BF16/INT4 RTN 导出和 4096 容量验收
 - 更完整的 Loader/状态失败矩阵与 CUDA 错误传播
 - temperature、top-k、top-p 等 sampling 策略
 - Batch、量化质量回归与更灵活的 Model Profile
-- 更进一步的显存复用与生成执行优化
 - PagedAttention 与更完整的生成 runtime
 
 ## Why Fire?

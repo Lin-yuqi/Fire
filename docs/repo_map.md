@@ -1,6 +1,6 @@
 # Fire 仓库地图
 
-> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最后全面核对日期：2026-09-20；Qwen3、AWQ 和 v0.2 聊天相关段落更新：2026-10-08。
+> 本文描述仓库当前实际状态，用于快速定位代码、理解依赖关系和继续开发。最近同步：2026-10-23（Qwen3、BF16/INT4、单 token GEMV 与性能记录）。
 
 ## 1. 项目定位与当前阶段
 
@@ -13,8 +13,8 @@ Fire 是一个以学习和实验为目标、从零构建的轻量级 CUDA 推理
 - `op` 已建立 `Operator`、`ParamOperator` 与执行上下文 `OpContext`，并接通 Add、RMSNorm、Matmul、Linear、Embedding、RoPE、SwiGLU 和 MHA。Softmax 已有 CPU/CUDA kernel 与直接数值测试，但尚无独立公开 Operator 包装；MHA 的 CPU/CUDA 实现内置稳定 softmax。`ParamOperator` 显式允许移动、禁止复制，支持按值组织 Block 中的参数算子。
 - Add 已提供 CPU（Armadillo）与 CUDA FP32 kernel，通过设备类型分派，并覆盖公共 `forward`、参数校验、边界尺寸和非默认 stream 测试。
 - RMSNorm 已提供 CPU/CUDA 一维与逐行二维 FP32 kernel，支持自定义 epsilon 和 CUDA stream；非 4 整数倍行宽会在未对齐行使用标量路径，避免 `float4` 未对齐访问。
-- Matmul/Linear 已具备 FP32/BF16 权重的 CPU/CUDA 与 GPU INT4 路径；BF16 `lm_head` 接收 FP32 hidden 并输出 FP32 logits。专门的 CUDA shape 矩阵和性能基准仍需补齐。
-- Embedding 已提供 CPU/CUDA FP32 查表 kernel、公开参数检查和单/多 token 测试。
+- MatmulOp 的公开接口要求 FP32；Linear 支持 CPU/CUDA FP32/BF16 权重与 GPU INT4。CUDA `N=1` 已接入 warp 按行的 dense/INT4 GEMV，覆盖向量化、未对齐回退和 stream 测试；固定 8B AWQ 的性能结果见 [baseline.md](baseline.md)。
+- Embedding 已提供 CPU/CUDA FP32/BF16 权重查表、FP32 输出、公开参数检查和单/多 token 测试。
 - RoPE 已按 HF/TinyLlama 的前后半区配对实现 CPU/CUDA 旋转及紧凑 `[max_seq_len, head_dim / 2]` sin/cos cache，并覆盖非零位置、GQA head 数和非默认 stream 测试。
 - SwiGLU 已提供 CPU/CUDA FP32 逐元素实现，检查输入/输出 shape，并验证数值、输入只读性及 CUDA block 边界；Softmax kernel 覆盖一维/二维、原地/非原地、长行和数值稳定性。
 - `model` 已实现 `FireReader`：通过 `open + fstat + mmap` 校验 `.fire` v1/v2，建立 name index，并通过共享 `Buffer` 维持 mapping 生命周期；v2 可读取 FP32、UInt8 与 BF16 物理 tensor。
@@ -80,9 +80,9 @@ Fire/
 │   │   ├── alloc_cu.cpp           # cudaMalloc/cudaFree 后端
 │   │   └── buffer.cpp             # Buffer 构造、析构与属性访问
 │   ├── tensor/
-│   │   └── tensor.cpp             # Tensor 初步实现
+│   │   └── tensor.cpp             # Tensor 视图、字节偏移、clone 与设备迁移
 │   ├── model/
-│   │   ├── fire_reader.cpp        # v1 校验、mmap ownership 与 name index
+│   │   ├── fire_reader.cpp        # v1/v2 校验、mmap ownership 与 name index
 │   │   ├── tinyllama_loader.cpp   # 201 项 profile 校验与结构化 CPU views
 │   │   ├── qwen_loader.cpp        # Qwen3 profile canonical tensor 校验与 views
 │   │   ├── kv_cache.cpp           # K/V 分配、CPU/GPU 写入、提交与 reset
@@ -101,17 +101,17 @@ Fire/
 │   │   └── kernels/
 │   │       ├── kernels_interface.*# 按设备类型分派已接入的 CPU/CUDA kernel
 │   │       ├── cpu/add_kernel.*   # Armadillo FP32 向量加法
-│   │       ├── cpu/emb_kernel.*   # FP32 embedding 行拷贝
+│   │       ├── cpu/emb_kernel.*   # FP32/BF16 embedding，输出 FP32
 │   │       ├── cpu/rmsnorm_kernel.* # CPU FP32 RMSNorm
-│   │       ├── cpu/matmul_kernel.* # Armadillo FP32 矩阵乘
+│   │       ├── cpu/matmul_kernel.* # FP32/BF16 权重矩阵乘，FP32 累加
 │   │       ├── cpu/mha_kernel.*   # CPU FP32 GQA attention
 │   │       ├── cpu/rope_kernel.*  # half-split RoPE 与 cache 生成
 │   │       ├── cpu/softmax_kernel.* # 稳定 FP32 softmax
 │   │       ├── cpu/swiglu_kernel.* # FP32 SwiGLU
 │   │       ├── cuda/add_kernel.*  # CUDA FP32 向量加法
-│   │       ├── cuda/emb_kernel.*  # CUDA embedding 行拷贝
+│   │       ├── cuda/emb_kernel.*  # CUDA FP32/BF16 embedding，输出 FP32
 │   │       ├── cuda/rmsnorm_kernel.* # CUDA FP32 RMSNorm
-│   │       ├── cuda/matmul_kernel.* # CUDA FP32 分块矩阵乘
+│   │       ├── cuda/matmul_kernel.* # FP32/BF16 GEMV、tiled dense、INT4 GEMV/通用 kernel
 │   │       ├── cuda/mha_kernel.*  # CUDA FP32 GQA attention
 │   │       ├── cuda/rope_kernel.* # CUDA RoPE 与 cache 生成
 │   │       ├── cuda/softmax_kernel.* # CUDA 稳定 softmax
@@ -133,14 +133,16 @@ Fire/
 │   │   ├── test_tinyllama_loader.cpp # 真实权重加载与 CPU/GPU forward 集成测试
 │   │   ├── test_export_tinyllama.py # Writer/exporter Python 合同测试
 │   │   ├── test_export_qwen3.py   # Qwen3 profile/source/payload 导出合同测试
+│   │   ├── test_quant.py         # RTN、packing 与 zero-point 合同
+│   │   ├── test_fire_writer_v2.py # v2 INT4/BF16 与 padding 合同
 │   │   ├── test_qwen3_hf_logits_alignment.py # Qwen3/HF logits 集成对齐
-│   │   ├── qwen3_logits_runner.cpp # Qwen3 CPU logits 集成测试 helper
-│   │   ├── test_qwen_profile.cpp  # Qwen3 profile 与 Block epsilon 测试
+│   │   ├── qwen3_logits_runner.cpp # Qwen3 CPU/GPU logits 集成测试 helper
+│   │   ├── test_qwen_profile.cpp  # Qwen3 profile、Loader、Block 与真实模型测试
 │   │   └── generate_fire_v1_fixture.py # 独立 260-byte v1 fixture 生成器
 │   ├── test_op/test_op.cpp        # Operator 与 Add 测试
 │   ├── test_op/test_emb.cpp       # Embedding 校验、CPU/CUDA 数值测试
 │   ├── test_op/test_rmsnorm.cpp   # RMSNorm CPU/CUDA 与错误分支测试
-│   ├── test_op/test_matmul.cpp    # CPU Matmul/Linear 数值测试
+│   ├── test_op/test_matmul.cpp    # CPU/CUDA dense、INT4 与 GEMV 边界/stream 测试
 │   ├── test_op/test_mha.cpp       # MHA CPU/CUDA 数值与错误分支测试
 │   ├── test_op/test_rope.cpp      # compact cache、half-split 与 GQA 测试
 │   ├── test_op/test_softmax.cpp   # CPU/CUDA 数值稳定性和宽度边界
@@ -154,9 +156,14 @@ Fire/
 ├── docs/
 │   ├── model_export_v0_1.md       # TinyLlama/Qwen3 导出、.fire v1 与验收设计
 │   ├── model_design_v0_1.md       # Model 契约、权重与执行设计及实施边界
+│   ├── qwen3_quantization_plan.md # RTN/AWQ 布局、实现状态与质量边界
+│   ├── performance_plan.md       # 逐项 profiling 与复测流程
+│   ├── int4_gemv_optimization.md  # 已接入的 GEMV 策略与可选优化点
+│   ├── baseline.md               # 固定负载的原始与优化后测量
 │   └── repo_map.md                # 本文
 ├── tools/
 │   ├── fire_writer.py             # model-agnostic .fire v1/v2 writer
+│   ├── quant.py                   # 通用 RTN INT4 数学与 packing
 │   ├── export_tinyllama.py        # TinyLlama-specific 两遍 exporter/CLI
 │   └── export_qwen3.py            # 0.6B/8B、单文件/分片 Qwen3 exporter/CLI
 ├── demo/
@@ -192,6 +199,8 @@ Fire (project)
 ├── fire_v1_fixture               # build-tree 内生成独立 260-byte fixture
 ├── llama_chat                    # v0.1 多轮 greedy 聊天 CLI
 ├── qwen_chat                     # v0.2 Qwen3 多轮 greedy 聊天 CLI
+├── tinyllama_logits_runner       # HF 对齐 helper，仅 BUILD_TESTING=ON
+├── qwen3_logits_runner           # HF 对齐 helper，仅 BUILD_TESTING=ON
 └── fire_tests                    # 依赖 fixture，链接 Fire::fire + GTest::gtest_main
     ├── test_base/test_buffer.cpp
     ├── test_tensor/test_tensor.cpp
@@ -217,6 +226,8 @@ Fire (project)
 CTest registration
 ├── fire_export_tinyllama_contract    # Python Writer/exporter unittest
 ├── fire_export_qwen3_contract        # Python Qwen3 exporter unittest
+├── fire_quant_contract               # RTN 与 packing unittest
+├── fire_writer_v2_contract           # v2 Writer unittest
 ├── fire_tinyllama_hf_logits_alignment # TinyLlama/HF 重型对齐
 ├── fire_qwen3_hf_logits_alignment    # Qwen3-0.6B/HF 重型对齐
 └── fire_qwen_chat_*                  # CLI help 与非法参数检查
@@ -225,7 +236,7 @@ CTest registration
 常用命令：
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build --target fire fire_tests llama_chat qwen_chat -j
 ctest --test-dir build --output-on-failure
 ```
@@ -317,11 +328,11 @@ Buffer 已接入库目标和测试目标，也是 Tensor 底层存储的基础�
 
 Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测试；设备迁移与更多行为测试仍待完善，详见第 6 节。
 
-### `model`: Reader、Loader 与 TinyLlama Runtime
+### `model`: Reader、Loader 与模型 Runtime
 
 命名空间为 `model`。`TensorInfo` 是 FireReader 对调用方返回的 name、dtype、dims、绝对 byte offset 和 byte size；它不是 96-byte wire struct。`FireReader` 提供以下公共 seam：
 
-- `open(path)` 使用 `open + fstat + mmap` 读取文件，对 Header、Directory、payload 范围、连续性和文件尾执行完整 v1 校验，并返回 `base::Status`。
+- `open(path)` 使用 `open + fstat + mmap` 读取文件，校验 v1/v2 Header、Directory、payload 范围和文件尾，并返回 `base::Status`；v1 payload 紧密连续，v2 允许四字节对齐所需的零 padding，并校验 dtype 与量化元数据。
 - `find(name)` 在 Reader 未打开或名称不存在时返回 `nullptr`。
 - `tensor_count()` 返回已解析的目录项数，尚未成功打开时为 `0`；Reader 不判断某个模型需要多少项。
 - `mapped_buffer()` 返回整个 mmap 的共享 ownership；由此构造的 Tensor view 可以活得比 Reader 更久。
@@ -330,7 +341,7 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 `TinyllamaLoader::open()` 复用 Reader 的容器校验；`loader_tensor(name, output)` 根据 metadata 构造共享 mmap 的 CPU Tensor view，不验证 TinyLlama profile。`load_weights(output)` 要求目录数量为 201，按 canonical name 逐项校验 FP32 dtype 和固定 shape，在局部对象中完成全部 view 组装后才移动发布 `TinyLlamaWeights`；任一失败不会发布部分结果。当前真实 `.fire` 集成测试会在文件存在时验证结构和 Loader 销毁后的 mmap ownership，但系统性的缺项、额外项和错误 shape 测试仍待补齐。
 
-`model.h` 定义单序列 `Model` 的 `config/prepare/forward/reset` 纯接口；`model_weights.h` 定义 TinyLlama 固定 profile、Qwen3 0.6B/8B profile value 与各自按层组织的 Tensor 字段。`TinyLlamaModel::create` 把结构化权重绑定到 Embedding、Norm 和 Linear 参数算子，并按 context 决定是否迁移到 GPU；`prepare` 分配 typed Runtime、K/V Tensor、attention score 和紧凑 RoPE cache。Qwen3 复用相同执行骨架，并处理独立 `q_dim` 与 projection 后的逐 head Q/K RMSNorm。两个模型的 `forward` 都按层执行 Attention/FFN、写入 K/V、生成 logits，并在全部成功后提交 cache length；Qwen3-0.6B CPU/GPU 路径均已通过真实模型测试，CPU 另与 Hugging Face 参考对齐。
+`model.h` 定义单序列 `Model` 的 `config/prepare/forward/reset` 纯接口；`model_weights.h` 定义 TinyLlama 固定 profile、Qwen3 0.6B/8B profile value 与结构化权重。Qwen3 的 Linear 权重使用 `op::Parameter` 表示普通 FP32/BF16，或包含 qweight/scales/zero-points/group_size 的 INT4；Embedding/Norm 仍为普通 Tensor。`TinyLlamaModel::create` 把结构化权重绑定到参数算子，并按 context 决定是否迁移到 GPU；`prepare` 分配 typed Runtime、K/V Tensor、attention score 和紧凑 RoPE cache。Qwen3 复用相同执行骨架，并处理独立 `q_dim` 与 projection 后的逐 head Q/K RMSNorm。两个模型的 `forward` 都按层执行 Attention/FFN、写入 K/V、生成 logits，并在全部成功后提交 cache length；Qwen3-0.6B CPU/GPU 路径均已有真实模型验证与独立 HF 对齐记录。
 
 ### `tokenizer`、`sampler` 与聊天入口
 
@@ -354,7 +365,7 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 独立 fixture 生成器与 TinyLlama/Qwen3 Python 合同测试已接入 CTest；`fire_v1_fixture` 是 `fire_tests` 的构建依赖，而非需要手动运行的非默认前置。本阶段没有引入通用 model registry、provider、planner 或 streaming framework。
 
-### `op`: Operator 与 FP32 算子
+### `op`: Operator、FP32 激活与权重类型
 
 命名空间为 `op`。`Operator` 保存算子类型和名称，并提供 Tensor 非空、设备、数据类型及维度检查；`ParamOperator` 管理带量化配置的参数列表，显式禁止复制并支持移动，使参数算子可按值放入 Block 容器。`OpContext` 描述单次执行的设备、CUDA stream、allocator 和 workspace。
 
@@ -364,9 +375,13 @@ Tensor 已编入 `fire`，目前有 `from_blob`、字节偏移和 CPU clone 测�
 
 Add 测试已覆盖公共 `VecAddOp::forward` 的 CPU/GPU 路径、参数错误、边界尺寸和非默认 stream。RMSNorm 测试覆盖 CPU 一维/逐行二维正确性、自定义 epsilon、参数错误、CUDA 打包尾部以及二维非 4 整数倍行宽。
 
-`MatmulOp` 接受一维或二维输入和 `[out_features, in_features]` 权重，计算 `scale * input * weight^T`。CPU 使用 Armadillo，CUDA 使用分块 kernel。`LinearOp` 绑定 weight 和可选 bias；FP32 路径复用 Matmul/Add kernel，GPU INT4 路径使用量化 matmul kernel，尚不接受 BF16 权重。现有 Matmul/Linear 数值测试覆盖 CPU 向量/矩阵及向量 bias；真实 TinyLlama GPU forward 已覆盖模型使用的 CUDA shape，专门的 CUDA 数值矩阵和性能基准仍需补齐。
+`MatmulOp` 接受 FP32 的一维/二维输入和 `[out_features, in_features]` 权重，计算 `scale * input * weight^T`。`LinearOp` 绑定 FP32/BF16 weight 与可选 FP32 bias，CPU/CUDA 都保持 FP32 输入、累加和输出；INT4 参数仅支持 GPU 且不接受 bias。CPU 的 INT4 对照由普通 FP32 反量化参考提供，尚无 CPU 量化 Linear 执行路径。
 
-`EmbeddingOp` 当前绑定未量化 FP32 `[vocab_size, embedding_dim]` weight，接收同设备 INT32 token Tensor，并要求输出元素数等于 token 数乘 embedding width。CPU/CUDA kernel 都按 token 顺序复制权重行；测试覆盖单/多 token、错误参数和 CUDA 非对齐尾部。8B 计划增加 BF16 权重查表、FP32 输出。
+CUDA 普通权重在 `N=1` 时走 `GEMV_bf16_fp32_v1`，每 warp 计算一行、每 block 四个 warp。K 为 4 的倍数且地址对齐时使用 `float4` 输入、FP32 `float4` 或 BF16 `uint2` 权重加载；否则使用标量 GEMV。`N>1` 保留 tiled dense。INT4 在 `N=1`、group=128、K 为 128 的倍数且地址对齐时走 `GEMV_int4_v1`，使用 `uint16_t` / `float4`、成对解包、组元数据复用和 warp 归约；其余输入回退到 16×16 通用 INT4 kernel。
+
+现有测试覆盖 CPU/GPU FP32/BF16、INT4、scale、bias、矩阵回退、长 K、输出行尾、未对齐输入/权重与默认/非默认 stream。固定 Qwen3-8B-AWQ 的两轮性能优化已有记录，更系统的形状与长上下文验证仍可扩展。
+
+`EmbeddingOp` 绑定未量化 FP32/BF16 `[vocab_size, embedding_dim]` weight，接收同设备 INT32 token Tensor，并要求 FP32 输出元素数等于 token 数乘 embedding width。CPU/CUDA kernel 按 token 顺序读取权重行，BF16 在读取时扩展为 FP32；测试覆盖两种权重、单/多 token、错误参数和 CUDA 非对齐尾部。
 
 `RoPEOp` 原地修改二维 `[heads, head_dim]` query/key。`head_dim` 必须为正偶数，key heads 不得多于 query heads；sin/cos cache 使用 `[max_seq_len, head_dim / 2]`，每个 head 内按前后半区配对，符合未 permutation 的 HF Q/K 权重布局。CPU/CUDA cache 生成与旋转测试覆盖非零位置、GQA 和非默认 stream。
 
@@ -392,7 +407,7 @@ RMSNorm 的当前调用路径是：
 3. 一维输入通过 `get_rmsnorm_kernel` 分派；二维 GPU 输入通过 `get_rmsnorm_kernel_dim` 分派，每个 block 处理一行。
 4. CUDA kernel 对可安全打包的地址使用 `float4`，并用标量循环处理尾部或未对齐行。
 
-`.fire` 权重的当前路径是：
+TinyLlama `.fire` v1 权重的当前路径是：
 
 1. model-specific exporter 在目标创建前校验 config 和全部 source metadata；TinyLlama 固定 201 项，Qwen3 由 0.6B/8B profile 定义 311/399 项并可读取 source shards。
 2. `FireWriter` 按规划好的绝对 offset 写入 Header、Directory 和逐项 FP32 payload。
@@ -402,6 +417,8 @@ RMSNorm 的当前调用路径是：
 6. 每层 K/V 写入 `[layer, pos, ...]`，MHA 读取 `[0, pos]` 的有效历史；整个 token 成功后 `KVCache::commit(pos)` 才推进长度。
 7. `LlamaTokenizer` 将 chat template 各消息编码为 token IDs，并由 demo 显式插入 BOS/EOS；`ArgmaxSampler` 从 logits 选出 next token。
 8. `llama_chat` 重复 forward、sample、decode，遇到 EOS 或本轮 token 上限后结束回复；后续轮次从当前 KV Cache 长度继续追加，达到 2048 token 后结束会话。
+
+Qwen3 则由 `export_qwen3.py` 的 `none/int4/awq` 选择 FP32 v1、RTN INT4 v2 或混合 BF16/INT4 v2；`Qwen3Loader` 按 profile 绑定普通或量化参数，再交给同一个 `Qwen3Model`。`qwen_chat` 使用 JSON tokenizer 和 Qwen3 模板生成，每次单 token forward 在满足条件时使用 GEMV；AWQ 的七类投影走 INT4，LM Head 走 BF16。
 
 外部内存路径则由 `Buffer(ptr, capacity, device_type)` 包装；`owns_memory()` 为 false，调用方仍负责外部指针的生命周期。
 
@@ -414,7 +431,7 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 1. **部分 CUDA 返回值未检查**：部分 memcpy/memset 路径忽略 CUDA API 返回的 `cudaError_t`，失败时可能缺少及时、准确的错误信息；按当前约定可继续使用 `CHECK/LOG(FATAL)` 报错，无需引入额外错误类型。
 2. **RMSNorm 支持范围有限**：当前只有 FP32 实现，CPU 会将连续前导维展平后逐行处理，GPU 多行路径只验证了二维 `{rows, width}`；更高维 GPU 输入的所有前导维度尚未完整接入 block 调度。量化 weight 会返回 `InvalidArgument`。
 3. **聊天入口以简单性优先**：两个 demo 只有 greedy sampling，没有滑动窗口或历史压缩。Qwen3 在模板改变历史 token 时重放缓存；已有固定 token 的 HF 对齐，完整语料质量评估仍待补充。
-4. **Matmul 验证与效率仍待补齐**：已有 FP32/BF16 CPU/CUDA 与 GPU INT4；更系统的 CUDA shape/误差矩阵和性能优化属于后续工作。
+4. **Matmul 验证范围仍可扩展**：已有 FP32/BF16 与 GPU INT4 GEMV、边界/对齐/stream 测试和短负载性能基线；更多形状、长上下文、NCU 硬件指标与完整质量回归仍待补充。
 5. **Softmax 尚未形成独立 Operator**：CPU/CUDA kernel 和直接测试已完成，MHA 已在内部封装 softmax 计算；其他调用方目前仍需要直接使用 kernel 接口。
 6. **状态错误矩阵仍不完整**：KVCache 小尺寸测试已覆盖 K/V 写入、提交、reset、错误 shape 与错误位置，真实模型 forward 也会拒绝重复位置；更多 create/prepare/reset 失败保持场景仍需补齐。
 
@@ -439,13 +456,13 @@ Operator 的可恢复参数错误通过 `base::Status` 返回；kernel 内部约
 
 ## 8. 近期开发计划
 
-v0.1 已形成完整学习基线，发布后按以下顺序继续推进：
+v0.2 聊天、量化导入和首轮单 token GEMV 已接通，后续按具体问题逐项推进：
 
 1. 为真实导出补充 source checkpoint 抽样 bit-exact FP32 回读，并完成 Loader 的缺项、额外项和错误 shape 失败矩阵。
-2. 用固定 token 序列与 Hugging Face 参考实现逐位置比较 logits，建立独立于 CPU/GPU 自比较的数值基线。
-3. 在现有 ArgmaxSampler 之外增加 temperature、top-k、top-p，并评估跨轮 KV Cache 复用。
-4. 补充 CUDA shape/误差矩阵、错误传播和性能基线。
-5. 继续推进 Matmul 量化、Kernel Fusion、显存复用和 profiling。
+2. 在既有固定 token HF 对齐上扩大语料质量回归；数值改动后按对应范围重新验证。
+3. 在已有跨轮 KV Cache 复用的基础上完善状态失败矩阵，并增加 temperature、top-k、top-p。
+4. 扩展 CUDA shape/误差矩阵、错误传播、长上下文与峰值显存测量；按需开展 NCU 分析。
+5. 以 [baseline.md](baseline.md) 的当前阶段为对照，选择 INT4 GEMV、Kernel Fusion、显存复用或 prefill 执行策略的一项改动。
 
 ## 9. 文档维护约定
 

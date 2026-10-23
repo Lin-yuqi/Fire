@@ -4,9 +4,15 @@
 
 ## 当前状态
 
-- `build/` 已完成 Release 构建，后续可以直接使用。
-- `profile/` 清空并保留目录，上一轮采集结果不作为本轮基线。
-- 本次仅清理产物并编写计划，不运行测试、性能采集或优化实现。
+状态核对日期：2026-10-23。以下结果来自 2026-10-21 的既有测量，本次文档同步未重新采集。
+
+- 已明确 `qwen_chat` 的 TTFT、TPOT 与 Decode 计时口径，完成固定 8B AWQ 负载的 Release 基线。
+- 已用 Nsight Systems 定位 INT4 与 BF16 输出投影热点，完成 INT4、FP32/BF16 的 `N=1` GEMV 和相关正确性测试。
+- 已完成两轮无 profiler 复测及新旧 nsys 对比，Decode 中位数依次为 3.57、26.78、41.85 tokens/s；数据、条件与适用范围统一记录在 [baseline.md](baseline.md)。
+- 最新所选 decode 区间的 GPU kernel 累计时间中，INT4 GEMV 占 71.33%，BF16 GEMV 占 22.34%。
+- Nsight Compute 硬件指标分析、更多上下文/形状的基准，以及完整质量回归仍待推进；不将下面所有步骤视为已按顺序完成。
+
+下列步骤保留为后续单项优化的工作方式，不自动执行整套流程。
 
 ## 执行步骤
 
@@ -20,7 +26,7 @@
 
 ### 2. 建立最小基线
 
-只创建一份固定提示词 `profile/prompt.txt`，运行现有 Release demo，结果写入 `profile/baseline.md`。先做一次短跑确认程序与输入，再按需要做一轮预热和三轮测量，记录在同一日志中。
+只创建一份固定提示词 `profile/prompt.txt`，运行现有 Release demo，将构建参数、计时口径和测量结果写入 `docs/baseline.md`。原始日志留在 `profile/`。先做一次短跑确认程序与输入，再按需要做一轮预热和三轮测量。
 
 解释实际工作量、TTFT、TPOT、decode 吞吐量及轮次间波动。模型加载时间与请求计时分开说明，区分模型 decode 指标和实际文本输出速度。
 
@@ -28,7 +34,7 @@
 
 ### 3. 用 Nsight Systems 定位主要耗时
 
-复用固定提示词，只采集一段短执行，保留 `profile/timeline.nsys-rep`。先查看时间线，区分初始化、prefill、decode、采样和收尾，再选取 decode 区间看累计耗时。
+复用固定提示词，只采集一段短执行，以本次改动的独立名称保存 `.nsys-rep`，保留用于对比的旧报告。先查看时间线，区分初始化、prefill、decode、采样和收尾，再选取 decode 区间看累计耗时。
 
 结合 kernel、拷贝和 CPU API 的关联解释等待发生在哪里。没有 NVTX 标记时，用采样边界及 forward 调用计数辅助划分，并说明这种方法的范围。API 等待时间与 GPU 执行时间可能重叠，不能直接相加。
 
@@ -60,16 +66,18 @@
 
 ## 文件约束
 
-文件按步骤逐个创建，预期最多保留以下五个性能产物：
+结论保存在仓库文档，提示词、原始日志和报告放在 Git 忽略的 `profile/`，不随克隆分发。文件按需要创建，当前已有产物与可选的下一项产物如下：
 
 | 文件 | 用途 |
 | --- | --- |
+| `docs/baseline.md` | 受版本管理的原始基线、两轮优化结果与测量口径 |
 | `profile/prompt.txt` | 唯一的固定输入 |
-| `profile/baseline.log` | 优化前测量 |
-| `profile/timeline.nsys-rep` | 系统时间线 |
-| `profile/kernel.ncu-rep` | 单个热点的详细指标 |
-| `profile/after.log` | 优化后测量 |
+| `profile/timeline_base.nsys-rep` | 原始实现时间线 |
+| `profile/timeline_gemmv.nsys-rep` | 仅 INT4 GEMV 阶段的时间线 |
+| `profile/timeline_gemmv_v2.nsys-rep` | INT4 + BF16 GEMV 阶段的时间线 |
+| `profile/after.log` | 最新一轮无 profiler 原始输出；历史数值保留在文档中 |
+| `profile/kernel.ncu-rep` | 可选：下一次实际开展 NCU 分析时才创建 |
 
 命令和结论直接在对话中解释，必要时更新本计划。不默认生成 CSV、JSON、额外日志、分析脚本或自动执行整套流程的脚本；确有分析需要时，再说明用途并控制产物数量。
 
-下一次从步骤 1 开始，先对齐计时口径。
+下一次从已有基线和热点证据出发，先选定一个待验证的问题，再决定是否补充采集或实现改动。
